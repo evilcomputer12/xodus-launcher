@@ -4,7 +4,7 @@ pkgver=r0
 pkgrel=1
 pkgdesc="PC Game Pass launcher for Linux built on xodus and WineGDK"
 arch=('any')
-url="https://github.com/martinv/xodus-launcher"
+url="https://github.com/evilcomputer12/xodus-launcher"
 license=('GPL-3.0-or-later')
 depends=('python' 'pyside6' 'xodus-git' 'libsecret' 'desktop-file-utils' 'hicolor-icon-theme')
 optdepends=('steam: add games as Steam shortcuts'
@@ -13,7 +13,7 @@ optdepends=('steam: add games as Steam shortcuts'
 makedepends=('git')
 provides=('xodus-launcher')
 conflicts=('xodus-launcher')
-source=("git+https://github.com/martinv/xodus-launcher.git")
+source=("git+https://github.com/evilcomputer12/xodus-launcher.git")
 sha256sums=('SKIP')
 
 pkgver() {
