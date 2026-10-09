@@ -599,8 +599,23 @@ def ensure_xodus_service(log=print):
     return False
 
 
-def launch_game(cfg, game_dir, log=print):
-    """Run the game via `xodus-cli run`. Blocks until it exits. Returns (code, tail)."""
+def stop_wine(cfg):
+    """Kill everything in the game's Wine prefix (used to force-stop a running game)."""
+    wine = cfg.get("wine") or find_wine()
+    if not wine:
+        return
+    env = dict(os.environ)
+    env["WINEPREFIX"] = cfg["prefix"]
+    try:
+        subprocess.run([str(Path(wine).parent / "wineserver"), "-k"], env=env, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def launch_game(cfg, game_dir, log=print, on_start=None):
+    """Run the game via `xodus-cli run`. Blocks until it exits. Returns (code, tail).
+
+    on_start(popen) is called once the process is spawned, so a caller can stop it."""
     wine = cfg.get("wine") or find_wine()
     if not wine or not Path(wine).exists():
         return 1, "Wine is not set up yet - open Xodus Launcher and use Settings > Set up Wine."
@@ -619,7 +634,12 @@ def launch_game(cfg, game_dir, log=print):
         with open(logfile, "w") as lf:
             lf.write("$ " + " ".join(cmd) + "\n")
             lf.flush()
-            p = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT, cwd=game_dir)
+            # new session so the whole wine process tree can be signalled as a group
+            p = subprocess.Popen(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT,
+                                 cwd=game_dir, start_new_session=True)
+            if on_start:
+                on_start(p)
+            p.wait()
         code = p.returncode
         tail = "\n".join(logfile.read_text(errors="replace").splitlines()[-25:])
         if "Could not find .exe" not in tail:
@@ -851,10 +871,31 @@ def run_gui(install_id=None):
         def __init__(self, cfg, game_dir):
             super().__init__()
             self.cfg, self.game_dir = cfg, game_dir
+            self.proc = None
+            self.stopped = False
 
         def run(self):
-            code, tail = launch_game(self.cfg, self.game_dir, log=lambda s: None)
+            code, tail = launch_game(self.cfg, self.game_dir, log=lambda s: None,
+                                     on_start=lambda p: setattr(self, "proc", p))
+            if self.stopped:
+                tail = "Stopped."
             self.finished_job.emit(code, tail)
+
+        def stop(self):
+            """Force-stop the running game (used by the Stop button)."""
+            self.stopped = True
+            p = self.proc
+            if p and p.poll() is None:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            stop_wine(self.cfg)  # bring down any detached wine processes in the prefix
+            if p and p.poll() is None:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
     class FilterModel(QSortFilterProxyModel):
         def __init__(self):
@@ -988,6 +1029,7 @@ def run_gui(install_id=None):
             self.workers = []
             self.current = None
             self.pending_install = None
+            self.play_job = None
             self.setWindowTitle(APP_NAME)
             self.setWindowIcon(QIcon(str(ICON_PATH)))
             self.resize(1280, 820)
@@ -1409,14 +1451,27 @@ def run_gui(install_id=None):
                                         "Set it up now?") == QMessageBox.Yes:
                     self.setup_wine(then=self.play_current)
                 return
-            self.b_play.setEnabled(False)
-            self.b_play.setText("Running…")
             job = LaunchJob(self.cfg, inst["dir"])
+            self.play_job = job
+            # the Play button becomes Stop while the game runs (Alt+F4 may not reach
+            # the game under some compositors; this always works)
+            self.b_play.setText("⏹  Stop")
+            try:
+                self.b_play.clicked.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self.b_play.clicked.connect(self.stop_current)
 
             def done(code, tail):
-                self.b_play.setEnabled(True)
+                try:
+                    self.b_play.clicked.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+                self.b_play.clicked.connect(self.play_current)
                 self.b_play.setText("▶  Play")
-                if code != 0:
+                self.b_play.setEnabled(True)
+                self.play_job = None
+                if code != 0 and not job.stopped:
                     box = QMessageBox(self)
                     box.setWindowTitle(APP_NAME)
                     box.setText(f"The game exited with code {code}.\n"
@@ -1428,6 +1483,14 @@ def run_gui(install_id=None):
             job.finished_job.connect(done)
             self.workers.append(job)
             job.start()
+
+        def stop_current(self):
+            job = getattr(self, "play_job", None)
+            if not job:
+                return
+            self.b_play.setText("Stopping…")
+            self.b_play.setEnabled(False)
+            threading.Thread(target=job.stop, daemon=True).start()
 
         def steam_current(self):
             inst = self.current_installed()
@@ -1492,6 +1555,8 @@ def run_gui(install_id=None):
                     return
                 self.active.cancel.set()
                 self.active.wait(5000)
+            if self.play_job:  # stop a running game so it doesn't outlive the launcher
+                self.play_job.stop()
             ev.accept()
 
     app = QApplication(sys.argv)

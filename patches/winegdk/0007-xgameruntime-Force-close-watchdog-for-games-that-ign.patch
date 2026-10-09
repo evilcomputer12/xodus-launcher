@@ -1,0 +1,195 @@
+From 3e2d4f53348fc47a5f2d6fc6820af44b0a27982c Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 00:17:32 +0200
+Subject: [PATCH 7/7] xgameruntime: Force-close watchdog for games that ignore
+ WM_CLOSE
+
+GDK titles often treat a window close request as suspend-to-background and
+never exit, because the GDK model is that the Xbox shell terminates the title.
+Under a desktop window manager that leaves an unclosable window.
+
+Subclass each top-level window the game creates (from a watchdog thread that
+polls EnumWindows for this process) and watch for WM_CLOSE / WM_SYSCOMMAND
+SC_CLOSE. The original window procedure still runs, so a well-behaved game
+closes normally; one that ignores the request is terminated after a grace
+period. Tunable via XODUS_FORCE_CLOSE=0 and XODUS_FORCE_CLOSE_MS=<ms>.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ dlls/xgameruntime/GDKComponent/ForceClose.c | 119 ++++++++++++++++++++
+ dlls/xgameruntime/Makefile.in               |   1 +
+ dlls/xgameruntime/main.c                    |   2 +
+ dlls/xgameruntime/private.h                 |   1 +
+ 4 files changed, 123 insertions(+)
+ create mode 100644 dlls/xgameruntime/GDKComponent/ForceClose.c
+
+diff --git a/dlls/xgameruntime/GDKComponent/ForceClose.c b/dlls/xgameruntime/GDKComponent/ForceClose.c
+new file mode 100644
+index 0000000..784ba07
+--- /dev/null
++++ b/dlls/xgameruntime/GDKComponent/ForceClose.c
+@@ -0,0 +1,119 @@
++/*
++ * Xbox Game runtime Library
++ *  Force-close watchdog
++ *
++ * GDK titles often ignore the window manager's close request (Alt+F4 / the
++ * window close button): the GDK model is that the Xbox shell suspends and then
++ * terminates a title, so many games treat WM_CLOSE as "go to background" and
++ * never exit. Under a normal desktop WM that leaves an unclosable window.
++ *
++ * We subclass each top-level window the game creates and watch for a close
++ * request (WM_CLOSE, or WM_SYSCOMMAND/SC_CLOSE). The original window procedure
++ * still runs, so a well-behaved game closes normally; a game that ignores the
++ * request is terminated after a short grace period.
++ *
++ *   XODUS_FORCE_CLOSE=0       disable
++ *   XODUS_FORCE_CLOSE_MS=N    grace period in milliseconds (default 4000)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
++
++static const WCHAR ORIG_PROC_PROP[] = L"XodusOrigWndProc";
++static LONG close_armed;
++static DWORD grace_ms = 4000;
++
++static DWORD WINAPI terminate_thread( void *arg )
++{
++    Sleep( grace_ms );
++    ERR( "game ignored the close request for %lu ms, terminating it\n", grace_ms );
++    TerminateProcess( GetCurrentProcess(), 0 );
++    return 0;
++}
++
++static void arm_close( HWND hwnd, UINT msg )
++{
++    HANDLE thread;
++
++    if (InterlockedExchange( &close_armed, 1 )) return;
++    ERR( "close requested for window %p (msg %#x); terminating in %lu ms unless the game exits first\n",
++         hwnd, msg, grace_ms );
++    thread = CreateThread( NULL, 0, terminate_thread, NULL, 0, NULL );
++    if (thread) CloseHandle( thread );
++    else close_armed = 0;
++}
++
++static LRESULT CALLBACK subclass_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    WNDPROC orig = (WNDPROC)GetPropW( hwnd, ORIG_PROC_PROP );
++
++    if (msg == WM_CLOSE || (msg == WM_SYSCOMMAND && (wparam & 0xfff0) == SC_CLOSE))
++        arm_close( hwnd, msg );
++
++    if (orig) return CallWindowProcW( orig, hwnd, msg, wparam, lparam );
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static BOOL CALLBACK enum_proc( HWND hwnd, LPARAM arg )
++{
++    DWORD pid = 0;
++    WNDPROC orig;
++
++    GetWindowThreadProcessId( hwnd, &pid );
++    if (pid != GetCurrentProcessId()) return TRUE;
++    if (!(GetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE)) return TRUE;
++    if (GetPropW( hwnd, ORIG_PROC_PROP )) return TRUE;           /* already subclassed */
++
++    orig = (WNDPROC)SetWindowLongPtrW( hwnd, GWLP_WNDPROC, (LONG_PTR)subclass_proc );
++    if (orig)
++    {
++        SetPropW( hwnd, ORIG_PROC_PROP, (HANDLE)orig );
++        TRACE( "subclassed top-level window %p\n", hwnd );
++    }
++    return TRUE;
++}
++
++static DWORD WINAPI watchdog_thread( void *arg )
++{
++    for (;;)
++    {
++        EnumWindows( enum_proc, 0 );
++        Sleep( 1000 );
++    }
++    return 0;
++}
++
++/* Called from InitializeApiImpl once the runtime is up. */
++void xodus_install_force_close( HINSTANCE module )
++{
++    static LONG started;
++    const char *env;
++    HANDLE thread;
++
++    if (InterlockedExchange( &started, 1 )) return;
++    if ((env = getenv( "XODUS_FORCE_CLOSE" )) && !strcmp( env, "0" ))
++    {
++        TRACE( "disabled by XODUS_FORCE_CLOSE=0\n" );
++        return;
++    }
++    if ((env = getenv( "XODUS_FORCE_CLOSE_MS" )) && atoi( env ) > 0) grace_ms = atoi( env );
++
++    thread = CreateThread( NULL, 0, watchdog_thread, NULL, 0, NULL );
++    if (thread) CloseHandle( thread );
++    TRACE( "force-close watchdog started, grace %lu ms\n", grace_ms );
++}
+diff --git a/dlls/xgameruntime/Makefile.in b/dlls/xgameruntime/Makefile.in
+index ed84c93..828346a 100644
+--- a/dlls/xgameruntime/Makefile.in
++++ b/dlls/xgameruntime/Makefile.in
+@@ -49,4 +49,5 @@ SOURCES = \
+ 	\
+ 	GDKComponent/Xodus/Unix/socket.c \
+ 	\
++	GDKComponent/ForceClose.c \
+ 	GDKComponent/InitInternalGDKC.cpp
+diff --git a/dlls/xgameruntime/main.c b/dlls/xgameruntime/main.c
+index 4fd4417..70e32dd 100644
+--- a/dlls/xgameruntime/main.c
++++ b/dlls/xgameruntime/main.c
+@@ -146,6 +146,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
+         case DLL_PROCESS_ATTACH:
+         {
+             DisableThreadLibraryCalls(hinst);
++            xgameruntime = hinst;
+             xgameruntime_threading = LoadLibraryA("xgameruntime.dll.threading");
+             break;
+         }
+@@ -163,6 +164,7 @@ typedef HRESULT (WINAPI *InitializeApiImplEx2_ext)( ULONG gdkVer, ULONG gsVer, C
+ 
+ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITIALIZE_OPTIONS *options )
+ {
++    xodus_install_force_close( xgameruntime );
+     //  Initialization can be done however we want on our side.
+     // You can choose to return `S_OK` once the full SDK is implemented.
+     //
+diff --git a/dlls/xgameruntime/private.h b/dlls/xgameruntime/private.h
+index afb930a..4081dec 100644
+--- a/dlls/xgameruntime/private.h
++++ b/dlls/xgameruntime/private.h
+@@ -109,6 +109,7 @@
+ #define XODUS_INTEROP 0
+ 
+ extern IXThreadingImpl *x_threading_impl;
++void xodus_install_force_close( HINSTANCE module );
+ extern IXGameRuntimeFeatureImpl *x_game_runtime_feature;
+ extern IXSystemImpl *x_system;
+ extern IXGameImpl3 *x_game;
+-- 
+2.56.0
+

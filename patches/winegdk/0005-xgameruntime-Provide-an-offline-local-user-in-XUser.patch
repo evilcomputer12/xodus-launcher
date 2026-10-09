@@ -1,7 +1,7 @@
 From d1a1a096ed78175f4f45747b4deb7ef28a35dbcb Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:36:43 +0200
-Subject: [PATCH 5/6] xgameruntime: Provide an offline local user in XUser.
+Subject: [PATCH 5/7] xgameruntime: Provide an offline local user in XUser.
 
 Until Xbox Live sign-in is wired to xodus-service, XUserAddAsync returns a
 single always-signed-in local player (gamertag = OS user name, adult, all
