@@ -40,8 +40,11 @@ CACHE_DIR = HOME / ".cache/xodus-launcher"
 CONFIG_FILE = HOME / ".config/xodus-launcher/config.json"
 LOG_DIR = CACHE_DIR / "logs"
 META_NAME = ".xodus-launcher.json"
-ICON_PATH = HOME / ".local/share/icons/hicolor/256x256/apps/xodus.png"
-SELF_CMD = str(HOME / ".local/bin/xodus-launcher")
+# installed either per-user (install.sh) or system-wide (package); find whichever exists
+ICON_PATH = next((p for p in (HOME / ".local/share/icons/hicolor/256x256/apps/xodus.png",
+                              Path("/usr/share/icons/hicolor/256x256/apps/xodus.png"))
+                  if p.exists()), HOME / ".local/share/icons/hicolor/256x256/apps/xodus.png")
+SELF_CMD = shutil.which("xodus-launcher") or str(HOME / ".local/bin/xodus-launcher")
 
 ALL_PC_GAMES_SIGL = "fdd9e2a7-0fee-49f6-ad69-4354098401ff"
 CATALOG_MAX_AGE = 12 * 3600
