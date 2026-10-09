@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Xodus Launcher
+GenericName=PC Game Pass for Linux
+Comment=Browse, download and play PC Game Pass games with Xodus
+Icon=xodus
+Exec=/home/martinv/.local/bin/xodus-launcher
+Terminal=false
+Categories=Game;
+StartupWMClass=xodus-launcher
