@@ -1,5 +1,5 @@
-From 80011dce15df51489a886f40f68a550a492f6ac9 Mon Sep 17 00:00:00 2001
-From: martinv <martinrobotika@gmail.com>
+From e8f8237c6e8437cb4b11d734077461f7b04ec35a Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:36:43 +0200
 Subject: [PATCH 4/6] xgameruntime: Implement IXSystemImpl2-5 and parse TitleId
  as hex.

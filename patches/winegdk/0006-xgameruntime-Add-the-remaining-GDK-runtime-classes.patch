@@ -1,5 +1,5 @@
-From 8840543a95b571fce8bc5b7812bb22bd93fdeb55 Mon Sep 17 00:00:00 2001
-From: martinv <martinrobotika@gmail.com>
+From cff6c99bd82bcc5febae17a672b6843cfb7a5303 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:36:43 +0200
 Subject: [PATCH 6/6] xgameruntime: Add the remaining GDK runtime classes.
 

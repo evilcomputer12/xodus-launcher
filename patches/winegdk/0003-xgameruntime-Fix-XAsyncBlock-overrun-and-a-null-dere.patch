@@ -1,5 +1,5 @@
-From 54444849bce145abff4ff8f309e0a7a4ee71f725 Mon Sep 17 00:00:00 2001
-From: martinv <martinrobotika@gmail.com>
+From 52cb4df2e76ab8993b730a76f744a599a0be7a54 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:36:43 +0200
 Subject: [PATCH 3/6] xgameruntime: Fix XAsyncBlock overrun and a null
  dereference in XAsyncSchedule.
