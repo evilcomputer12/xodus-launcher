@@ -8,16 +8,19 @@ SRC=${SRC:-$HOME/.cache/xodus-launcher/winegdk-src}
 PREFIX=${PREFIX:-$HOME/.local/share/xodus-launcher/wine-gdk}
 JOBS=${JOBS:-$(nproc)}
 REPO=https://github.com/Weather-OS/WineGDK
-PATCH="$here/patches/winegdk/0001-xodus-launcher-fixes.patch"
+PATCHES="$here/patches/winegdk"
 
 if [ ! -d "$SRC/.git" ]; then
     git clone --depth 1 --recurse-submodules --shallow-submodules "$REPO" "$SRC"
 fi
 cd "$SRC"
-if git apply --check "$PATCH" 2>/dev/null; then
-    git apply "$PATCH"
+# Apply the patch series as commits on a branch (idempotent: skipped if already applied).
+if ! git rev-parse --verify -q xodus-launcher >/dev/null; then
+    git checkout -q -b xodus-launcher
+    GIT_COMMITTER_NAME=${GIT_COMMITTER_NAME:-xodus-launcher} GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL:-build@localhost} \
+        git am --3way "$PATCHES"/*.patch
 else
-    echo "patch already applied or does not apply cleanly; continuing with the tree as-is" >&2
+    git checkout -q xodus-launcher
 fi
 [ -x configure ] || ./autogen.sh
 mkdir -p build && cd build

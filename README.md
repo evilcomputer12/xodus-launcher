@@ -47,10 +47,11 @@ Then start **Xodus Launcher** from the app menu, sign in, pick a game, Install, 
 
 - `patches/xodus/0001-fix-prefix-cache-flush.patch`: streaming downloads crashed with
   "cache ended before cached_len" (flush the cache file before reading it back).
-- `patches/winegdk/0001-xodus-launcher-fixes.patch`: xodus memfd executable loading, new GDK
-  classes (XGame, XGameSave, XPersistentLocalStorage, offline XUser, XSystemImpl2-5), a 224-byte
-  buffer overrun in XAsync, a crash in XAsyncSchedule tracing, `RegisterAppStateChangeNotification`
-  returning success, hex TitleId parsing.
+- `patches/winegdk/`: a git series on top of WineGDK master (see `BASE-COMMIT`):
+  memfd executable loading (from the xodus wine fork), `RegisterAppStateChangeNotification`
+  returning success, XAsync buffer-overrun and tracing fixes, `IXSystemImpl2-5` + hex TitleId,
+  an offline local XUser, and the remaining GDK runtime classes (XGame, XGameSave,
+  XPersistentLocalStorage implemented; XStore, XPackage, XGameUi and 12 more ported as stubs).
 
 ## License
 

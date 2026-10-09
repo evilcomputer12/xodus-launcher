@@ -1,0 +1,319 @@
+From 19fb1863025bc5e095ea5ec3777f3845d74980a9 Mon Sep 17 00:00:00 2001
+From: martinv <martinrobotika@gmail.com>
+Date: Fri, 9 Oct 2026 23:36:43 +0200
+Subject: [PATCH 5/6] xgameruntime: Provide an offline local user in XUser.
+
+Until Xbox Live sign-in is wired to xodus-service, XUserAddAsync returns a
+single always-signed-in local player (gamertag = OS user name, adult, all
+privileges). Completion happens from a worker thread because games set up
+their callback state after XUserAddAsync returns, and XAsyncSchedule is
+avoided (it threw). Change-event registration succeeds with a dummy token.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/System/XUser.cpp             | 196 +++++++++++++++---
+ 1 file changed, 166 insertions(+), 30 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/System/XUser.cpp b/dlls/xgameruntime/GDKComponent/System/XUser.cpp
+index 7627125..c71fe2d 100644
+--- a/dlls/xgameruntime/GDKComponent/System/XUser.cpp
++++ b/dlls/xgameruntime/GDKComponent/System/XUser.cpp
+@@ -20,14 +20,78 @@
+  */
+ 
+ #include "../../private.h"
++#include "User/UserImpl.h"
+ 
+ #include <cstring>
+ #include <atomic>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
++
++/*
++ * Offline local player. Real Xbox Live sign-in (through xodus-service) is not wired up yet, so
++ * games get a single always-signed-in local user and keep working offline.
++ */
++static XUser g_offline_user = { X_USER_SIGNATURE, nullptr };
++static const UINT64 OfflineUserLocalId = 1;
++static const UINT64 OfflineUserXuid = 0x0009000000000001ull;
++static const char XUserAddAsyncIdentity[] = "XUserAddAsync";
++
++static BOOL IsOfflineUser( XUserHandle user )
++{
++    return user == &g_offline_user;
++}
++
++static DWORD WINAPI
++OfflineUserAddCompleteThread( void *param )
++{
++    XAsyncBlock *async = (XAsyncBlock *)param;
++    IXThreadingImpl *xthreading;
++
++    Sleep( 50 );
++    if ( SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) )
++    {
++        xthreading->XAsyncComplete( async, S_OK, sizeof(XUserHandle) );
++        xthreading->Release();
++    }
++    return 0;
++}
++
++static HRESULT WINAPI
++OfflineUserAddProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    IXThreadingImpl *xthreading;
++    HRESULT hr = S_OK;
++
++    TRACE( "op %d, data %p.\n", (int)op, data );
++
++    switch (op)
++    {
++        case XAsyncOp::Begin:
++        {
++            // Complete from another thread: games set up the state their completion callback uses
++            // after XUserAddAsync returns, so completing inside Begin re-enters them too early.
++            // (WineGDK's XAsyncSchedule path currently throws, so it is avoided here.)
++            HANDLE thread = CreateThread( nullptr, 0, OfflineUserAddCompleteThread, data->async, 0, nullptr );
++            if ( !thread ) return HRESULT_FROM_WIN32( GetLastError() );
++            CloseHandle( thread );
++            break;
++        }
++
++        case XAsyncOp::GetResult:
++            *(XUserHandle *)data->buffer = &g_offline_user;
++            break;
++
++        default:
++            break;
++    }
++
++    return hr;
++}
++
+ class XUserImpl : 
+-    public IXUserImpl6
++    public IXUserImpl6,
++    public IXUserGamertagImpl
+ {
+ public:
+     HRESULT WINAPI QueryInterface( REFIID iid, void **out )
+@@ -97,6 +161,13 @@ public:
+             return S_OK;
+         }
+ 
++        if ( iid == __uuidof( IXUserGamertagImpl ) )
++        {
++            AddRef();
++            *out = static_cast<IXUserGamertagImpl *>(this);
++            return S_OK;
++        }
++
+         FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &iid ) );
+         *out = nullptr;
+         return E_NOINTERFACE;
+@@ -128,19 +199,23 @@ public:
+ 
+     HRESULT WINAPI XUserDuplicateHandle( XUserHandle handle, XUserHandle *duplicatedHandle ) override
+     {
+-        FIXME( "handle %p, duplicatedHandle %p stub!\n", handle, duplicatedHandle );
+-        return E_NOTIMPL;
++        TRACE( "handle %p, duplicatedHandle %p\n", handle, duplicatedHandle );
++        if ( !duplicatedHandle ) return E_POINTER;
++        if ( !IsOfflineUser( handle ) ) return E_INVALIDARG;
++        *duplicatedHandle = handle;
++        return S_OK;
+     }
+ 
+     void WINAPI XUserCloseHandle( XUserHandle user ) override
+     {
+-        FIXME( "user %p stub!\n", user );
++        TRACE( "user %p\n", user );
+     }
+ 
+     INT32 WINAPI XUserCompare( XUserHandle user1, XUserHandle user2 ) override
+     {
+-        FIXME( "user1 %p, user2 %p stub!\n", user1, user2 );
+-        return E_NOTIMPL;
++        TRACE( "user1 %p, user2 %p\n", user1, user2 );
++        if ( user1 == user2 ) return 0;
++        return user1 < user2 ? -1 : 1;
+     }
+ 
+     HRESULT WINAPI XUserGetMaxUsers( UINT32 *maxUsers ) override
+@@ -152,50 +227,82 @@ public:
+ 
+     HRESULT WINAPI XUserAddAsync( XUserAddOptions options, XAsyncBlock *async ) override
+     {
+-        FIXME( "options %d, async %p stub!\n", (int)options, async );
+-        return E_NOTIMPL;
++        IXThreadingImpl *xthreading;
++        HRESULT hr;
++
++        TRACE( "options %d, async %p, adding offline user\n", (int)options, async );
++
++        if ( !async ) return E_POINTER;
++        if ( FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) ) return hr;
++        hr = xthreading->XAsyncBegin( async, nullptr, XUserAddAsyncIdentity, "XUserAddAsync", OfflineUserAddProvider );
++        xthreading->Release();
++        return hr;
+     }
+ 
+     HRESULT WINAPI XUserAddResult( XAsyncBlock *async, XUserHandle *newUser ) override
+     {
+-        FIXME( "async %p, newUser %p stub!\n", async, newUser );
+-        return E_NOTIMPL;
++        IXThreadingImpl *xthreading;
++        HRESULT hr;
++
++        TRACE( "async %p, newUser %p\n", async, newUser );
++
++        if ( !newUser ) return E_POINTER;
++        if ( FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) ) return hr;
++        hr = xthreading->XAsyncGetResult( async, XUserAddAsyncIdentity, sizeof(XUserHandle), newUser, nullptr );
++        xthreading->Release();
++        return hr;
+     }
+ 
+     HRESULT WINAPI XUserGetLocalId( XUserHandle user, XUserLocalId *userLocalId ) override
+     {
+-        FIXME( "user %p, userLocalId %p stub!\n", user, userLocalId );
+-        return E_NOTIMPL;
++        TRACE( "user %p, userLocalId %p\n", user, userLocalId );
++        if ( !userLocalId ) return E_POINTER;
++        if ( !IsOfflineUser( user ) ) return E_INVALIDARG;
++        userLocalId->value = OfflineUserLocalId;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI XUserFindUserByLocalId( XUserLocalId userLocalId, XUserHandle *handle ) override
+     {
+-        FIXME( "userLocalId %p, handle %p stub!\n", &userLocalId, handle );
+-        return E_NOTIMPL;
++        TRACE( "userLocalId %I64u, handle %p\n", userLocalId.value, handle );
++        if ( !handle ) return E_POINTER;
++        if ( userLocalId.value != OfflineUserLocalId ) return E_GAMEUSER_USER_NOT_FOUND;
++        *handle = &g_offline_user;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI XUserGetId( XUserHandle user, UINT64 *userId ) override
+     {
+-        FIXME( "user %p, userId %p stub!\n", user, userId );
+-        return E_NOTIMPL;
++        TRACE( "user %p, userId %p\n", user, userId );
++        if ( !userId ) return E_POINTER;
++        if ( !IsOfflineUser( user ) ) return E_INVALIDARG;
++        *userId = OfflineUserXuid;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI XUserFindUserById( UINT64 userId, XUserHandle *handle ) override
+     {
+-        FIXME( "userId %llu, handle %p stub!\n", userId, handle );
+-        return E_NOTIMPL;
++        TRACE( "userId %I64u, handle %p\n", userId, handle );
++        if ( !handle ) return E_POINTER;
++        if ( userId != OfflineUserXuid ) return E_GAMEUSER_USER_NOT_FOUND;
++        *handle = &g_offline_user;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI XUserGetIsGuest( XUserHandle user, BOOLEAN *isGuest ) override
+     {
+-        FIXME( "user %p, isGuest %p stub!\n", user, isGuest );
+-        return E_NOTIMPL;
++        TRACE( "user %p, isGuest %p\n", user, isGuest );
++        if ( !isGuest ) return E_POINTER;
++        *isGuest = FALSE;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI XUserGetState( XUserHandle user, XUserState *state ) override
+     {
+-        FIXME( "user %p, state %p stub!\n", user, state );
+-        return E_NOTIMPL;
++        TRACE( "user %p, state %p\n", user, state );
++        if ( !state ) return E_POINTER;
++        *state = IsOfflineUser( user ) ? XUserState::SignedIn : XUserState::SignedOut;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI __PADDING__() override
+@@ -224,14 +331,19 @@ public:
+ 
+     HRESULT WINAPI XUserGetAgeGroup( XUserHandle user, XUserAgeGroup *ageGroup ) override
+     {
+-        FIXME( "user %p, ageGroup %p stub!\n", user, ageGroup );
+-        return E_NOTIMPL;
++        TRACE( "user %p, ageGroup %p\n", user, ageGroup );
++        if ( !ageGroup ) return E_POINTER;
++        *ageGroup = XUserAgeGroup::Adult;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI XUserCheckPrivilege( XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege, BOOLEAN *hasPrivilege, XUserPrivilegeDenyReason *reason ) override
+     {
+-        FIXME( "user %p, options %d, privilege %d, hasPrivilege %p, reason %p stub!\n", user, (int)options, (int)privilege, hasPrivilege, reason );
+-        return E_NOTIMPL;
++        TRACE( "user %p, options %d, privilege %d, hasPrivilege %p, reason %p\n", user, (int)options, (int)privilege, hasPrivilege, reason );
++        if ( !hasPrivilege ) return E_POINTER;
++        *hasPrivilege = TRUE;
++        if ( reason ) *reason = XUserPrivilegeDenyReason::None;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI XUserResolvePrivilegeWithUiAsync( XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege, XAsyncBlock *async ) override
+@@ -308,14 +420,17 @@ public:
+ 
+     HRESULT WINAPI XUserRegisterForChangeEvent( XTaskQueueHandle queue, void *context, XUserChangeEventCallback *callback, XTaskQueueRegistrationToken *token ) override
+     {
+-        FIXME( "queue %p, context %p, callback %p, token %p stub!\n", queue, context, callback, token );
+-        return E_NOTIMPL;
++        // the offline user never changes, so the callback is never invoked
++        TRACE( "queue %p, context %p, callback %p, token %p\n", queue, context, callback, token );
++        if ( !token ) return E_POINTER;
++        token->token = 1;
++        return S_OK;
+     }
+ 
+     BOOLEAN WINAPI XUserUnregisterForChangeEvent( XTaskQueueRegistrationToken token, BOOLEAN wait ) override
+     {
+-        FIXME( "token %p, wait %d stub!\n", &token, wait );
+-        return FALSE;
++        TRACE( "token %I64u, wait %d\n", token.token, wait );
++        return TRUE;
+     }
+ 
+     HRESULT WINAPI XUserGetSignOutDeferral( XUserSignOutDeferralHandle *deferral ) override
+@@ -408,6 +523,27 @@ public:
+         return E_NOTIMPL;
+     }
+ 
++    HRESULT WINAPI XUserGetGamertag( XUserHandle user, XUserGamertagComponent gamertagComponent, SIZE_T gamertagSize, char *gamertag, SIZE_T *gamertagUsed ) override
++    {
++        char name[16] = "Player";
++        DWORD len = sizeof(name);
++        SIZE_T needed;
++
++        TRACE( "user %p, gamertagComponent %d, gamertagSize %Iu, gamertag %p, gamertagUsed %p\n", user, (int)gamertagComponent, gamertagSize, gamertag, gamertagUsed );
++
++        if ( !gamertag ) return E_POINTER;
++        if ( !IsOfflineUser( user ) ) return E_INVALIDARG;
++        // gamertags are at most 15 characters; use the Windows (= Linux) user name
++        if ( !GetUserNameA( name, &len ) ) lstrcpyA( name, "Player" );
++        name[15] = 0;
++
++        needed = std::strlen( name ) + 1;
++        if ( gamertagSize < needed ) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++        std::memcpy( gamertag, name, needed );
++        if ( gamertagUsed ) *gamertagUsed = needed;
++        return S_OK;
++    }
++
+     std::atomic_long ref{ 1 };
+ };
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,64 @@
+From 54444849bce145abff4ff8f309e0a7a4ee71f725 Mon Sep 17 00:00:00 2001
+From: martinv <martinrobotika@gmail.com>
+Date: Fri, 9 Oct 2026 23:36:43 +0200
+Subject: [PATCH 3/6] xgameruntime: Fix XAsyncBlock overrun and a null
+ dereference in XAsyncSchedule.
+
+AllocState cleared sizeof(asyncBlock->internal) *pointers* instead of bytes:
+internal is void*[4] in this port (unsigned char[32] upstream), so every
+XAsyncBegin zeroed 224 bytes past the caller's XAsyncBlock. Balatro crashed in
+its own code right after XUserAddAsync because of this.
+
+XAsyncSchedule traced state->queue after state.Detach() had nulled the
+reference, crashing whenever the gdkc channel was enabled.
+
+Also add the missing trailing newline to xtaskqueue.h, which made widl fail
+with "Unexpected end of file during preprocessing" for IDLs importing it.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/System/Threading/XAsync.cpp             | 9 +++------
+ include/xtaskqueue.h                                     | 2 +-
+ 2 files changed, 4 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.cpp b/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.cpp
+index 6b30344..bb8292e 100644
+--- a/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.cpp
++++ b/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.cpp
+@@ -405,10 +405,9 @@ static HRESULT AllocState(XAsyncBlock* asyncBlock, size_t contextSize)
+         RETURN_HR(E_INVALIDARG);
+     }
+ 
+-    for (auto i = 0u; i < sizeof(asyncBlock->internal); ++i)
+-    {
+-        asyncBlock->internal[i] = 0;
+-    }
++    // internal is void*[4] here (unsigned char[32] upstream): clear bytes, not sizeof() pointers,
++    // or this overruns the caller's XAsyncBlock by 224 bytes
++    memset(asyncBlock->internal, 0, sizeof(asyncBlock->internal));
+ 
+     internal = new (asyncBlock->internal) AsyncBlockInternal{};
+ 
+@@ -807,8 +806,6 @@ HRESULT WINAPI XAsyncSchedule(
+ 
+     state.Detach();
+ 
+-    TRACE("Before completion, queue here was %p\n", state->queue);
+-
+     return S_OK;
+ }
+ 
+diff --git a/include/xtaskqueue.h b/include/xtaskqueue.h
+index e312652..b543db2 100644
+--- a/include/xtaskqueue.h
++++ b/include/xtaskqueue.h
+@@ -92,4 +92,4 @@ BOOLEAN __stdcall XThreadIsTimeSensitive();
+ }
+ #endif
+ 
+-#endif
+\ No newline at end of file
++#endif
+-- 
+2.56.0
+

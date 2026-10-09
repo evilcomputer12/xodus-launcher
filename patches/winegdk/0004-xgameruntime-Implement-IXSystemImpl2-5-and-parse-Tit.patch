@@ -1,0 +1,106 @@
+From 80011dce15df51489a886f40f68a550a492f6ac9 Mon Sep 17 00:00:00 2001
+From: martinv <martinrobotika@gmail.com>
+Date: Fri, 9 Oct 2026 23:36:43 +0200
+Subject: [PATCH 4/6] xgameruntime: Implement IXSystemImpl2-5 and parse TitleId
+ as hex.
+
+Games query XSystemImpl for IXSystemImpl4 (XSystemHandleTrack,
+XSystemIsHandleValid, XSystemAllowFullDownloadBandwidth). TitleId in
+MicrosoftGame.config is hexadecimal (e.g. 6adc6be5), it was parsed as decimal.
+The sandbox id can be overridden with WINE_XBL_SANDBOX for development titles.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/InitInternalGDKC.cpp         |  2 +-
+ .../GDKComponent/System/XSystem.cpp           | 34 +++++++++++++++----
+ 2 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
+index fb90e48..a68361b 100644
+--- a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
++++ b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
+@@ -135,7 +135,7 @@ ObtainMsaAppId( INITIALIZE_OPTIONS *options )
+                 else if ( !strcmp( (LPSTR)child->name, "TitleId" ) )
+                 {
+                     LPSTR value = (LPSTR)xmlNodeGetContent( child );
+-                    titleId = strtoul( value, NULL, 10 );
++                    titleId = strtoul( value, NULL, 16 ); /* TitleId is hex in MicrosoftGame.config */
+                     free( value );
+                 }
+                 else if ( !strcmp( (LPSTR)child->name, "MSAFullTrust" ) )
+diff --git a/dlls/xgameruntime/GDKComponent/System/XSystem.cpp b/dlls/xgameruntime/GDKComponent/System/XSystem.cpp
+index 293da4a..ce6208f 100644
+--- a/dlls/xgameruntime/GDKComponent/System/XSystem.cpp
++++ b/dlls/xgameruntime/GDKComponent/System/XSystem.cpp
+@@ -31,7 +31,7 @@ const INT32 XSystemXboxLiveSandboxIdMaxBytes = 16;
+ const INT32 XSystemAppSpecificDeviceIdBytes = 45;
+ 
+ class XSystemImpl : 
+-    public IXSystemImpl
++    public IXSystemImpl5
+ {
+ public:
+     HRESULT WINAPI QueryInterface( REFIID iid, void **out )
+@@ -44,10 +44,14 @@ public:
+         if ( iid == __uuidof( IUnknown ) ||
+              iid == __uuidof( IInspectable ) ||
+              iid == __uuidof( IAgileObject ) ||
+-             iid == __uuidof( IXSystemImpl ) )
++             iid == __uuidof( IXSystemImpl ) ||
++             iid == __uuidof( IXSystemImpl2 ) ||
++             iid == __uuidof( IXSystemImpl3 ) ||
++             iid == __uuidof( IXSystemImpl4 ) ||
++             iid == __uuidof( IXSystemImpl5 ) )
+         {
+             AddRef();
+-            *out = static_cast<IXSystemImpl *>(this);
++            *out = static_cast<IXSystemImpl5 *>(this);
+             return S_OK;
+         }
+ 
+@@ -99,8 +103,9 @@ public:
+ 
+     HRESULT WINAPI XSystemGetXboxLiveSandboxId( INT32 sandboxIdSize, LPSTR sandboxId, SIZE_T *sandboxIdUsed ) override
+     {    
+-        // Always assume RETAIL environment for Wine
+-        LPCSTR Id = "RETAIL";
++        // Assume RETAIL environment for Wine unless overridden (debugging dev-sandbox titles)
++        LPCSTR Id = getenv( "WINE_XBL_SANDBOX" );
++        if ( !Id || !*Id ) Id = "RETAIL";
+ 
+         TRACE( "sandboxIdSize %d, sandboxId %p, sandboxIdUsed %p\n", sandboxIdSize, sandboxId, sandboxIdUsed );
+ 
+@@ -121,10 +126,27 @@ public:
+         return E_NOTIMPL;
+     }
+ 
++    HRESULT WINAPI XSystemHandleTrack( XSystemHandleCallback callback, void *context ) override
++    {
++        FIXME( "callback %p, context %p semi-stub!\n", callback, context );
++        return S_OK;
++    }
++
++    BOOLEAN WINAPI XSystemIsHandleValid( XSystemHandle handle ) override
++    {
++        TRACE( "handle %p\n", handle );
++        return handle != nullptr;
++    }
++
++    void WINAPI XSystemAllowFullDownloadBandwidth( BOOLEAN enable ) override
++    {
++        TRACE( "enable %d\n", enable );
++    }
++
+ private:
+     std::atomic_long ref{ 1 };
+ };
+ 
+ static XSystemImpl g_x_system;
+ 
+-IXSystemImpl *x_system = static_cast<IXSystemImpl*>(&g_x_system);
+\ No newline at end of file
++IXSystemImpl *x_system = static_cast<IXSystemImpl*>(static_cast<IXSystemImpl5*>(&g_x_system));
+\ No newline at end of file
+-- 
+2.56.0
+

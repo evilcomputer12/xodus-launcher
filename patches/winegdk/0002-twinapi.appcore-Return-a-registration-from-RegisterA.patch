@@ -1,0 +1,62 @@
+From e830c62958a56c0dd7069f94d8ff1cc83509e64b Mon Sep 17 00:00:00 2001
+From: martinv <martinrobotika@gmail.com>
+Date: Fri, 9 Oct 2026 23:36:43 +0200
+Subject: [PATCH 2/6] twinapi.appcore: Return a registration from
+ RegisterAppStateChangeNotification.
+
+GDK titles (seen with Balatro) treat ERROR_CALL_NOT_IMPLEMENTED here as fatal
+and exit during startup. Hand out a heap-allocated registration instead; the
+routine is never invoked because desktop processes are never suspended, and
+UnregisterAppStateChangeNotification frees it.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ dlls/twinapi.appcore/main.c | 23 ++++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 72bf9b1..3137beb 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -33,10 +33,26 @@ ULONG WINAPI RegisterAppConstrainedChangeNotification( PAPPCONSTRAIN_CHANGE_ROUT
+ /***********************************************************************
+  *           RegisterAppStateChangeNotification (twinapi.appcore.@)
+  */
++struct appstate_registration
++{
++    PAPPSTATE_CHANGE_ROUTINE routine;
++    void *context;
++};
++
+ ULONG WINAPI RegisterAppStateChangeNotification( PAPPSTATE_CHANGE_ROUTINE routine, void *context, PAPPSTATE_REGISTRATION *reg )
+ {
+-    FIXME( "routine %p, context %p, reg %p - stub.\n", routine, context, reg );
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    struct appstate_registration *registration;
++
++    FIXME( "routine %p, context %p, reg %p - semi-stub.\n", routine, context, reg );
++
++    if (!reg) return ERROR_INVALID_PARAMETER;
++    /* Desktop apps are never suspended under Wine, so the routine is never called. GDK titles
++     * treat a failure here as fatal, so hand out a registration anyway. */
++    if (!(registration = HeapAlloc( GetProcessHeap(), 0, sizeof(*registration) ))) return ERROR_OUTOFMEMORY;
++    registration->routine = routine;
++    registration->context = context;
++    *reg = (PAPPSTATE_REGISTRATION)registration;
++    return ERROR_SUCCESS;
+ }
+ 
+ /***********************************************************************
+@@ -52,7 +68,8 @@ void WINAPI UnregisterAppConstrainedChangeNotification( PAPPCONSTRAIN_REGISTRATI
+  */
+ void WINAPI UnregisterAppStateChangeNotification( PAPPSTATE_REGISTRATION reg )
+ {
+-    FIXME( "reg %p - stub.\n", reg );
++    TRACE( "reg %p.\n", reg );
++    HeapFree( GetProcessHeap(), 0, reg );
+ }
+ 
+ HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
+-- 
+2.56.0
+
