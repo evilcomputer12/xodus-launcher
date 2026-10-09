@@ -11,8 +11,8 @@ makedepends=('cargo' 'git')
 provides=("${pkgname::-4}")
 conflicts=("${pkgname::-4}")
 options=(!lto)
-source=("git+$url.git")
-sha256sums=('SKIP')
+source=("git+$url.git" "fix-prefix-cache-flush.patch")
+sha256sums=('SKIP' 'SKIP')
 
 pkgver() {
 	# Todo: change this into the tag system when stable point builds are released!
@@ -22,6 +22,7 @@ pkgver() {
 
 prepare() {
 	cd "$srcdir/${pkgname::-4}"
+	git apply "$srcdir/fix-prefix-cache-flush.patch"
 	export RUSTUP_TOOLCHAIN=stable
 	cargo fetch --locked --target host-tuple
 }
@@ -30,7 +31,7 @@ build() {
 	cd "$srcdir/${pkgname::-4}"
 	export RUSTUP_TOOLCHAIN=stable
 	export CARGO_TARGET_DIR=target
-	cargo build --frozen --release --all-features
+	cargo build --frozen --release --workspace
 }
 
 check() {
@@ -40,6 +41,7 @@ check() {
 package() {
 	cd "$srcdir/${pkgname::-4}"
 	install -Dm755 target/release/xodus-cli "${pkgdir}/usr/bin/${pkgname::-4}-cli"
+	install -Dm755 target/release/xodus-service "${pkgdir}/usr/bin/${pkgname::-4}-service"
 	install -dm755 "${pkgdir}/usr/share/doc"
 	cp -a docs/ "${pkgdir}/usr/share/doc/${pkgname::-4}"
 }
