@@ -1,0 +1,304 @@
+From 113e74bed9d3c1d300d31a02dc74b0010600c823 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 12:25:56 +0200
+Subject: [PATCH 22/22] xgameruntime: Implement IXGameSaveImpl4 (PlayFab game
+ saves)
+
+GDK 2504 and later serve the PlayFab game save API (PFXGameSave.h) through
+a fourth version of the XGameSave class interface, {ab4ae4fb-6508-4950-
+a032-45fd4bf8c43b}, whose vtable appends the seventeen PFXGameSave*
+methods to IXGameSaveImpl3. The GDK shim in a game built with those SDKs
+queries that interface for every XGameSave call, so a runtime that does
+not know it fails all game saves: Brotato crashes right after the
+E_NOINTERFACE with a null provider.
+
+The slot order comes from the XGameSave wrappers of xgameruntime.lib in
+the public Microsoft.GDK.PC 2510 package, the signatures from its
+PFXGameSave.h. With PlayFab the game saves files in a folder the runtime
+hands out and syncs with the cloud, driving a sync UI through callbacks.
+Here the folder is local (XodusGames\<title>\PlayFabSave, or the
+fileLocation the game asks for), nothing is synced, the UI callbacks are
+accepted but never invoked, progress is always complete and uploads and
+save descriptions complete immediately.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/System/XGameSave.cpp         | 155 +++++++++++++++++-
+ dlls/xgameruntime/main.c                      |   2 +-
+ dlls/xgameruntime/private.h                   |   2 +-
+ include/xgamesave.idl                         |  45 ++++-
+ 4 files changed, 197 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/System/XGameSave.cpp b/dlls/xgameruntime/GDKComponent/System/XGameSave.cpp
+index 0208cf4..7943f5e 100644
+--- a/dlls/xgameruntime/GDKComponent/System/XGameSave.cpp
++++ b/dlls/xgameruntime/GDKComponent/System/XGameSave.cpp
+@@ -365,8 +365,32 @@ static const char ReadIdentity[] = "XGameSaveReadBlobDataAsync";
+ static const char SubmitIdentity[] = "XGameSaveSubmitUpdateAsync";
+ static const char FilesFolderIdentity[] = "XGameSaveFilesGetFolderWithUiAsync";
+ 
++/* PlayFab game saves (PFXGameSave.h, GDK 2504+): the game asks for a folder, saves files in it and
++ * the runtime keeps it in sync with the PlayFab cloud, driving a sync UI through callbacks. Here
++ * the folder is local and never synced, so the callbacks are never invoked, the progress is always
++ * "complete" and uploads succeed immediately. */
++struct PFXGameSaveConfig
++{
++    XUserHandle user;
++    std::string titleId;
++    std::string fileLocation;
++    UINT32 flags;
++};
++static const UINT32 PFInitFlagUseFileLocation = 0x8;
++static const UINT32 PFSyncStateComplete = 5;
++static const char PFFolderIdentity[] = "PFXGameSaveFilesGetFolderWithUiAsync";
++static const char PFUploadIdentity[] = "PFXGameSaveFilesUploadWithUiAsync";
++static const char PFDescriptionIdentity[] = "PFXGameSaveFilesSetSaveDescriptionAsync";
++
++static HRESULT BeginCompletedAsync( XAsyncBlock *async, const void *identity, const char *name )
++{
++    auto ctx = new SaveAsyncContext();
++    ctx->work = []( SaveAsyncContext * ) { return S_OK; };
++    return BeginSaveAsync( async, identity, name, ctx );
++}
++
+ class XGameSaveImpl :
+-    public IXGameSaveImpl3
++    public IXGameSaveImpl4
+ {
+ public:
+     HRESULT WINAPI QueryInterface( REFIID iid, void **out )
+@@ -379,10 +403,11 @@ public:
+         if ( iid == __uuidof( IUnknown ) ||
+              iid == __uuidof( IXGameSaveImpl ) ||
+              iid == __uuidof( IXGameSaveImpl2 ) ||
+-             iid == __uuidof( IXGameSaveImpl3 ) )
++             iid == __uuidof( IXGameSaveImpl3 ) ||
++             iid == __uuidof( IXGameSaveImpl4 ) )
+         {
+             AddRef();
+-            *out = static_cast<IXGameSaveImpl3 *>(this);
++            *out = static_cast<IXGameSaveImpl4 *>(this);
+             return S_OK;
+         }
+ 
+@@ -722,10 +747,132 @@ public:
+         return S_OK;
+     }
+ 
++    HRESULT WINAPI PFXGameSaveInitializeConfig( struct PFXGameSaveConfigRequest *configRequest, PFXGameSaveConfigHandle *config ) override
++    {
++        TRACE( "configRequest %p, config %p\n", configRequest, config );
++        if ( !config ) return E_POINTER;
++        *config = nullptr;
++        if ( !configRequest ) return E_INVALIDARG;
++        TRACE( "user %p, titleId %s, flags %#x, fileLocation %s\n", configRequest->requestingUser, debugstr_a( configRequest->titleId ),
++               configRequest->flags, debugstr_a( configRequest->fileLocation ) );
++        auto c = new PFXGameSaveConfig();
++        c->user = configRequest->requestingUser;
++        c->titleId = configRequest->titleId ? configRequest->titleId : "";
++        c->fileLocation = configRequest->fileLocation ? configRequest->fileLocation : "";
++        c->flags = configRequest->flags;
++        *config = c;
++        return S_OK;
++    }
++    void WINAPI PFXGameSaveFreeConfig( PFXGameSaveConfigHandle config ) override
++    {
++        TRACE( "config %p\n", config );
++        delete config;
++    }
++    HRESULT WINAPI PFXGameSaveFilesGetFolderWithUiAsync( PFXGameSaveConfigHandle configHandle, XAsyncBlock *async ) override
++    {
++        TRACE( "configHandle %p, async %p\n", configHandle, async );
++        if ( !configHandle ) return E_GS_HANDLE_EXPIRED;
++        auto ctx = new SaveAsyncContext();
++        auto folder = std::make_shared<std::string>();
++        bool useLocation = (configHandle->flags & PFInitFlagUseFileLocation) && !configHandle->fileLocation.empty();
++        std::string location = configHandle->fileLocation;
++        ctx->work = [folder, useLocation, location]( SaveAsyncContext *c ) {
++            if ( useLocation )
++            {
++                CreateDirectoryA( location.c_str(), NULL );
++                *folder = location;
++                if ( folder->back() != '\\' ) *folder += '\\';
++            }
++            else *folder = TitleDir( "PlayFabSave" );
++            c->resultSize = folder->size() + 1;
++            return folder->empty() ? E_FAIL : S_OK;
++        };
++        ctx->fill = [folder]( void *buffer ) { memcpy( buffer, folder->c_str(), folder->size() + 1 ); };
++        return BeginSaveAsync( async, PFFolderIdentity, "PFXGameSaveFilesGetFolderWithUiAsync", ctx );
++    }
++    HRESULT WINAPI PFXGameSaveFilesGetFolderWithUiResult( XAsyncBlock *async, SIZE_T folderSize, char *folderResult ) override
++    {
++        TRACE( "async %p, folderSize %Iu, folderResult %p\n", async, folderSize, folderResult );
++        if ( !folderResult ) return E_POINTER;
++        return GetSaveAsyncResult( async, PFFolderIdentity, folderSize, folderResult, nullptr );
++    }
++    HRESULT WINAPI PFXGameSaveFilesGetRemainingQuota( PFXGameSaveConfigHandle configHandle, INT64 *remainingQuota ) override
++    {
++        TRACE( "configHandle %p, remainingQuota %p\n", configHandle, remainingQuota );
++        if ( !remainingQuota ) return E_POINTER;
++        if ( !configHandle ) return E_GS_HANDLE_EXPIRED;
++        *remainingQuota = GameSaveQuotaBytes;
++        return S_OK;
++    }
++    HRESULT WINAPI PFXGameSaveSetUiCallbacks( PFXGameSaveUiCallbacks *callbacks ) override
++    {
++        TRACE( "callbacks %p (never invoked: local saves do not sync)\n", callbacks );
++        return S_OK;
++    }
++    HRESULT WINAPI PFXGameSaveProgressUiGetProgress( XUserHandle requestingUser, UINT32 *syncState, UINT64 *current, UINT64 *total ) override
++    {
++        TRACE( "requestingUser %p, syncState %p, current %p, total %p\n", requestingUser, syncState, current, total );
++        if ( syncState ) *syncState = PFSyncStateComplete;
++        if ( current ) *current = 0;
++        if ( total ) *total = 0;
++        return S_OK;
++    }
++    HRESULT WINAPI PFXGameSaveSetProgressUiResponse( XUserHandle requestingUser, UINT32 response ) override
++    {
++        TRACE( "requestingUser %p, response %u\n", requestingUser, response );
++        return S_OK;
++    }
++    HRESULT WINAPI PFXGameSaveSetSyncFailedUiResponse( XUserHandle requestingUser, UINT32 response ) override
++    {
++        TRACE( "requestingUser %p, response %u\n", requestingUser, response );
++        return S_OK;
++    }
++    HRESULT WINAPI PFXGameSaveSetActiveDeviceContentionUiResponse( XUserHandle requestingUser, UINT32 response ) override
++    {
++        TRACE( "requestingUser %p, response %u\n", requestingUser, response );
++        return S_OK;
++    }
++    HRESULT WINAPI PFXGameSaveSetConflictUiResponse( XUserHandle requestingUser, UINT32 response ) override
++    {
++        TRACE( "requestingUser %p, response %u\n", requestingUser, response );
++        return S_OK;
++    }
++    HRESULT WINAPI PFXGameSaveSetOutOfStorageUiResponse( XUserHandle requestingUser, UINT32 response ) override
++    {
++        TRACE( "requestingUser %p, response %u\n", requestingUser, response );
++        return S_OK;
++    }
++    HRESULT WINAPI PFXGameSaveFilesUploadWithUiAsync( PFXGameSaveConfigHandle configHandle, UINT32 options, XAsyncBlock *async ) override
++    {
++        TRACE( "configHandle %p, options %u, async %p\n", configHandle, options, async );
++        if ( !configHandle ) return E_GS_HANDLE_EXPIRED;
++        return BeginCompletedAsync( async, PFUploadIdentity, "PFXGameSaveFilesUploadWithUiAsync" );
++    }
++    HRESULT WINAPI PFXGameSaveFilesUploadWithUiResult( XAsyncBlock *async ) override
++    {
++        TRACE( "async %p\n", async );
++        return GetSaveAsyncResult( async, PFUploadIdentity, 0, nullptr, nullptr );
++    }
++    HRESULT WINAPI PFXGameSaveFilesSetSaveDescriptionAsync( PFXGameSaveConfigHandle configHandle, const char *shortSaveDescription, XAsyncBlock *async ) override
++    {
++        TRACE( "configHandle %p, shortSaveDescription %s, async %p\n", configHandle, debugstr_a( shortSaveDescription ), async );
++        if ( !configHandle ) return E_GS_HANDLE_EXPIRED;
++        return BeginCompletedAsync( async, PFDescriptionIdentity, "PFXGameSaveFilesSetSaveDescriptionAsync" );
++    }
++    HRESULT WINAPI PFXGameSaveFilesSetSaveDescriptionResult( XAsyncBlock *async ) override
++    {
++        TRACE( "async %p\n", async );
++        return GetSaveAsyncResult( async, PFDescriptionIdentity, 0, nullptr, nullptr );
++    }
++    HRESULT WINAPI PFXGameSaveSetActiveDeviceChangedCallback( void *callback, void *context ) override
++    {
++        TRACE( "callback %p, context %p (never invoked)\n", callback, context );
++        return S_OK;
++    }
+ private:
+     std::atomic_long ref{ 1 };
+ };
+ 
+ static XGameSaveImpl g_x_game_save;
+ 
+-IXGameSaveImpl3 *x_game_save = static_cast<IXGameSaveImpl3*>(&g_x_game_save);
++IXGameSaveImpl4 *x_game_save = static_cast<IXGameSaveImpl4*>(&g_x_game_save);
+diff --git a/dlls/xgameruntime/main.c b/dlls/xgameruntime/main.c
+index 1f0a57e..1cbe670 100644
+--- a/dlls/xgameruntime/main.c
++++ b/dlls/xgameruntime/main.c
+@@ -244,7 +244,7 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
+     }
+     else if ( IsEqualGUID( runtimeClassId, &CLSID_XGameSaveImpl ) )
+     {
+-        return IXGameSaveImpl3_QueryInterface( x_game_save, interfaceId, out );
++        return IXGameSaveImpl4_QueryInterface( x_game_save, interfaceId, out );
+     }
+     else if ( IsEqualGUID( runtimeClassId, &CLSID_XGameImpl ) )
+     {
+diff --git a/dlls/xgameruntime/private.h b/dlls/xgameruntime/private.h
+index 56feb61..cb379b2 100644
+--- a/dlls/xgameruntime/private.h
++++ b/dlls/xgameruntime/private.h
+@@ -132,7 +132,7 @@ void xodus_install_force_close( HINSTANCE module );
+ extern IXGameRuntimeFeatureImpl *x_game_runtime_feature;
+ extern IXSystemImpl *x_system;
+ extern IXGameImpl3 *x_game;
+-extern IXGameSaveImpl3 *x_game_save;
++extern IXGameSaveImpl4 *x_game_save;
+ extern IXPersistentLocalStorageImpl3 *x_persistent_local_storage;
+ extern IXSystemAnalyticsImpl *x_system_analytics;
+ extern IXNetworkingImpl *x_networking;
+diff --git a/include/xgamesave.idl b/include/xgamesave.idl
+index 07cdcfc..92bb528 100644
+--- a/include/xgamesave.idl
++++ b/include/xgamesave.idl
+@@ -116,12 +116,55 @@ interface IXGameSaveImpl3 : IXGameSaveImpl2
+ {
+ }
+ 
++typedef struct PFXGameSaveConfig *PFXGameSaveConfigHandle;
++typedef struct PFXGameSaveUiCallbacks PFXGameSaveUiCallbacks;
++
++/* PFXGameSave.h: request for PFXGameSaveInitializeConfig */
++struct PFXGameSaveConfigRequest
++{
++    XUserHandle requestingUser;
++    const char *titleId;
++    const char *apiUrl;
++    UINT32 flags;
++    const char *entityId;
++    const char *entityToken;
++    const char *fileLocation;
++};
++
++/* GDK 2504+: the PlayFab game save API (PFXGameSave.h) is served by the same class. Slot order
++ * taken from the XGameSave wrappers of xgameruntime.lib (GDK 2510). */
++[
++    local,
++    object,
++    uuid(ab4ae4fb-6508-4950-a032-45fd4bf8c43b)
++]
++interface IXGameSaveImpl4 : IXGameSaveImpl3
++{
++    HRESULT PFXGameSaveInitializeConfig( [in] struct PFXGameSaveConfigRequest *configRequest, [out] PFXGameSaveConfigHandle *config );
++    void PFXGameSaveFreeConfig( [in] PFXGameSaveConfigHandle config );
++    HRESULT PFXGameSaveFilesGetFolderWithUiAsync( [in] PFXGameSaveConfigHandle configHandle, [in] XAsyncBlock *async );
++    HRESULT PFXGameSaveFilesGetFolderWithUiResult( [in] XAsyncBlock *async, [in] SIZE_T folderSize, [out] char *folderResult );
++    HRESULT PFXGameSaveFilesGetRemainingQuota( [in] PFXGameSaveConfigHandle configHandle, [out] INT64 *remainingQuota );
++    HRESULT PFXGameSaveSetUiCallbacks( [in] PFXGameSaveUiCallbacks *callbacks );
++    HRESULT PFXGameSaveProgressUiGetProgress( [in] XUserHandle requestingUser, [out] UINT32 *syncState, [out] UINT64 *current, [out] UINT64 *total );
++    HRESULT PFXGameSaveSetProgressUiResponse( [in] XUserHandle requestingUser, [in] UINT32 response );
++    HRESULT PFXGameSaveSetSyncFailedUiResponse( [in] XUserHandle requestingUser, [in] UINT32 response );
++    HRESULT PFXGameSaveSetActiveDeviceContentionUiResponse( [in] XUserHandle requestingUser, [in] UINT32 response );
++    HRESULT PFXGameSaveSetConflictUiResponse( [in] XUserHandle requestingUser, [in] UINT32 response );
++    HRESULT PFXGameSaveSetOutOfStorageUiResponse( [in] XUserHandle requestingUser, [in] UINT32 response );
++    HRESULT PFXGameSaveFilesUploadWithUiAsync( [in] PFXGameSaveConfigHandle configHandle, [in] UINT32 options, [in] XAsyncBlock *async );
++    HRESULT PFXGameSaveFilesUploadWithUiResult( [in] XAsyncBlock *async );
++    HRESULT PFXGameSaveFilesSetSaveDescriptionAsync( [in] PFXGameSaveConfigHandle configHandle, [in] const char *shortSaveDescription, [in] XAsyncBlock *async );
++    HRESULT PFXGameSaveFilesSetSaveDescriptionResult( [in] XAsyncBlock *async );
++    HRESULT PFXGameSaveSetActiveDeviceChangedCallback( [in] void *callback, [in] void *context );
++}
++
+ [
+     uuid(704c3f58-e629-4cc2-b197-30511b996fe2)
+ ]
+ coclass XGameSaveImpl
+ {
+-    [default] interface IXGameSaveImpl3;
++    [default] interface IXGameSaveImpl4;
+ }
+ 
+ cpp_quote("#endif")

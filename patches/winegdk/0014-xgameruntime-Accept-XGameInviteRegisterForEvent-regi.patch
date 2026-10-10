@@ -1,7 +1,7 @@
 From bfaf6c2a9ba86a2ff76e083f3ebf80838d2d0cc8 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 07:45:43 +0200
-Subject: [PATCH 14/21] xgameruntime: Accept XGameInviteRegisterForEvent
+Subject: [PATCH 14/22] xgameruntime: Accept XGameInviteRegisterForEvent
  registrations.
 
 Return S_OK with a non-zero token instead of E_NOTIMPL. Game invites never

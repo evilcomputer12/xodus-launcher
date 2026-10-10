@@ -13,7 +13,7 @@ classes. This table tracks what the open-source WineGDK build used by Xodus Laun
 | XNetworkingImpl | yes | | connectivity hint stubs |
 | XUserImpl | stubs | offline local player, gamertag, privileges | real Xbox Live sign-in planned via xodus-service |
 | XGameImpl | no | added (title id from MicrosoftGame.config) | |
-| XGameSaveImpl | no | added, local files under `AppData\Local\XodusGames\<titleid>\GameSave` | no cloud sync |
+| XGameSaveImpl | no | local containers/blobs under AppData\Local\XodusGames\<titleid>\GameSave; XGameSaveFiles folder; IXGameSaveImpl4 = PlayFab game saves (PFXGameSave.h, GDK 2504+): local folder, no cloud sync, UI callbacks never fire | Balatro saves; Brotato needs Impl4 for every save call |
 | XPersistentLocalStorageImpl | no | added | |
 | XStoreImpl | no | contexts + game licence (active, not trial, StoreId); add-on licence acquisitions return a handle that is never valid (= not owned); licence token / catalog still stubs | needed by Space Marine 2 at "Press button", Brotato at boot (DLC licence) |
 | XPackageImpl | no | packaged-process identity, enumeration of the game's own package, mount of the install dir, locale | identity parsed from MicrosoftGame.config |

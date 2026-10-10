@@ -1,7 +1,7 @@
 From 71e8d7b95f65d002d309739895832d71e95aa6cd Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 07:53:34 +0200
-Subject: [PATCH 18/21] xgameruntime: Implement
+Subject: [PATCH 18/22] xgameruntime: Implement
  XNetworkingQuerySecurityInformationForUrl[Utf16]Async.
 
 Both variants complete from a worker thread (the AsyncJob pattern of

@@ -1,7 +1,7 @@
 From 50361597b4f8c4feed8926220d9804b63531e1aa Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 11:52:33 +0200
-Subject: [PATCH 21/21] xgameruntime: Return licence handles for add-on
+Subject: [PATCH 21/22] xgameruntime: Return licence handles for add-on
  acquisitions
 
 XStoreAcquireLicenseForDurablesAsync and XStoreAcquireLicenseForPackageAsync

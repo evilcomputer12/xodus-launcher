@@ -58,11 +58,11 @@
     "9P9VNSQK1W3K": {
       "title": "Brotato",
       "status": "launches",
-      "notes": "Godot 4 game. Launches, renders at native resolution (VKD3D-Proton) and signs in to Xbox Live. Asks the game-save object for an interface WineGDK does not know ({ab4ae4fb-6508-4950-a032-45fd4bf8c43b}, stored next to GameSaveImpl in Microsoft's xgameruntime.dll, so a newer game-save interface); the game tolerates the E_NOINTERFACE. Downloading needs xodus with PR #217 (carried in patches/xodus). Gameplay not confirmed yet.",
+      "notes": "Godot 3 game built with a 2025 GDK: it acquires the licence of its DLC (9NLGSVFW9C0S) at boot and uses the PlayFab game-save API (PFXGameSave, IXGameSaveImpl4) for every save call; both need the WineGDK commits 5036159 and 113e74b (add-on licence handles, IXGameSaveImpl4 with a local save folder, no cloud sync). Renders at native resolution, signs in to Xbox Live, runs stable with those. Download needs xodus with PR #217 (carried in patches/xodus). Menu/gameplay not confirmed yet.",
       "tested": {
         "date": "2026-10-10",
         "launcher": "3ad46ae",
-        "winegdk": "xodus-launcher@283602e (source build)",
+        "winegdk": "xodus-launcher@113e74b (source build)",
         "gpu": "AMD Radeon RX 7600 XT (RADV, Mesa 26.2)",
         "distro": "CachyOS"
       }
