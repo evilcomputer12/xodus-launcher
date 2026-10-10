@@ -34,9 +34,10 @@ component, the launcher downloads it on your machine from Microsoft's servers an
 ```sh
 # 1. xodus-cli + xodus-service (AUR package with our fixes)
 scripts/build-xodus.sh
-# 2. WineGDK with our patches (takes ~20 minutes)
-sudo pacman -S --needed mingw-w64-gcc autoconf bison flex gnutls vulkan-headers
-scripts/build-winegdk.sh
+# 2. WineGDK: the launcher's "Set up Wine" button downloads the prebuilt build from the
+#    GitHub releases (no compiler needed). To build it yourself instead (~20 minutes):
+#    sudo pacman -S --needed mingw-w64-gcc autoconf bison flex gnutls vulkan-headers
+#    scripts/build-winegdk.sh
 # 3. the launcher
 sudo pacman -S --needed pyside6 python
 ./install.sh

@@ -540,8 +540,46 @@ def download_resumable(url, path, log, attempts=30):
     raise RuntimeError(f"Download failed after {attempts} attempts ({human_size(got)} received)")
 
 
+RELEASES_API = "https://api.github.com/repos/evilcomputer12/xodus-launcher/releases/latest"
+
+
+def download_winegdk_release(log):
+    """Fetch the prebuilt WineGDK tarball from the project's latest GitHub release into DATA_DIR."""
+    rel = http_json(RELEASES_API, 60)
+    assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}
+    tar_name = next((n for n in assets if n.endswith("-x86_64.tar.zst")), None)
+    if not tar_name:
+        raise RuntimeError("the latest release has no WineGDK tarball")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tpath = CACHE_DIR / tar_name
+    log(f"Downloading prebuilt WineGDK {rel.get('tag_name')} (~420 MB) ...")
+    download_resumable(assets[tar_name], tpath, log)
+    if tar_name + ".sha256" in assets:
+        expected = http_get(assets[tar_name + ".sha256"], 60).decode().split()[0]
+        h = hashlib.sha256()
+        with open(tpath, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        if h.hexdigest() != expected:
+            tpath.unlink()
+            raise RuntimeError("SHA-256 checksum mismatch for the WineGDK download")
+        log("Checksum OK")
+    log("Extracting ...")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if shutil.which("tar") and shutil.which("zstd"):
+        subprocess.run(["tar", "-I", "zstd", "-xf", str(tpath), "-C", str(DATA_DIR)], check=True)
+    else:
+        with tarfile.open(tpath, "r:zst") as t:  # Python >= 3.14
+            t.extractall(DATA_DIR, filter="tar")
+    tpath.unlink()
+    if not (DATA_DIR / "wine-gdk/bin/wine").exists():
+        raise RuntimeError("the WineGDK tarball did not contain wine-gdk/bin/wine")
+    log("WineGDK installed")
+
+
 def setup_wine(cfg, log):
-    """Download the xodus Proton build, create a prefix with DXVK/VKD3D. Returns wine path."""
+    """Get WineGDK (prebuilt release, or a local build), DXVK/VKD3D from the xodus Proton build,
+    and create the prefix. Returns the wine path."""
     PROTON_DIR.mkdir(parents=True, exist_ok=True)
     wine = find_proton_wine()
     if not wine:
@@ -576,6 +614,8 @@ def setup_wine(cfg, log):
         if not wine:
             raise RuntimeError("Proton archive did not contain files/bin/wine")
     dist = Path(wine).parent.parent  # Proton dist: source of DXVK / VKD3D-Proton
+    if not any(w.exists() for w in BUILT_WINES):
+        download_winegdk_release(log)
     wine = find_wine()
     log(f"Wine: {wine}")
     if list(Path(wine).parent.parent.glob("lib*/wine/*/xgameruntime.dll")):
