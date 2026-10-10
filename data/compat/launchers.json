@@ -24,6 +24,9 @@
         "kind": "ge-proton",
         "min_version": "GE-Proton10-18",
         "prefer_tools": [
+          "Proton - Experimental",
+          "Proton 11",
+          "UMU-Proton-11",
           "UMU-Proton-10",
           "GE-Proton10",
           "Proton 10"
@@ -31,6 +34,10 @@
         "release": {
           "repo": "Open-Wine-Components/umu-proton",
           "tag": "UMU-Proton-10.0-4"
+        },
+        "steam_tool": {
+          "name": "Proton - Experimental",
+          "appid": 1493710
         }
       },
       "prefix": {
@@ -95,6 +102,7 @@
         "notes": "Ubisoft Connect itself has no anti-cheat. Of the 60 Ubisoft titles in the local Game Pass catalog index most are single-player (Assassin's Creed series, Far Cry 3/4/5/6/New Dawn/Primal, Watch Dogs 2, Immortals, Prince of Persia, Rayman, Child of Light, Star Wars Outlaws, Avatar, South Park, Trials...). Titles with anti-cheat, with AreWeAntiCheatYet status measured on the STEAM builds: Easy Anti-Cheat - For Honor (Supported), The Division 2 (Supported; Ubisoft enabled EAC's Proton support in Jan 2023, confirmed for Steam only; DX12 mode crashes), Far Cry 5 (Supported), Ghost Recon Wildlands (Broken), Brawlhalla (Supported); BattlEye - Rainbow Six Siege (Denied by Ubisoft: online play unavailable), Ghost Recon Breakpoint (Supported), Watch Dogs: Legion (Supported; BattlEye only guards Online mode), Riders Republic (Supported with tweaks), Skull and Bones (Running), The Crew Motorfest (Supported), The Crew 2 (Broken); FairFight (server-side) - The Division; Denuvo Anti-Cheat - Rainbow Six Extraction (Running); PunkBuster on old titles (AC III/IV/Brotherhood/Revelations, Far Cry 2/3) is inert. Mechanism: Proton's Wine (ValveSoftware/wine dlls/ntdll/unix/loader.c set_dll_path) appends $PROTON_BATTLEYE_RUNTIME/v1/lib/wine and /v1/lib64/wine plus $PROTON_EAC_RUNTIME/v2/lib32 and /v2/lib64 to the builtin DLL search path, so the game's EAC/BattlEye Windows modules are replaced by Valve's Linux builds; the runtimes are Steam apps 1826330 'Proton EasyAntiCheat Runtime' (steamapps/common/Proton EasyAntiCheat Runtime) and 1161040 'Proton BattlEye Runtime' (steamapps/common/Proton BattlEye Runtime). Steam exports the two env vars itself; outside Steam, Lutris sets PROTON_EAC_RUNTIME=<runtime_dir>/eac_runtime and PROTON_BATTLEYE_RUNTIME=<runtime_dir>/battleye_runtime (lutris/runners/wine.py) and Heroic does the same, both fetching the runtimes from https://lutris.net/api/runtimes (eac_runtime-20240114.tar.xz and battleeye_runtime.tar.xz on github.com/lutris/buildbot releases) - a third-party redistribution of Valve's runtime, so prefer reusing an existing Steam install and make the Lutris mirror an explicit opt-in. EAC additionally needs the game to ship its Linux module (EasyAntiCheat/easyanticheat_x64.so) and the publisher to enable Proton support on the EAC/BattlEye backend; those switches are per game, but it is unverified whether the Ubisoft Connect (Game Pass) builds ship the same modules as the Steam builds. Single-player bypass: no Ubisoft title is known to use the start_protected_game.exe bootstrapper pattern (EAC/BattlEye are loaded in-process), so the Space Marine 2 bypass does not apply; for titles whose anti-cheat only gates online modes (e.g. Watch Dogs: Legion Online) label online as unavailable unless the matching runtime is configured and the title is listed Supported."
       },
       "known_issues": [
+        "2026-10-10: on GE-Proton 11-7 and Proton-CachyOS 11 the client's UI thread loops in RtlUnwindEx (STATUS_LONGJUMP) until it overflows its stack and the client runs headless; Valve's Proton Experimental (Wine 11 based, no staging patches) runs it fine.",
         "2026-10-10: client 174.1.13380 (built 2026-10-01) shows no window on any Wine 11 based build (GE-Proton11-7, Proton-CachyOS 11, plain Wine 11): its UI thread does 48 longjmp unwinds and overflows its stack inside Wine's 32-bit ucrtbase, the client swallows the exception and runs headless. Wine 10 based builds work (UMU-Proton-10.0-4 verified: login window), so the recipe prefers Proton 10 builds and downloads UMU-Proton-10.0-4 when none is installed.",
         "Ubisoft Connect auto-updates itself and has repeatedly broken under Wine/Proton: 2023-02-01 ('Game starter version mismatch' / unrecoverable error; fixed the same day in Proton Experimental and by GE-Proton7-49), 2023-08-01 (needed WINE_SIMULATE_WRITECOPY=1 for UplayWebCore.exe; Proton Experimental 'Fixed Ubisoft Connect not working after its recent update', GE-Proton8-10 'fixes Ubisoft Connect'), 2025-09 ('Ubisoft connect has detected an unsolvable error and needs to be restarted'; fixed by moving to GE-Proton10-10 or newer, one report also needed a wiped, reinstalled prefix). Keep GE-Proton current and expect breakage right after client updates.",
         "ntsync: GE-Proton10-18 (2025-10-12) 'imported ntsync ubisoft connect fix'; on kernels with ntsync (CachyOS) use GE-Proton10-18 or newer, or set PROTON_NO_NTSYNC=1 as a fallback. Historically (6.21-GE-1) fsync made the client hang at 'Looking for patches' on a fresh prefix while esync worked.",
@@ -199,11 +207,15 @@
         "kind": "ge-proton",
         "min_version": "GE-Proton11-1",
         "prefer_tools": [
-          "GE-Proton11",
           "Proton - Experimental",
-          "GE-Proton"
+          "Proton 11",
+          "UMU-Proton-11"
         ],
-        "release": null
+        "release": null,
+        "steam_tool": {
+          "name": "Proton - Experimental",
+          "appid": 1493710
+        }
       },
       "prefix": {
         "winetricks": [
@@ -265,6 +277,7 @@
         "notes": "The EA app client itself has no anti-cheat; only games do. (1) EA anticheat / 'EA Javelin' (kernel driver, Windows only): Battlefield 6/REDSEC/2042, Battlefield 1 and V (FairFight + EA anticheat), EA SPORTS FC 24-26, Madden 24-26, WRC 24, skate., PvZ Battle for Neighborville / Garden Warfare 2, FIFA 23 -> AreWeAntiCheatYet 'Denied': no Linux module exists, there is no single-player bypass, so label online modes unavailable and expect these not to start at all. EA has only posted a job listing (March 2026) about future Linux/Proton support for Javelin. (2) Easy Anti-Cheat with a Linux module: STAR WARS: Squadrons and Madden NFL 23 are 'Supported' with Steam's 'Proton EasyAntiCheat Runtime' (Steam app 1826330; BattlEye runtime is app 1161040). Mechanism: Proton's Wine (ValveSoftware/wine dlls/ntdll/unix/loader.c set_dll_path) reads the PROTON_EAC_RUNTIME env var and adds <dir>/v2/lib32 and <dir>/v2/lib64 to the DLL search path (PROTON_BATTLEYE_RUNTIME likewise), so when Xodus runs GE-Proton's files/bin/wine directly it only has to export PROTON_EAC_RUNTIME=<path of app 1826330> in wine_env (under Steam the lsteamclient shim sets it from the installed app; Lutris points it at its own runtime/eac_runtime copy). Whether the EA-app builds of those titles ship the easyanticheat_x64.so Linux module like the Steam builds is unverified. Apex Legends dropped Linux support (EAC + Hyperion, Denied). (3) FairFight/PunkBuster only (server-side or user-mode): Titanfall, Titanfall 2, STAR WARS Battlefront (2015) / II (2017), Battlefield 4, Battlefield: Hardline run (Supported/Running). Mark EA Play/Game Pass titles with an EA anticheat entry as 'online unavailable / not launchable' in the compat DB; leave the rest as normal."
       },
       "known_issues": [
+        "2026-10-10: on GE-Proton 11-7 and Proton-CachyOS 11 the client's UI thread loops in RtlUnwindEx (STATUS_LONGJUMP) until it overflows its stack and the client runs headless; Valve's Proton Experimental (Wine 11 based, no staging patches) runs it fine.",
         "2026-10-10: the installer's last step moves the client into <version>\\EA Desktop and creates a directory symlink 'EA Desktop' -> '<version>\\EA Desktop' (CreateSymbolicLinkW); builds without reparse-point support (UMU-Proton-10.0-4 returns success without creating the link) make the install roll back with 0x8007065b. Wine 11 based builds (GE-Proton 11, Proton Experimental) create the link, so the recipe prefers them.",
         "Self-update layout: the installer/updater may place the client in a versioned folder, drive_c/Program Files/Electronic Arts/EA Desktop/<version>/EA Desktop/EALauncher.exe (unifideck saw 13.735.2.6250/ in July 2026), instead of EA Desktop/EA Desktop/. Lutris' ea-app script runs a verifyea.sh after install and after every exit that moves <version>/EA Desktop up to EA Desktop/EA Desktop; alternatively resolve EALauncher.exe with a glob (NonSteamLaunchers does find -iname EALauncher.exe). Symptom when the path goes stale: 'Connecting to the EA app' splash then exit code 0 (lutris/lutris#6843, Aug-Oct 2026).",
         "EA app updates regularly break the Wine install: Jan 2026 an EA Desktop update left the launcher half-updated (RPC_S_SERVER_UNAVAILABLE 0x6ba, CreateSymbolicLinkW stubs) and games stopped launching until Proton Experimental (2026-01-29) / Proton 11.0-1-beta1 (2026-04-16) 'Fixed many EA games being unplayable after a recent EA Desktop update'; GE-Proton10-30 (2026-02-10) imported those upstream changes. Proton 11.0-1-beta2 (Xalia 0.4.9) fixed lockups when interacting with the EA App. Keep GE-Proton >= 11-1 (unifideck: unattended install + rendered login window on GE-Proton11-1, 2026-07-03); Lutris itself runs the client on dwproton-11.0-14 (Proton Experimental bleeding-edge 11.0, 2026-09-29). NonSteamLaunchers keeps a 'repaireaapp' path (re-run the installer /quiet into the same prefix) for when the client breaks itself.",
@@ -364,6 +377,9 @@
         "kind": "ge-proton",
         "min_version": "GE-Proton9-23",
         "prefer_tools": [
+          "Proton - Experimental",
+          "Proton 11",
+          "UMU-Proton-11",
           "UMU-Proton-10",
           "GE-Proton10",
           "Proton 10"
@@ -371,6 +387,10 @@
         "release": {
           "repo": "Open-Wine-Components/umu-proton",
           "tag": "UMU-Proton-10.0-4"
+        },
+        "steam_tool": {
+          "name": "Proton - Experimental",
+          "appid": 1493710
         }
       },
       "prefix": {
@@ -529,6 +549,9 @@
         "kind": "ge-proton",
         "min_version": "GE-Proton11-7",
         "prefer_tools": [
+          "Proton - Experimental",
+          "Proton 11",
+          "UMU-Proton-11",
           "UMU-Proton-10",
           "GE-Proton10",
           "Proton 10"
@@ -536,6 +559,10 @@
         "release": {
           "repo": "Open-Wine-Components/umu-proton",
           "tag": "UMU-Proton-10.0-4"
+        },
+        "steam_tool": {
+          "name": "Proton - Experimental",
+          "appid": 1493710
         }
       },
       "prefix": {
@@ -701,6 +728,9 @@
         "kind": "ge-proton",
         "min_version": null,
         "prefer_tools": [
+          "Proton - Experimental",
+          "Proton 11",
+          "UMU-Proton-11",
           "UMU-Proton-10",
           "GE-Proton10",
           "Proton 10"
@@ -708,6 +738,10 @@
         "release": {
           "repo": "Open-Wine-Components/umu-proton",
           "tag": "UMU-Proton-10.0-4"
+        },
+        "steam_tool": {
+          "name": "Proton - Experimental",
+          "appid": 1493710
         }
       },
       "prefix": {

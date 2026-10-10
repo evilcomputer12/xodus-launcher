@@ -311,6 +311,16 @@ def _log_tail(logfile, lines=15):
         return ""
 
 
+def scope_cmd(name):
+    """systemd-run prefix that puts a process in its own transient user scope, or [] without
+    systemd. systemd-oomd kills whole cgroups: a game that eats the RAM must not take the launcher
+    (or the terminal it was started from) down with it."""
+    if not shutil.which("systemd-run") or os.environ.get("XODUS_NO_SCOPE"):
+        return []
+    unit = re.sub(r"[^A-Za-z0-9_.-]", "-", f"{name}-{os.getpid()}-{int(time.time())}")
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}"]
+
+
 def prefix_activity(prefix, window=90):
     """Bytes written in the last `window` seconds under the prefix's drive_c (temp downloads,
     program files): lets a silent installer show that it is still doing something."""
@@ -533,6 +543,9 @@ def validate_launchers_db(db):
             errors.append(f"{where}.runtime.min_version: GE-ProtonX-Y or null")
         if not all(isinstance(v, str) and v for v in rt.get("prefer_tools", []) or []):
             errors.append(f"{where}.runtime.prefer_tools: a list of directory-name prefixes")
+        st = rt.get("steam_tool")
+        if st is not None and not (isinstance(st, dict) and isinstance(st.get("name"), str) and isinstance(st.get("appid"), int)):
+            errors.append(f"{where}.runtime.steam_tool: {{name, appid}}")
         relz = rt.get("release")
         if relz is not None and not (isinstance(relz, dict) and re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", str(relz.get("repo", "")))
                                      and re.match(r"^[A-Za-z0-9._-]+$", str(relz.get("tag", "")))):
@@ -1434,6 +1447,15 @@ class ThirdPartyLauncher:
         tag = ge_proton_installed()
         return _ge_root() / tag if tag else None
 
+    def runtime_hint(self):
+        """Readable message when none of the Proton builds the recipe needs is installed."""
+        rt = self.recipe.get("runtime") or {}
+        st = rt.get("steam_tool") or {}
+        msg = f"{self.name} needs one of these Proton builds installed by Steam or umu: " + ", ".join(rt.get("prefer_tools") or [])
+        if st:
+            msg += f". In Steam, install \"{st['name']}\" (steam://install/{st['appid']}) and try again"
+        return msg
+
     def use_umu(self):
         """Run through umu-launcher (Steam Linux Runtime container, what Lutris/Heroic do) when it
         is installed: Proton's 32-bit side needs libraries the host rarely has (Ubisoft Connect's
@@ -1441,14 +1463,18 @@ class ThirdPartyLauncher:
         return str((self.cfg or {}).get("thirdparty_runner", "umu")) == "umu" and bool(shutil.which("umu-run"))
 
     def runner_cmd(self, wine, exe, args=()):
-        """(argv, env) to run a Windows exe in this prefix with the selected Proton build."""
+        """(argv, env) to run a Windows exe in this prefix with the selected Proton build, in its
+        own systemd scope when available (an out-of-memory kill then takes the client, not the
+        launcher or the terminal it was started from)."""
         tool = Path(wine).parent.parent.parent
         self._tool_dir = tool
         if self.use_umu():
             env = self.env(runner="umu")
             env.update({"PROTONPATH": str(tool), "GAMEID": "umu-default", "STORE": "none"})
-            return ["umu-run", str(exe)] + [str(a) for a in args], env
-        return [wine, str(exe)] + [str(a) for a in args], self.env()
+            cmd = ["umu-run", str(exe)] + [str(a) for a in args]
+        else:
+            cmd, env = [wine, str(exe)] + [str(a) for a in args], self.env()
+        return scope_cmd(f"xodus-{self.id}") + cmd, env
 
     def wine(self):
         """GE-Proton's files/bin/wine for this launcher (downloads GE-Proton when needed)."""
@@ -1458,6 +1484,8 @@ class ThirdPartyLauncher:
         tool = find_proton_tool(rt.get("prefer_tools"))
         if not tool and rt.get("release"):
             tool = ensure_proton_release(self.cfg, rt["release"]["repo"], rt["release"]["tag"], self.log)
+        if not tool and rt.get("prefer_tools") and not rt.get("release"):
+            raise RuntimeError(self.runtime_hint())
         wine = str(tool / "files/bin/wine") if tool else \
             ensure_ge_proton(self.cfg, self.log, min_version=rt.get("min_version"))
         if not wine or not Path(wine).exists():
@@ -1814,6 +1842,8 @@ class ThirdPartyLauncher:
         rt = self.recipe.get("runtime") or {}
         progress("runtime", None, "Checking GE-Proton")
         tool = find_proton_tool(rt.get("prefer_tools"))
+        if not tool and rt.get("prefer_tools") and not rt.get("release"):
+            raise RuntimeError(self.runtime_hint())
         if not tool and rt.get("release"):
             progress("runtime", None, f"Fetching {rt['release']['tag']}")
             tool = ensure_proton_release(self.cfg, rt["release"]["repo"], rt["release"]["tag"], self.log,

@@ -1438,6 +1438,11 @@ def launch_game(cfg, game_dir, log=print, on_start=None):
             lf.write("\n".join(header + ["$ " + " ".join(cmd)]) + "\n")
             lf.flush()
             # new session so the whole wine process tree can be signalled as a group
+            try:
+                from thirdparty import scope_cmd
+                cmd = scope_cmd("xodus-game") + cmd
+            except ImportError:
+                pass
             p = subprocess.Popen(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT,
                                  cwd=cwd, start_new_session=True)
             if on_start:
