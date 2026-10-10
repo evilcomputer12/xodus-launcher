@@ -1,7 +1,7 @@
 From e306053309780340131e5e55f930c9f76461e5e8 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 01:33:23 +0200
-Subject: [PATCH 5/8] xodus: Add user identity claims and UserInfo protocol
+Subject: [PATCH 5/9] xodus: Add user identity claims and UserInfo protocol
  messages.
 
 TokenAndSignatureResponse now carries the identity claims of the user the

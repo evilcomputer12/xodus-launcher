@@ -1,7 +1,7 @@
 From 8a702dd3d2a29fdf1876183b70ab6ecad7340777 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:55:28 +0200
-Subject: [PATCH 3/8] xodus: Add TokenAndSignature protocol messages and
+Subject: [PATCH 3/9] xodus: Add TokenAndSignature protocol messages and
  title-bound sessions.
 
 New XML message pair TOKEN_AND_SIGNATURE_REQUEST (5) / _RESPONSE (6) carrying

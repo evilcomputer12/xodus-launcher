@@ -1,7 +1,7 @@
 From c0ed81d8ad0b58b9d8c0b31500ab7b41a358bddf Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:34:24 +0200
-Subject: [PATCH 1/8] msixvc: flush PrefixCacheFile writes before exposing them
+Subject: [PATCH 1/9] msixvc: flush PrefixCacheFile writes before exposing them
  to the reader
 
 PrefixCacheFile keeps two handles on the cache file: cache_writer (a

@@ -20,8 +20,9 @@ source=("git+$url.git"
         "0006-xodus-service-Report-identity-claims-with-TokenAndSi.patch"
         "0007-xodus-service-Handle-UserInfoRequest.patch"
         "0008-xodus-Document-that-TokenAndSignatureRequest-Body-ma.patch"
+        "0009-xodus-service-Do-not-panic-or-hang-on-MSA-faults-sta.patch"
 )
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 pkgver() {
 	# Todo: change this into the tag system when stable point builds are released!

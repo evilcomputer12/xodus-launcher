@@ -1,7 +1,7 @@
 From f9d2d85fa57b24443a061338b79a7e7379ce353f Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:55:28 +0200
-Subject: [PATCH 2/8] xodus: Add relying-party resolution and Xbox Live request
+Subject: [PATCH 2/9] xodus: Add relying-party resolution and Xbox Live request
  signing.
 
 resolve_relying_party() picks the relying party and signature policy for a

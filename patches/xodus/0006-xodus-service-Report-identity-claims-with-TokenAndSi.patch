@@ -1,7 +1,7 @@
 From 3abd0ab2629b2f04018ec229f5ac9a65efcd04ff Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 01:33:56 +0200
-Subject: [PATCH 6/8] xodus-service: Report identity claims with
+Subject: [PATCH 6/9] xodus-service: Report identity claims with
  TokenAndSignatureResponse.
 
 Success replies now carry the Xuid, gamertags, age group and user hash of

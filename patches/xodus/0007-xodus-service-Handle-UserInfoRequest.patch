@@ -1,7 +1,7 @@
 From ac9d871e7a6212df1fc6cf7ff5289dd735582eec Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 01:34:15 +0200
-Subject: [PATCH 7/8] xodus-service: Handle UserInfoRequest.
+Subject: [PATCH 7/9] xodus-service: Handle UserInfoRequest.
 
 Answer the runtime's UserInfoRequest (7) with a UserInfoResponse (8) that
 says who is signed in: the identity claims of an XSTS token for the default

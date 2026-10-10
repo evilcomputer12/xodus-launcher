@@ -1,7 +1,7 @@
 From 8d23982f8080898f24ec3ce682bb3c6f0f1e3f2e Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:55:28 +0200
-Subject: [PATCH 4/8] xodus-service: Handle TokenAndSignatureRequest.
+Subject: [PATCH 4/9] xodus-service: Handle TokenAndSignatureRequest.
 
 Resolve the relying party and signature policy for the URL (endpoint table
 fetched once per process), keep one title-bound session per MSA app id +
