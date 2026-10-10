@@ -4,7 +4,6 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 DIR=${DIR:-$HOME/.cache/xodus-launcher/xodus-pkg}
 mkdir -p "$DIR" && cd "$DIR"
-cp "$here/patches/xodus/PKGBUILD" "$here/patches/xodus/0001-fix-prefix-cache-flush.patch" .
-mv -f 0001-fix-prefix-cache-flush.patch fix-prefix-cache-flush.patch
+cp "$here/patches/xodus/PKGBUILD" "$here"/patches/xodus/0*.patch .
 makepkg -sf --noconfirm
 sudo pacman -U --noconfirm ./xodus-git-*.pkg.tar.zst

@@ -12,8 +12,9 @@ top of the [xodus](https://github.com/xodus-gaming/xodus) project and
 
 - Catalog browsing, sign-in, downloads and library management work.
 - Games launch through a patched WineGDK. **Balatro** is the first title confirmed running.
-- Games run with an *offline* local player: achievements, cloud saves and multiplayer are not
-  available yet (real Xbox Live sign-in is in progress).
+- Games sign in with your real Xbox account through xodus-service: identity (gamertag, XUID)
+  and signed Xbox Live tokens work, so achievements and other online calls can succeed.
+  Cloud save sync is not implemented yet (saves are local).
 - Each additional game may need more of the Xbox GDK runtime implemented; see `docs/`.
 
 ## How it works
@@ -45,12 +46,13 @@ Then start **Xodus Launcher** from the app menu, sign in, pick a game, Install, 
 
 ## Patches carried here (to be sent upstream)
 
-- `patches/xodus/0001-fix-prefix-cache-flush.patch`: streaming downloads crashed with
-  "cache ended before cached_len" (flush the cache file before reading it back).
+- `patches/xodus/`: a git series on xodus main: the streaming-download crash fix, and
+  `TokenAndSignatureRequest` / `UserInfoRequest` in xodus-service (real Xbox Live tokens, request
+  signing and identity for games).
 - `patches/winegdk/`: a git series on top of WineGDK master (see `BASE-COMMIT`):
   memfd executable loading (from the xodus wine fork), `RegisterAppStateChangeNotification`
   returning success, XAsync buffer-overrun and tracing fixes, `IXSystemImpl2-5` + hex TitleId,
-  an offline local XUser, and the remaining GDK runtime classes (XGame, XGameSave,
+  an XUser that signs in through xodus-service (offline fallback), a force-close watchdog, and the remaining GDK runtime classes (XGame, XGameSave,
   XPersistentLocalStorage implemented; XStore, XPackage, XGameUi and 12 more ported as stubs).
 
 ## License

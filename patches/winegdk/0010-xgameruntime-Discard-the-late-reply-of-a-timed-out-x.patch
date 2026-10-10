@@ -1,0 +1,245 @@
+From b354f355ba53967ef759056505a050746e23e070 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 02:33:42 +0200
+Subject: [PATCH 10/12] xgameruntime: Discard the late reply of a timed-out
+ xodus request.
+
+The service answers strictly in order and replies carry no correlation
+id, so once SendRequest gave up waiting, its reply was still handed to
+whatever request came next: a request of the same type accepted it (a
+token and signature computed for another URL and body, 401 from Xbox
+Live), one of another type failed with E_UNEXPECTED, and every later
+reply stayed off by one until a quiet gap dropped a stale frame on the
+floor. Count the replies still owed after a timeout and have the reader
+discard that many frames before it dispatches again. The connection
+stays usable, so a cold sign-in that outlasts the UserInfo timeout is
+picked up by the game's next XUserAddAsync. Handler removal and the
+counting happen under the lock the reader dispatches under, and a reply
+that arrives just as the wait gives up is still returned as a success.
+
+A frame that could not be sent in full leaves the service's stream
+undecodable: give the connection up there as well instead of leaving
+the reader on a socket nothing can be sent on any more.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/Xodus/IPCLayer.cpp           | 102 +++++++++++++-----
+ .../GDKComponent/Xodus/Unix/socket.c          |   5 +-
+ dlls/xgameruntime/private.h                   |   2 +
+ 3 files changed, 80 insertions(+), 29 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/Xodus/IPCLayer.cpp b/dlls/xgameruntime/GDKComponent/Xodus/IPCLayer.cpp
+index 370e3c6..15ce804 100644
+--- a/dlls/xgameruntime/GDKComponent/Xodus/IPCLayer.cpp
++++ b/dlls/xgameruntime/GDKComponent/Xodus/IPCLayer.cpp
+@@ -41,9 +41,11 @@ using namespace ABI::Windows::Storage::Streams;
+ /*
+  * Wire format (both directions, little endian, no padding): u32 magic, u16 message type,
+  * u16 body length, body. The service answers every request with type + 1 on the same
+- * connection, one request at a time. Replies carry no correlation id, so requests are
++ * connection, one request at a time, in order. Replies carry no correlation id, so requests are
+  * serialised here (m_RequestLock) and the single reader thread hands every received frame to
+- * the handler of the request in flight.
++ * the handler of the request in flight. A request that stops waiting (timeout) is still answered
++ * later: such replies are counted (m_StaleReplies) and the reader discards that many frames
++ * before dispatching again, so a late reply never ends up with the next request.
+  */
+ class ABI::Xodus::IPCLayer :
+     public IIPCLayer
+@@ -191,23 +193,11 @@ public:
+     HRESULT WINAPI
+     remove_ResponseReceived( EventRegistrationToken token ) override
+     {
+-        response_received_callback *oldCallback;
+         const std::lock_guard<std::mutex> lock( m_CallbacksLock );
+ 
+         TRACE("token %lld.\n", token.value);
+ 
+-        LIST_FOR_EACH_ENTRY( oldCallback, &m_Callbacks, response_received_callback, entry )
+-        {
+-            if ( oldCallback->token == token.value )
+-            {
+-                list_remove( &oldCallback->entry );
+-                oldCallback->handler->Release();
+-                delete oldCallback;
+-                return S_OK;
+-            }
+-        }
+-
+-        return E_BOUNDS;
++        return RemoveCallback( token.value );
+     }
+ 
+ private:
+@@ -237,10 +227,48 @@ private:
+         IXodusIPCPacket *response;
+     };
+ 
++    /* m_CallbacksLock held */
++    HRESULT RemoveCallback( INT64 token )
++    {
++        response_received_callback *oldCallback;
++
++        LIST_FOR_EACH_ENTRY( oldCallback, &m_Callbacks, response_received_callback, entry )
++        {
++            if ( oldCallback->token == token )
++            {
++                list_remove( &oldCallback->entry );
++                oldCallback->handler->Release();
++                delete oldCallback;
++                return S_OK;
++            }
++        }
++
++        return E_BOUNDS;
++    }
++
++    /*
++     * Unregisters the handler of a request that is done waiting. Returns true when the service
++     * still owes the reply (the frame went out, nothing came back in time): it is counted in
++     * m_StaleReplies and the reader discards it on arrival. Removal and counting happen under the
++     * lock the reader dispatches under, so a reply can neither slip in between nor be counted
++     * after the handler already took it.
++     */
++    bool RetireRequest( EventRegistrationToken token, bool sent, const SendRequestContext *context )
++    {
++        const std::lock_guard<std::mutex> lock( m_CallbacksLock );
++
++        RemoveCallback( token.value );
++        if ( !sent || context->response || !m_ReaderAlive ) return false;
++
++        m_StaleReplies++;
++        TRACE( "reply still owed, %u stale %s to discard\n", m_StaleReplies, m_StaleReplies == 1 ? "reply" : "replies" );
++        return true;
++    }
++
+     /*
+      * Frames the packet, sends it and waits up to timeoutMs for the reply. Results:
+      *   S_OK                                   result holds the reply packet (owned reference)
+-     *   HRESULT_FROM_WIN32(ERROR_TIMEOUT)      no reply in time
++     *   HRESULT_FROM_WIN32(ERROR_TIMEOUT)      no reply in time (discarded when it arrives; the connection stays usable)
+      *   HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED) connection gone (before or while waiting)
+      *   E_INVALIDARG                           body larger than the u16 length field
+      */
+@@ -257,6 +285,7 @@ private:
+         HRESULT status = S_OK;
+         NTSTATUS nts;
+         UINT32 messageLength = 0;
++        bool sent = false, owed = false;
+         IPCFrame frame{};
+         IPCHeader_CTYPE header{};
+         EventRegistrationToken token{};
+@@ -279,7 +308,7 @@ private:
+ 
+         status = message->get_Length( &messageLength );
+         if ( FAILED( status ) ) goto _CLEANUP;
+-        if ( messageLength > 0xFFFF )
++        if ( messageLength > IPC_MAX_BODY_BYTES )
+         {
+             WARN( "message of %u bytes does not fit the u16 length field.\n", messageLength );
+             status = E_INVALIDARG;
+@@ -337,24 +366,28 @@ private:
+                     status = HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
+                 }
+                 else
++                {
++                    sent = true;
+                     asyncres = WaitForSingleObject( context.event, timeoutMs );
++                }
+ 
+-                iface->remove_ResponseReceived( token ); /* after this no handler invocation is in progress */
++                /* after this no handler invocation is in progress; a reply that beat the removal is still taken */
++                owed = iface->RetireRequest( token, sent, &context );
+ 
+-                if ( SUCCEEDED( status ) )
++                if ( SUCCEEDED( status ) && !context.response )
+                 {
+-                    if ( asyncres == WAIT_TIMEOUT )
+-                    {
+-                        WARN( "no reply to type %u within %u ms.\n", header.Message_Type, timeoutMs );
+-                        status = HRESULT_FROM_WIN32( ERROR_TIMEOUT );
+-                    }
+-                    else if ( asyncres != WAIT_OBJECT_0 )
+-                        status = E_FAIL;
+-                    else if ( !context.response )
++                    if ( !owed )
+                     {
+                         TRACE( "connection closed while waiting for the reply to type %u.\n", header.Message_Type );
+                         status = HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
+                     }
++                    else if ( asyncres == WAIT_TIMEOUT )
++                    {
++                        WARN( "no reply to type %u within %u ms.\n", header.Message_Type, timeoutMs );
++                        status = HRESULT_FROM_WIN32( ERROR_TIMEOUT );
++                    }
++                    else
++                        status = E_FAIL; /* the wait itself failed; the reply is discarded when it arrives */
+                 }
+             }
+         }
+@@ -402,11 +435,23 @@ _CLEANUP:
+         return S_OK;
+     }
+ 
++    /* Reader -> the request in flight. packet == NULL means the connection is gone. */
+     void DispatchPacket( IXodusIPCPacket *packet )
+     {
+         response_received_callback *currCallback;
+         const std::lock_guard<std::mutex> lock( m_CallbacksLock );
+ 
++        if ( packet && m_StaleReplies )
++        {
++            UINT16 messageType = 0;
++
++            /* the service answers in order: this is the reply to the oldest request that stopped waiting */
++            packet->get_MessageType( &messageType );
++            m_StaleReplies--;
++            TRACE( "discarding stale reply type %u, %u more to discard\n", messageType, m_StaleReplies );
++            return;
++        }
++
+         LIST_FOR_EACH_ENTRY( currCallback, &m_Callbacks, response_received_callback, entry )
+         {
+             currCallback->handler->Invoke( packet );
+@@ -539,7 +584,8 @@ _EXIT:
+     };
+ 
+     struct list m_Callbacks = LIST_INIT( m_Callbacks );
+-    std::mutex m_CallbacksLock;              /* protects m_Callbacks */
++    std::mutex m_CallbacksLock;              /* protects m_Callbacks and m_StaleReplies */
++    UINT32 m_StaleReplies = 0;               /* replies the service still owes for requests that stopped waiting */
+     std::mutex m_RequestLock;                /* one request in flight per connection */
+     std::atomic<INT64> m_NextEventToken{ 0 };
+     std::atomic<bool> m_ReaderStarted{ false };
+diff --git a/dlls/xgameruntime/GDKComponent/Xodus/Unix/socket.c b/dlls/xgameruntime/GDKComponent/Xodus/Unix/socket.c
+index 5c1882c..40c50ed 100644
+--- a/dlls/xgameruntime/GDKComponent/Xodus/Unix/socket.c
++++ b/dlls/xgameruntime/GDKComponent/Xodus/Unix/socket.c
+@@ -241,7 +241,10 @@ static NTSTATUS send_frm( void *args )
+         {
+             if ( errno == EINTR )
+                 continue;
+-            TRACE( "send failed with errno %d\n", errno );
++            /* the service may have read part of this frame: the stream cannot be resynchronised, give it up */
++            TRACE( "send failed with errno %d, closing the connection\n", errno );
++            sock_dead = 1;
++            shutdown( sockfd, SHUT_RDWR ); /* wakes the reader, which then exits */
+             return STATUS_CONNECTION_RESET;
+         }
+ 
+diff --git a/dlls/xgameruntime/private.h b/dlls/xgameruntime/private.h
+index 1254cbb..6d125e9 100644
+--- a/dlls/xgameruntime/private.h
++++ b/dlls/xgameruntime/private.h
+@@ -113,6 +113,8 @@
+ #define IPC_MSA_TOKEN_TIMEOUT_MS 30000
+ #define IPC_USER_INFO_TIMEOUT_MS 15000
+ #define IPC_TOKEN_TIMEOUT_MS 60000
++/* Largest frame body: the length field on the wire is a u16. */
++#define IPC_MAX_BODY_BYTES 0xFFFF
+ /* 1 restores the old eager service handshake during XGameRuntimeInitialize (fatal when the service is down). */
+ #define XODUS_INTEROP 0
+ 
+-- 
+2.56.0
+

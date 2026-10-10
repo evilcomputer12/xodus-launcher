@@ -1,0 +1,29 @@
+From 4afaf0ae618885622d39add34feda0d11dd41094 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 03:07:34 +0200
+Subject: [PATCH 12/12] xgameruntime: Allow 60 s for the first identity lookup
+
+A cold UserInfoRequest runs the full Xbox Live sign-in flow in xodus-service
+(measured 35 s); 15 s made every first launch fall back to the offline user.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ dlls/xgameruntime/private.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dlls/xgameruntime/private.h b/dlls/xgameruntime/private.h
+index ca8522e..ee71eae 100644
+--- a/dlls/xgameruntime/private.h
++++ b/dlls/xgameruntime/private.h
+@@ -111,7 +111,7 @@
+ #define IPC_REQUEST_TIMEOUT_MS 5000
+ #define IPC_PING_TIMEOUT_MS 3000
+ #define IPC_MSA_TOKEN_TIMEOUT_MS 30000
+-#define IPC_USER_INFO_TIMEOUT_MS 15000
++#define IPC_USER_INFO_TIMEOUT_MS 60000
+ #define IPC_TOKEN_TIMEOUT_MS 60000
+ /* Largest frame body: the length field on the wire is a u16. */
+ #define IPC_MAX_BODY_BYTES 0xFFFF
+-- 
+2.56.0
+

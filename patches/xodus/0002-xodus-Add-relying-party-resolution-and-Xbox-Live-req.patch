@@ -1,0 +1,504 @@
+From f9d2d85fa57b24443a061338b79a7e7379ce353f Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Fri, 9 Oct 2026 23:55:28 +0200
+Subject: [PATCH 2/8] xodus: Add relying-party resolution and Xbox Live request
+ signing.
+
+resolve_relying_party() picks the relying party and signature policy for a
+request URL from the title.mgt endpoint table the way XUserGetTokenAndSignature
+does (protocol + fqdn/wildcard host + optional exact path, most specific entry
+wins, http://xboxlive.com as the default). TitleMgtEndPoint now carries Path.
+
+signing::sign_request() produces the Signature header value (ES256 over policy
+version, FILETIME, method, path+query, Authorization and the body prefix) with
+a p256 proof key, reusing xal's prehash layout. It exists so the service can
+sign a request that the game, not the service, is going to send; the test
+checks the result byte-for-byte against xal's RequestSigner.
+
+xsts_user_only() is a non-panicking version of api::xbox::run().
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Cargo.lock                                 |   3 +
+ crates/xodus/Cargo.toml                    |   3 +
+ crates/xodus/src/api/xbox/mod.rs           |  35 +++--
+ crates/xodus/src/api/xbox/signing.rs       | 169 +++++++++++++++++++++
+ crates/xodus/src/api/xbox/title.rs         | 122 ++++++++++++++-
+ crates/xodus/src/models/xbox.rs            |   4 +-
+ crates/xodus/testdata/title_endpoints.json |   1 +
+ 7 files changed, 319 insertions(+), 18 deletions(-)
+ create mode 100644 crates/xodus/src/api/xbox/signing.rs
+ create mode 100644 crates/xodus/testdata/title_endpoints.json
+
+diff --git a/Cargo.lock b/Cargo.lock
+index ac47ad5..9f400d5 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7151,10 +7151,12 @@ dependencies = [
+  "num-bigint-dig 0.9.1",
+  "num-integer",
+  "num_enum",
++ "p256",
+  "prost",
+  "prost-build",
+  "quick-xml 0.42.0",
+  "rand 0.10.2",
++ "reqwest 0.11.27",
+  "reqwest 0.13.4",
+  "rsa",
+  "serde",
+@@ -7204,6 +7206,7 @@ dependencies = [
+ name = "xodus-service"
+ version = "0.1.0"
+ dependencies = [
++ "base64 0.23.1",
+  "chrono",
+  "console-subscriber",
+  "quick-xml 0.42.0",
+diff --git a/crates/xodus/Cargo.toml b/crates/xodus/Cargo.toml
+index fa1033c..17145b9 100644
+--- a/crates/xodus/Cargo.toml
++++ b/crates/xodus/Cargo.toml
+@@ -34,6 +34,7 @@ globset = "0.4.20"
+ num-bigint-dig = "0.9.1"
+ num-integer = "0.1.47"
+ kryptering = "0.5.0"
++p256 = "0.13.2"
+ 
+ [target.'cfg(not(target_os = "linux"))'.dependencies]
+ smbios-lib = "0.9.4"
+@@ -45,6 +46,8 @@ dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-ope
+ apple-native-keyring-store = { version = "1.0.2", features = ["keychain"]}
+ 
+ [dev-dependencies]
++# xal's reqwest, to cross-check signatures against its RequestSigner in tests
++reqwest011 = { package = "reqwest", version = "0.11" }
+ rsa = "0.9.10"
+ bergshamra = "0.8.0"
+ ed25519-dalek = "3.0.0"
+diff --git a/crates/xodus/src/api/xbox/mod.rs b/crates/xodus/src/api/xbox/mod.rs
+index 9adadb4..1d36234 100644
+--- a/crates/xodus/src/api/xbox/mod.rs
++++ b/crates/xodus/src/api/xbox/mod.rs
+@@ -4,6 +4,7 @@ use crate::models::soap;
+ use crate::models::xbox::XstsResponse;
+ 
+ pub mod auth;
++pub mod signing;
+ pub mod title;
+ pub use auth::{authenticate_xbox_user, get_xsts_auth_header, request_xsts_token};
+ 
+@@ -13,6 +14,19 @@ pub async fn run(
+     legacy: LegacyToken,
+     relying_party: &str,
+ ) -> XstsResponse {
++    xsts_user_only(client, dev_token, legacy, relying_party)
++        .await
++        .expect("Failed to authenticate Xbox user")
++}
++
++/// XSTS token for `relying_party` from the stored MSA user token only (no device/title
++/// identity, so requests made with it cannot be signed). Non-panicking variant of [`run`].
++pub async fn xsts_user_only(
++    client: &reqwest::Client,
++    dev_token: LegacyToken,
++    legacy: LegacyToken,
++    relying_party: &str,
++) -> Result<XstsResponse, Box<dyn std::error::Error + Send + Sync>> {
+     let user_token = crate::api::live::exchange_user_token(
+         client,
+         legacy,
+@@ -26,13 +40,11 @@ pub async fn run(
+             Some(soap::PolicyReference::mbi_ssl()),
+         )],
+     )
+-    .await
+-    .expect("Failed to get ms user token");
++    .await?;
+ 
+     let user_token: Token = match user_token {
+-        ExchangeUserTokenOutcome::Fault(_) => {
+-            eprintln!("Failed to get exchange MS token");
+-            panic!("TODO");
++        ExchangeUserTokenOutcome::Fault(fault) => {
++            return Err(format!("MSA token exchange failed: {fault:?}").into());
+         }
+         ExchangeUserTokenOutcome::Issued(
+             soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
+@@ -43,17 +55,12 @@ pub async fn run(
+         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
+             token,
+         )) => (*token).into(),
+-        _ => unreachable!("Only responses are handled"),
++        _ => return Err("unexpected MSA token exchange response".into()),
+     };
+     let Token::Compact(user_token) = user_token else {
+-        eprintln!("Unsupported token");
+-        panic!("TODO");
++        return Err("unsupported MSA user token type".into());
+     };
+-    let resp = authenticate_xbox_user(client, user_token)
+-        .await
+-        .expect("Failed to authenticate Xbox user");
++    let resp = authenticate_xbox_user(client, user_token).await?;
+ 
+-    request_xsts_token(client, resp.token, relying_party)
+-        .await
+-        .expect("Failed to authenticate Xbox user")
++    Ok(request_xsts_token(client, resp.token, relying_party).await?)
+ }
+diff --git a/crates/xodus/src/api/xbox/signing.rs b/crates/xodus/src/api/xbox/signing.rs
+new file mode 100644
+index 0000000..e73e190
+--- /dev/null
++++ b/crates/xodus/src/api/xbox/signing.rs
+@@ -0,0 +1,169 @@
++//! Xbox Live HTTP request signatures (the `Signature` header).
++//!
++//! The signature covers the signing policy version, a FILETIME timestamp, the HTTP method,
++//! path + query, the `Authorization` header and the first `max_body_bytes` of the body, hashed
++//! with SHA-256 and signed with ES256 using the proof key that was registered with the device
++//! token. The header value is `base64(version_be32 || filetime_be64 || r || s)`.
++//!
++//! The hashing layout is shared with xal's [`RequestSigner`]; this module only exists so a
++//! signature can be produced for a request the service never sends itself (the game does).
++
++use base64::Engine;
++use chrono::{DateTime, Utc};
++use p256::SecretKey;
++use p256::ecdsa::signature::hazmat::PrehashSigner;
++use p256::ecdsa::{Signature, SigningKey};
++use xal::RequestSigner;
++
++/// Seconds between 1601-01-01 (FILETIME epoch) and 1970-01-01.
++const FILETIME_UNIX_EPOCH_DIFF: i64 = 11_644_473_600;
++
++/// Windows FILETIME (100 ns ticks since 1601) of `timestamp`, big-endian as used in the signature.
++fn filetime_be(timestamp: DateTime<Utc>) -> [u8; 8] {
++    let ticks = (timestamp.timestamp() + FILETIME_UNIX_EPOCH_DIFF) as u64 * 10_000_000
++        + u64::from(timestamp.timestamp_subsec_nanos() / 100);
++    ticks.to_be_bytes()
++}
++
++/// `path?query` of a URL, the form the signature expects.
++pub fn path_and_query(url: &reqwest::Url) -> String {
++    match url.query() {
++        Some(q) => format!("{}?{}", url.path(), q),
++        None => url.path().to_string(),
++    }
++}
++
++/// Compute the `Signature` header value for a request.
++#[allow(clippy::too_many_arguments)]
++pub fn sign_request(
++    keypair: &SecretKey,
++    policy_version: i32,
++    max_body_bytes: usize,
++    timestamp: DateTime<Utc>,
++    method: &str,
++    path_and_query: &str,
++    authorization: &str,
++    body: &[u8],
++) -> Result<String, p256::ecdsa::Error> {
++    let version = policy_version.to_be_bytes();
++    let filetime = filetime_be(timestamp);
++    let prehash = RequestSigner::prehash_message_data(
++        &version,
++        &filetime,
++        method,
++        path_and_query,
++        authorization,
++        body,
++        max_body_bytes,
++    );
++    let signing_key: SigningKey = keypair.clone().into();
++    let signature: Signature = signing_key.sign_prehash(&prehash)?;
++
++    let mut bytes = Vec::with_capacity(4 + 8 + 64);
++    bytes.extend_from_slice(&version);
++    bytes.extend_from_slice(&filetime);
++    bytes.extend_from_slice(&signature.to_bytes());
++    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
++}
++
++#[cfg(test)]
++mod test {
++    use super::*;
++    use chrono::TimeZone;
++    use xal::response::TitleEndpointsResponse;
++    use xal::{RequestSigning, SignaturePolicyCache};
++
++    #[test]
++    fn filetime_matches_known_value() {
++        // 2020-01-01T00:00:00Z == 132223104000000000 (verified against .NET DateTime.ToFileTimeUtc)
++        let ts = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
++        assert_eq!(u64::from_be_bytes(filetime_be(ts)), 132_223_104_000_000_000);
++    }
++
++    #[test]
++    fn path_and_query_formatting() {
++        let u = reqwest::Url::parse("https://host.xboxlive.com/a/b?x=1&y=2").unwrap();
++        assert_eq!(path_and_query(&u), "/a/b?x=1&y=2");
++        let u = reqwest::Url::parse("https://host.xboxlive.com/a").unwrap();
++        assert_eq!(path_and_query(&u), "/a");
++    }
++
++    /// Same key, policy, timestamp and request must give the same header as xal's signer.
++    #[tokio::test]
++    async fn signature_matches_xal() {
++        let endpoints: TitleEndpointsResponse =
++            serde_json::from_str(include_str!("../../../testdata/title_endpoints.json")).unwrap();
++        let mut signer = RequestSigner {
++            keypair: SecretKey::random(&mut rand_core_compat::Rng),
++            signature_policy_cache: SignaturePolicyCache::new(endpoints),
++        };
++        let ts = Utc.with_ymd_and_hms(2026, 10, 9, 12, 0, 0).unwrap();
++        let url = "https://achievements.xboxlive.com/users/xuid(1)/achievements?titleId=5";
++        let authorization = "XBL3.0 x=123;token";
++        let body = b"{\"hello\":\"world\"}".to_vec();
++
++        // xal's http::Request path drops every header (it `replace`s an Option<&mut HeaderMap>),
++        // so compare through its reqwest path instead.
++        let request = reqwest011::Client::new()
++            .post(url)
++            .header("Authorization", authorization)
++            .body(body.clone())
++            .build()
++            .unwrap();
++        let signed = signer.sign_request(request, Some(ts)).await.unwrap();
++        let expected = signed
++            .headers()
++            .get("Signature")
++            .expect("xal added a Signature header")
++            .to_str()
++            .unwrap()
++            .to_owned();
++
++        let got = sign_request(
++            &signer.keypair,
++            1,
++            8192,
++            ts,
++            "POST",
++            &path_and_query(&reqwest::Url::parse(url).unwrap()),
++            authorization,
++            &body,
++        )
++        .unwrap();
++        assert_eq!(got, expected);
++    }
++
++    /// p256 0.13 wants a rand_core 0.6 RNG; adapt the workspace's rand without adding a dep.
++    mod rand_core_compat {
++        pub struct Rng;
++        impl p256::elliptic_curve::rand_core::CryptoRng for Rng {}
++        impl p256::elliptic_curve::rand_core::RngCore for Rng {
++            fn next_u32(&mut self) -> u32 {
++                let mut b = [0u8; 4];
++                self.fill_bytes(&mut b);
++                u32::from_le_bytes(b)
++            }
++            fn next_u64(&mut self) -> u64 {
++                let mut b = [0u8; 8];
++                self.fill_bytes(&mut b);
++                u64::from_le_bytes(b)
++            }
++            fn fill_bytes(&mut self, dest: &mut [u8]) {
++                getrandom_fill(dest);
++            }
++            fn try_fill_bytes(
++                &mut self,
++                dest: &mut [u8],
++            ) -> Result<(), p256::elliptic_curve::rand_core::Error> {
++                getrandom_fill(dest);
++                Ok(())
++            }
++        }
++        fn getrandom_fill(dest: &mut [u8]) {
++            use std::io::Read;
++            std::fs::File::open("/dev/urandom")
++                .and_then(|mut f| f.read_exact(dest))
++                .expect("urandom");
++        }
++    }
++}
+diff --git a/crates/xodus/src/api/xbox/title.rs b/crates/xodus/src/api/xbox/title.rs
+index 6f21128..193bcf2 100644
+--- a/crates/xodus/src/api/xbox/title.rs
++++ b/crates/xodus/src/api/xbox/title.rs
+@@ -1,4 +1,4 @@
+-use crate::models::xbox::{TitleMgtEndPoint, TitleMgtResponse};
++use crate::models::xbox::{TitleMgtEndPoint, TitleMgtResponse, TitleMgtSignaturePolicy};
+ 
+ pub async fn get_title_management(client: &reqwest::Client) -> reqwest::Result<TitleMgtResponse> {
+     let response = client
+@@ -29,14 +29,76 @@ pub fn get_endpoint<'a>(url: &str, response: &'a TitleMgtResponse) -> Option<&'a
+         .copied()
+ }
+ 
++/// Relying party used when no endpoint matches (same default as the Xbox runtime).
++pub const DEFAULT_RELYING_PARTY: &str = "http://xboxlive.com";
++
++/// What a service request needs to know about its target endpoint.
++#[derive(Debug, Clone, PartialEq)]
++pub struct ResolvedEndpoint {
++    pub relying_party: String,
++    /// Signature policy to sign the request with, `None` when the endpoint is not signed.
++    pub signature_policy: Option<TitleMgtSignaturePolicy>,
++}
++
++/// Resolve the relying party and signature policy for a request URL, the way
++/// `XUserGetTokenAndSignature` does: match protocol, host (fqdn or `*.` wildcard) and, when
++/// the endpoint declares one, the exact path; the most specific match wins (a path-specific
++/// entry beats a host-only one, a longer host beats a shorter one).
++pub fn resolve_relying_party(url: &str, table: &TitleMgtResponse) -> Option<ResolvedEndpoint> {
++    let parsed = reqwest::Url::parse(url).ok()?;
++    let scheme = match parsed.scheme() {
++        "wss" => "https",
++        "ws" => "http",
++        other => other,
++    };
++    let host = parsed.host_str()?;
++
++    let best = table
++        .end_points
++        .iter()
++        .filter(|e| e.protocol.eq_ignore_ascii_case(scheme))
++        .filter(|e| match e.host_type.as_deref() {
++            Some("wildcard") => {
++                let suffix = e.host.trim_start_matches('*');
++                host.ends_with(suffix) && host.len() > suffix.len()
++            }
++            _ => host.eq_ignore_ascii_case(&e.host),
++        })
++        .filter(|e| e.path.as_deref().is_none_or(|p| p == parsed.path()))
++        .max_by_key(|e| {
++            (
++                e.path.is_some(),
++                e.host.chars().filter(|&c| c != '*').count(),
++            )
++        });
++
++    let (relying_party, policy_index) = match best {
++        Some(e) => (
++            e.relying_party
++                .clone()
++                .unwrap_or_else(|| DEFAULT_RELYING_PARTY.to_string()),
++            e.signature_policy_index,
++        ),
++        None => (DEFAULT_RELYING_PARTY.to_string(), None),
++    };
++    let signature_policy =
++        policy_index.and_then(|i| table.signature_policies.get(i as usize).cloned());
++
++    Some(ResolvedEndpoint {
++        relying_party,
++        signature_policy,
++    })
++}
++
+ #[cfg(test)]
+ mod test {
+     use super::*;
++    const ENDPOINTS_JSON: &str = r##"{"EndPoints":[{"Protocol":"https","Host":"musicdelivery-ssl.xboxlive.com","HostType":"fqdn","RelyingParty":"http://music.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"cloudcollection-ssl.xboxlive.com","HostType":"fqdn","RelyingParty":"http://music.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"websockets.platform.bing.com","HostType":"fqdn","RelyingParty":"http://platform.bing.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"websockets.platform.bing-int.com","HostType":"fqdn","RelyingParty":"http://platform.bing.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"inventory.xboxlive.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"licensing.xboxlive.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"accountstroubleshooter.xboxlive.com","HostType":"fqdn","RelyingParty":"http://accounts.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"gamertag.xboxlive.com","HostType":"fqdn","RelyingParty":"http://accounts.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"help.ui.xboxlive.com","HostType":"fqdn","RelyingParty":"http://uxservices.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.ui.xboxlive.com","HostType":"wildcard"},{"Protocol":"https","Host":"data-vef.xboxlive.com","HostType":"fqdn","RelyingParty":"http://data-vef.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"update.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"updatepc.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"update-cdn.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"packages.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"packagespc.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"instance.mgt.xboxlive.com","HostType":"fqdn","RelyingParty":"http://instance.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":2},{"Protocol":"https","Host":"device.mgt.xboxlive.com","HostType":"fqdn","RelyingParty":"http://device.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"device.mgt.xboxlive.com","HostType":"fqdn","Path":"/registrations/bestv","RelyingParty":"http://bestv.device.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"device.mgt.xboxlive.com","HostType":"fqdn","Path":"/devices/current/unlock","RelyingParty":"http://unlock.device.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"xkms.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xkms.xboxlive.com","TokenType":"JWT","MinTlsVersion":"1.2","SignaturePolicyIndex":0},{"Protocol":"https","Host":"privileges.xboxlive.com","HostType":"fqdn","RelyingParty":"http://banning.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"privileges.xboxlive.com","HostType":"fqdn","Path":"/upsell","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"settings.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xboxlive.com","TokenType":"JWT","ServerCertIndex":[0,1],"SignaturePolicyIndex":1},{"Protocol":"https","Host":"*.experimentation.xboxlive.com","HostType":"wildcard","RelyingParty":"http://experimentation.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"*.xboxlive.com","HostType":"wildcard","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xboxlive.com","HostType":"fqdn","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"http","Host":"*.xboxlive.com","HostType":"wildcard"},{"Protocol":"https","Host":"xaaa.bbtv.cn","HostType":"fqdn","Path":"/xboxsms/OOBEService/AuthorizationStatus","RelyingParty":"http://bestvrp.bestv.com/","SubRelyingParty":"http://www.bestv.com.cn/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.vortex-win-sandbox.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.vortex-sandbox.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"vortex-events.xboxlive.com","HostType":"fqdn","RelyingParty":"http://events.xboxlive.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.pipe.int.trafficmanager.net","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.events-sandbox.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"musicimage.xboxlive.com","HostType":"fqdn"},{"Protocol":"https","Host":"*.xboxservices.com","HostType":"wildcard","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"assets.xboxservices.com","HostType":"fqdn"},{"Protocol":"https","Host":"*.mp.microsoft.com","HostType":"wildcard","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"account.microsoft.com","HostType":"fqdn","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.account.microsoft.com","HostType":"wildcard","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"licensing.mp.microsoft.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"collections.mp.microsoft.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"api.twitch.tv","HostType":"fqdn","RelyingParty":"https://twitchxboxrp.twitch.tv/","TokenType":"JWT"},{"Protocol":"https","Host":"xdes.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xdes.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gameservices.xboxlive.com","HostType":"wildcard","RelyingParty":"https://gameservices.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"ssl.bing.com","HostType":"fqdn","Path":"/speechreco/xbox/accessibility","RelyingParty":"http://platform.bing.com/","TokenType":"JWT"},{"Protocol":"https","Host":"speech.bing.com","HostType":"fqdn","RelyingParty":"http://platform.bing.com/","TokenType":"JWT"},{"Protocol":"https","Host":"zto.dds.microsoft.com","HostType":"fqdn","RelyingParty":"http://dds.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"user.mgt.xboxlive.com","HostType":"fqdn","RelyingParty":"http://accounts.xboxlive.com","TokenType":"JWT"},{"Protocol":"https","Host":"gssv-auth-prod.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"gssv-auth-strs.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-prod.xboxlive.com","HostType":"wildcard","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-test.xboxlive.com","HostType":"wildcard","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-int.xboxlive.com","HostType":"wildcard","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-prod.xboxlive.com","HostType":"wildcard","Path":"/v5/sessions/cloud","RelyingParty":"http://connect.gssv.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.gssv-play-test.xboxlive.com","HostType":"wildcard","Path":"/v5/sessions/cloud","RelyingParty":"http://connect.gssv.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.gssv-play-int.xboxlive.com","HostType":"wildcard","Path":"/v5/sessions/cloud","RelyingParty":"http://connect.gssv.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"settings-sandbox.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT"},{"Protocol":"https","Host":"settings-win.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT","ServerCertIndex":[2]},{"Protocol":"https","Host":"settings-ppe.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT"},{"Protocol":"https","Host":"settings.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT","ServerCertIndex":[3,0]},{"Protocol":"https","Host":"playfabapi.com","HostType":"fqdn","RelyingParty":"http://playfab.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"sisu.xboxlive.com","HostType":"fqdn","RelyingParty":"http://sisu.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"beta-sisu.xboxlive.com","HostType":"fqdn","RelyingParty":"http://sisu.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.gamepass.com","HostType":"wildcard","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xflight.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xflight.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xrap.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://rap.xboxflight.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"rap-fd.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://rap.xboxflight.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"streaming.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://streaming.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.support.xboxlive.com","HostType":"wildcard","RelyingParty":"rp://support.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"streaming-ppe.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://streaming.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xoobe.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://xoobe.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xoobe.platform.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://xoobe.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.ide.platform.xboxservices.com","HostType":"wildcard","RelyingParty":"rp://ide.platform.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.ppe.exp.xboxservices.com","HostType":"wildcard","RelyingParty":"rp://ppe.exp.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.exp.xboxservices.com","HostType":"wildcard","RelyingParty":"rp://exp.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"contentaccess.exp.xboxservices.com","HostType":"fqdn","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"gamingconsent-staging.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gamingconsent.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"gamingconsent.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gamingconsent.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.sucu.xboxlive.com","HostType":"wildcard","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xai.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://xai.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"int.xai.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://ppe.xai.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"test.xai.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://ppe.xai.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xgrant.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://rewards.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0}],"SignaturePolicies":[{"Version":1,"SupportedAlgorithms":["ES256"],"MaxBodyBytes":8192,"SupportedSignatureTypes":["XBL"]},{"Version":1,"SupportedAlgorithms":["ES256"],"MaxBodyBytes":2147483647,"SupportedSignatureTypes":["XBL"]},{"Version":2,"SupportedAlgorithms":["ES256"],"MaxBodyBytes":0,"SupportedSignatureTypes":["DPoP","XBL"]}],"Certs":[{"Thumbprint":"54D9D20239080C32316ED9FF980A48988F4ADF2D","IsIssuer":true,"RootCertIndex":0},{"Thumbprint":"D5A9ACDB80066D0E67FF65A939BBBC952F8ED171","RootCertIndex":0},{"Thumbprint":"8F43288AD272F3103B6FB1428485EA3014C0BCFE","IsIssuer":true,"RootCertIndex":1},{"Thumbprint":"AD898AC73DF333EB60AC1F5FC6C4B2219DDB79B7","IsIssuer":true,"RootCertIndex":0}],"RootCerts":["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"]}"##;
+ 
+     #[test]
+     fn test_endpoint_cases() {
+-        let string = r##"{"EndPoints":[{"Protocol":"https","Host":"musicdelivery-ssl.xboxlive.com","HostType":"fqdn","RelyingParty":"http://music.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"cloudcollection-ssl.xboxlive.com","HostType":"fqdn","RelyingParty":"http://music.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"websockets.platform.bing.com","HostType":"fqdn","RelyingParty":"http://platform.bing.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"websockets.platform.bing-int.com","HostType":"fqdn","RelyingParty":"http://platform.bing.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"inventory.xboxlive.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"licensing.xboxlive.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"accountstroubleshooter.xboxlive.com","HostType":"fqdn","RelyingParty":"http://accounts.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"gamertag.xboxlive.com","HostType":"fqdn","RelyingParty":"http://accounts.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"help.ui.xboxlive.com","HostType":"fqdn","RelyingParty":"http://uxservices.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.ui.xboxlive.com","HostType":"wildcard"},{"Protocol":"https","Host":"data-vef.xboxlive.com","HostType":"fqdn","RelyingParty":"http://data-vef.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"update.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"updatepc.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"update-cdn.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"packages.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"packagespc.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"instance.mgt.xboxlive.com","HostType":"fqdn","RelyingParty":"http://instance.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":2},{"Protocol":"https","Host":"device.mgt.xboxlive.com","HostType":"fqdn","RelyingParty":"http://device.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"device.mgt.xboxlive.com","HostType":"fqdn","Path":"/registrations/bestv","RelyingParty":"http://bestv.device.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"device.mgt.xboxlive.com","HostType":"fqdn","Path":"/devices/current/unlock","RelyingParty":"http://unlock.device.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"xkms.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xkms.xboxlive.com","TokenType":"JWT","MinTlsVersion":"1.2","SignaturePolicyIndex":0},{"Protocol":"https","Host":"privileges.xboxlive.com","HostType":"fqdn","RelyingParty":"http://banning.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"privileges.xboxlive.com","HostType":"fqdn","Path":"/upsell","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"settings.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xboxlive.com","TokenType":"JWT","ServerCertIndex":[0,1],"SignaturePolicyIndex":1},{"Protocol":"https","Host":"*.experimentation.xboxlive.com","HostType":"wildcard","RelyingParty":"http://experimentation.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"*.xboxlive.com","HostType":"wildcard","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xboxlive.com","HostType":"fqdn","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"http","Host":"*.xboxlive.com","HostType":"wildcard"},{"Protocol":"https","Host":"xaaa.bbtv.cn","HostType":"fqdn","Path":"/xboxsms/OOBEService/AuthorizationStatus","RelyingParty":"http://bestvrp.bestv.com/","SubRelyingParty":"http://www.bestv.com.cn/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.vortex-win-sandbox.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.vortex-sandbox.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"vortex-events.xboxlive.com","HostType":"fqdn","RelyingParty":"http://events.xboxlive.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.pipe.int.trafficmanager.net","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.events-sandbox.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"musicimage.xboxlive.com","HostType":"fqdn"},{"Protocol":"https","Host":"*.xboxservices.com","HostType":"wildcard","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"assets.xboxservices.com","HostType":"fqdn"},{"Protocol":"https","Host":"*.mp.microsoft.com","HostType":"wildcard","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"account.microsoft.com","HostType":"fqdn","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.account.microsoft.com","HostType":"wildcard","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"licensing.mp.microsoft.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"collections.mp.microsoft.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"api.twitch.tv","HostType":"fqdn","RelyingParty":"https://twitchxboxrp.twitch.tv/","TokenType":"JWT"},{"Protocol":"https","Host":"xdes.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xdes.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gameservices.xboxlive.com","HostType":"wildcard","RelyingParty":"https://gameservices.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"ssl.bing.com","HostType":"fqdn","Path":"/speechreco/xbox/accessibility","RelyingParty":"http://platform.bing.com/","TokenType":"JWT"},{"Protocol":"https","Host":"speech.bing.com","HostType":"fqdn","RelyingParty":"http://platform.bing.com/","TokenType":"JWT"},{"Protocol":"https","Host":"zto.dds.microsoft.com","HostType":"fqdn","RelyingParty":"http://dds.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"user.mgt.xboxlive.com","HostType":"fqdn","RelyingParty":"http://accounts.xboxlive.com","TokenType":"JWT"},{"Protocol":"https","Host":"gssv-auth-prod.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"gssv-auth-strs.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-prod.xboxlive.com","HostType":"wildcard","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-test.xboxlive.com","HostType":"wildcard","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-int.xboxlive.com","HostType":"wildcard","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-prod.xboxlive.com","HostType":"wildcard","Path":"/v5/sessions/cloud","RelyingParty":"http://connect.gssv.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.gssv-play-test.xboxlive.com","HostType":"wildcard","Path":"/v5/sessions/cloud","RelyingParty":"http://connect.gssv.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.gssv-play-int.xboxlive.com","HostType":"wildcard","Path":"/v5/sessions/cloud","RelyingParty":"http://connect.gssv.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"settings-sandbox.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT"},{"Protocol":"https","Host":"settings-win.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT","ServerCertIndex":[2]},{"Protocol":"https","Host":"settings-ppe.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT"},{"Protocol":"https","Host":"settings.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT","ServerCertIndex":[3,0]},{"Protocol":"https","Host":"playfabapi.com","HostType":"fqdn","RelyingParty":"http://playfab.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"sisu.xboxlive.com","HostType":"fqdn","RelyingParty":"http://sisu.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"beta-sisu.xboxlive.com","HostType":"fqdn","RelyingParty":"http://sisu.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.gamepass.com","HostType":"wildcard","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xflight.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xflight.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xrap.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://rap.xboxflight.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"rap-fd.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://rap.xboxflight.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"streaming.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://streaming.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.support.xboxlive.com","HostType":"wildcard","RelyingParty":"rp://support.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"streaming-ppe.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://streaming.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xoobe.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://xoobe.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xoobe.platform.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://xoobe.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.ide.platform.xboxservices.com","HostType":"wildcard","RelyingParty":"rp://ide.platform.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.ppe.exp.xboxservices.com","HostType":"wildcard","RelyingParty":"rp://ppe.exp.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.exp.xboxservices.com","HostType":"wildcard","RelyingParty":"rp://exp.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"contentaccess.exp.xboxservices.com","HostType":"fqdn","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"gamingconsent-staging.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gamingconsent.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"gamingconsent.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gamingconsent.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.sucu.xboxlive.com","HostType":"wildcard","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xai.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://xai.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"int.xai.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://ppe.xai.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"test.xai.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://ppe.xai.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xgrant.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://rewards.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0}],"SignaturePolicies":[{"Version":1,"SupportedAlgorithms":["ES256"],"MaxBodyBytes":8192,"SupportedSignatureTypes":["XBL"]},{"Version":1,"SupportedAlgorithms":["ES256"],"MaxBodyBytes":2147483647,"SupportedSignatureTypes":["XBL"]},{"Version":2,"SupportedAlgorithms":["ES256"],"MaxBodyBytes":0,"SupportedSignatureTypes":["DPoP","XBL"]}],"Certs":[{"Thumbprint":"54D9D20239080C32316ED9FF980A48988F4ADF2D","IsIssuer":true,"RootCertIndex":0},{"Thumbprint":"D5A9ACDB80066D0E67FF65A939BBBC952F8ED171","RootCertIndex":0},{"Thumbprint":"8F43288AD272F3103B6FB1428485EA3014C0BCFE","IsIssuer":true,"RootCertIndex":1},{"Thumbprint":"AD898AC73DF333EB60AC1F5FC6C4B2219DDB79B7","IsIssuer":true,"RootCertIndex":0}],"RootCerts":["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"]}"##;
+-        let response = serde_json::from_str::<TitleMgtResponse>(string).expect("Failed to parse");
++        let response =
++            serde_json::from_str::<TitleMgtResponse>(ENDPOINTS_JSON).expect("Failed to parse");
+ 
+         let live = get_endpoint("https://xboxlive.com", &response).expect("No xboxlive endpoint");
+         assert_eq!(live.host, "xboxlive.com");
+@@ -57,4 +119,58 @@ mod test {
+             Some("http://update.xboxlive.com")
+         );
+     }
++
++    #[test]
++    fn test_resolve_relying_party() {
++        let table = serde_json::from_str::<TitleMgtResponse>(ENDPOINTS_JSON).expect("parse");
++
++        // exact host
++        let r = resolve_relying_party(
++            "https://achievements.xboxlive.com/users/xuid(1)/achievements?titleId=5",
++            &table,
++        )
++        .unwrap();
++        assert_eq!(r.relying_party, "http://xboxlive.com");
++        assert_eq!(r.signature_policy.as_ref().map(|p| p.version), Some(1));
++        assert_eq!(
++            r.signature_policy.as_ref().map(|p| p.max_body_bytes),
++            Some(8192)
++        );
++
++        // specific host beats the *.xboxlive.com wildcard
++        let r = resolve_relying_party("https://packagespc.xboxlive.com/GetBasePackage/x", &table)
++            .unwrap();
++        assert_eq!(r.relying_party, "http://update.xboxlive.com");
++
++        // wildcard with a different policy index
++        let r = resolve_relying_party("https://a.experimentation.xboxlive.com/", &table).unwrap();
++        assert_eq!(r.relying_party, "http://experimentation.xboxlive.com/");
++        assert_eq!(
++            r.signature_policy.as_ref().map(|p| p.max_body_bytes),
++            Some(2147483647)
++        );
++
++        // path-specific entry beats the host-only one for the same host
++        let r = resolve_relying_party(
++            "https://device.mgt.xboxlive.com/devices/current/unlock",
++            &table,
++        )
++        .unwrap();
++        assert_eq!(r.relying_party, "http://unlock.device.mgt.xboxlive.com");
++        let r =
++            resolve_relying_party("https://device.mgt.xboxlive.com/registrations", &table).unwrap();
++        assert_eq!(r.relying_party, "http://device.mgt.xboxlive.com");
++
++        // unsigned endpoint (no SignaturePolicyIndex) and unknown host -> default RP, no policy
++        let r = resolve_relying_party("https://playfabapi.com/Client/Login", &table).unwrap();
++        assert_eq!(r.relying_party, "http://playfab.xboxlive.com/");
++        assert!(r.signature_policy.is_none());
++        let r = resolve_relying_party("https://example.com/", &table).unwrap();
++        assert_eq!(r.relying_party, DEFAULT_RELYING_PARTY);
++        assert!(r.signature_policy.is_none());
++
++        // ws(s) is treated as http(s); bad URLs are rejected
++        assert!(resolve_relying_party("wss://xboxlive.com/", &table).is_some());
++        assert!(resolve_relying_party("not a url", &table).is_none());
++    }
+ }
+diff --git a/crates/xodus/src/models/xbox.rs b/crates/xodus/src/models/xbox.rs
+index b7cd989..731a6f3 100644
+--- a/crates/xodus/src/models/xbox.rs
++++ b/crates/xodus/src/models/xbox.rs
+@@ -100,6 +100,8 @@ pub struct TitleMgtEndPoint {
+     #[serde(default)]
+     pub host_type: Option<String>,
+     #[serde(default)]
++    pub path: Option<String>,
++    #[serde(default)]
+     pub relying_party: Option<String>,
+     #[serde(default)]
+     pub token_type: Option<String>,
+@@ -107,7 +109,7 @@ pub struct TitleMgtEndPoint {
+     pub signature_policy_index: Option<u8>,
+ }
+ 
+-#[derive(Debug, Deserialize, Clone)]
++#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+ #[serde(rename_all = "PascalCase")]
+ pub struct TitleMgtSignaturePolicy {
+     pub version: u16,
+diff --git a/crates/xodus/testdata/title_endpoints.json b/crates/xodus/testdata/title_endpoints.json
+new file mode 100644
+index 0000000..a61ff2c
+--- /dev/null
++++ b/crates/xodus/testdata/title_endpoints.json
+@@ -0,0 +1 @@
++{"EndPoints":[{"Protocol":"https","Host":"musicdelivery-ssl.xboxlive.com","HostType":"fqdn","RelyingParty":"http://music.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"cloudcollection-ssl.xboxlive.com","HostType":"fqdn","RelyingParty":"http://music.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"websockets.platform.bing.com","HostType":"fqdn","RelyingParty":"http://platform.bing.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"websockets.platform.bing-int.com","HostType":"fqdn","RelyingParty":"http://platform.bing.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"inventory.xboxlive.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"licensing.xboxlive.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"accountstroubleshooter.xboxlive.com","HostType":"fqdn","RelyingParty":"http://accounts.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"gamertag.xboxlive.com","HostType":"fqdn","RelyingParty":"http://accounts.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"help.ui.xboxlive.com","HostType":"fqdn","RelyingParty":"http://uxservices.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.ui.xboxlive.com","HostType":"wildcard"},{"Protocol":"https","Host":"data-vef.xboxlive.com","HostType":"fqdn","RelyingParty":"http://data-vef.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"update.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"updatepc.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"update-cdn.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"packages.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"packagespc.xboxlive.com","HostType":"fqdn","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"instance.mgt.xboxlive.com","HostType":"fqdn","RelyingParty":"http://instance.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":2},{"Protocol":"https","Host":"device.mgt.xboxlive.com","HostType":"fqdn","RelyingParty":"http://device.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"device.mgt.xboxlive.com","HostType":"fqdn","Path":"/registrations/bestv","RelyingParty":"http://bestv.device.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"device.mgt.xboxlive.com","HostType":"fqdn","Path":"/devices/current/unlock","RelyingParty":"http://unlock.device.mgt.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"xkms.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xkms.xboxlive.com","TokenType":"JWT","MinTlsVersion":"1.2","SignaturePolicyIndex":0},{"Protocol":"https","Host":"privileges.xboxlive.com","HostType":"fqdn","RelyingParty":"http://banning.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"privileges.xboxlive.com","HostType":"fqdn","Path":"/upsell","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"settings.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xboxlive.com","TokenType":"JWT","ServerCertIndex":[0,1],"SignaturePolicyIndex":1},{"Protocol":"https","Host":"*.experimentation.xboxlive.com","HostType":"wildcard","RelyingParty":"http://experimentation.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":1},{"Protocol":"https","Host":"*.xboxlive.com","HostType":"wildcard","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xboxlive.com","HostType":"fqdn","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"http","Host":"*.xboxlive.com","HostType":"wildcard"},{"Protocol":"https","Host":"xaaa.bbtv.cn","HostType":"fqdn","Path":"/xboxsms/OOBEService/AuthorizationStatus","RelyingParty":"http://bestvrp.bestv.com/","SubRelyingParty":"http://www.bestv.com.cn/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.vortex-win-sandbox.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.vortex-sandbox.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"vortex-events.xboxlive.com","HostType":"fqdn","RelyingParty":"http://events.xboxlive.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.pipe.int.trafficmanager.net","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"*.events-sandbox.data.microsoft.com","HostType":"wildcard","RelyingParty":"http://vortex-sbx.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"musicimage.xboxlive.com","HostType":"fqdn"},{"Protocol":"https","Host":"*.xboxservices.com","HostType":"wildcard","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"assets.xboxservices.com","HostType":"fqdn"},{"Protocol":"https","Host":"*.mp.microsoft.com","HostType":"wildcard","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"account.microsoft.com","HostType":"fqdn","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.account.microsoft.com","HostType":"wildcard","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"licensing.mp.microsoft.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"collections.mp.microsoft.com","HostType":"fqdn","RelyingParty":"http://licensing.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"api.twitch.tv","HostType":"fqdn","RelyingParty":"https://twitchxboxrp.twitch.tv/","TokenType":"JWT"},{"Protocol":"https","Host":"xdes.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xdes.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gameservices.xboxlive.com","HostType":"wildcard","RelyingParty":"https://gameservices.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"ssl.bing.com","HostType":"fqdn","Path":"/speechreco/xbox/accessibility","RelyingParty":"http://platform.bing.com/","TokenType":"JWT"},{"Protocol":"https","Host":"speech.bing.com","HostType":"fqdn","RelyingParty":"http://platform.bing.com/","TokenType":"JWT"},{"Protocol":"https","Host":"zto.dds.microsoft.com","HostType":"fqdn","RelyingParty":"http://dds.microsoft.com","TokenType":"JWT"},{"Protocol":"https","Host":"user.mgt.xboxlive.com","HostType":"fqdn","RelyingParty":"http://accounts.xboxlive.com","TokenType":"JWT"},{"Protocol":"https","Host":"gssv-auth-prod.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"gssv-auth-strs.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-prod.xboxlive.com","HostType":"wildcard","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-test.xboxlive.com","HostType":"wildcard","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-int.xboxlive.com","HostType":"wildcard","RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"*.gssv-play-prod.xboxlive.com","HostType":"wildcard","Path":"/v5/sessions/cloud","RelyingParty":"http://connect.gssv.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.gssv-play-test.xboxlive.com","HostType":"wildcard","Path":"/v5/sessions/cloud","RelyingParty":"http://connect.gssv.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.gssv-play-int.xboxlive.com","HostType":"wildcard","Path":"/v5/sessions/cloud","RelyingParty":"http://connect.gssv.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"settings-sandbox.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT"},{"Protocol":"https","Host":"settings-win.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT","ServerCertIndex":[2]},{"Protocol":"https","Host":"settings-ppe.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT"},{"Protocol":"https","Host":"settings.data.microsoft.com","HostType":"fqdn","RelyingParty":"http://onesettings-xbox-rp.com/","TokenType":"JWT","ServerCertIndex":[3,0]},{"Protocol":"https","Host":"playfabapi.com","HostType":"fqdn","RelyingParty":"http://playfab.xboxlive.com/","TokenType":"JWT"},{"Protocol":"https","Host":"sisu.xboxlive.com","HostType":"fqdn","RelyingParty":"http://sisu.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"beta-sisu.xboxlive.com","HostType":"fqdn","RelyingParty":"http://sisu.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.gamepass.com","HostType":"wildcard","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xflight.xboxlive.com","HostType":"fqdn","RelyingParty":"http://xflight.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xrap.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://rap.xboxflight.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"rap-fd.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://rap.xboxflight.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"streaming.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://streaming.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.support.xboxlive.com","HostType":"wildcard","RelyingParty":"rp://support.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"streaming-ppe.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://streaming.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xoobe.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://xoobe.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xoobe.platform.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://xoobe.xboxlive.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.ide.platform.xboxservices.com","HostType":"wildcard","RelyingParty":"rp://ide.platform.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.ppe.exp.xboxservices.com","HostType":"wildcard","RelyingParty":"rp://ppe.exp.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.exp.xboxservices.com","HostType":"wildcard","RelyingParty":"rp://exp.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"contentaccess.exp.xboxservices.com","HostType":"fqdn","RelyingParty":"http://mp.microsoft.com/","TokenType":"JWT"},{"Protocol":"https","Host":"gamingconsent-staging.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gamingconsent.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"gamingconsent.xboxlive.com","HostType":"fqdn","RelyingParty":"http://gamingconsent.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"*.sucu.xboxlive.com","HostType":"wildcard","RelyingParty":"http://update.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xai.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://xai.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"int.xai.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://ppe.xai.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"test.xai.xboxservices.com","HostType":"fqdn","RelyingParty":"rp://ppe.xai.xboxservices.com/","TokenType":"JWT","SignaturePolicyIndex":0},{"Protocol":"https","Host":"xgrant.xboxlive.com","HostType":"fqdn","RelyingParty":"rp://rewards.xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0}],"SignaturePolicies":[{"Version":1,"SupportedAlgorithms":["ES256"],"MaxBodyBytes":8192,"SupportedSignatureTypes":["XBL"]},{"Version":1,"SupportedAlgorithms":["ES256"],"MaxBodyBytes":2147483647,"SupportedSignatureTypes":["XBL"]},{"Version":2,"SupportedAlgorithms":["ES256"],"MaxBodyBytes":0,"SupportedSignatureTypes":["DPoP","XBL"]}],"Certs":[{"Thumbprint":"54D9D20239080C32316ED9FF980A48988F4ADF2D","IsIssuer":true,"RootCertIndex":0},{"Thumbprint":"D5A9ACDB80066D0E67FF65A939BBBC952F8ED171","RootCertIndex":0},{"Thumbprint":"8F43288AD272F3103B6FB1428485EA3014C0BCFE","IsIssuer":true,"RootCertIndex":1},{"Thumbprint":"AD898AC73DF333EB60AC1F5FC6C4B2219DDB79B7","IsIssuer":true,"RootCertIndex":0}],"RootCerts":["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"]}
+-- 
+2.56.0
+

@@ -11,8 +11,17 @@ makedepends=('cargo' 'git')
 provides=("${pkgname::-4}")
 conflicts=("${pkgname::-4}")
 options=(!lto)
-source=("git+$url.git" "fix-prefix-cache-flush.patch")
-sha256sums=('SKIP' 'SKIP')
+source=("git+$url.git"
+        "0001-msixvc-flush-PrefixCacheFile-writes-before-exposing-.patch"
+        "0002-xodus-Add-relying-party-resolution-and-Xbox-Live-req.patch"
+        "0003-xodus-Add-TokenAndSignature-protocol-messages-and-ti.patch"
+        "0004-xodus-service-Handle-TokenAndSignatureRequest.patch"
+        "0005-xodus-Add-user-identity-claims-and-UserInfo-protocol.patch"
+        "0006-xodus-service-Report-identity-claims-with-TokenAndSi.patch"
+        "0007-xodus-service-Handle-UserInfoRequest.patch"
+        "0008-xodus-Document-that-TokenAndSignatureRequest-Body-ma.patch"
+)
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 pkgver() {
 	# Todo: change this into the tag system when stable point builds are released!
@@ -22,7 +31,7 @@ pkgver() {
 
 prepare() {
 	cd "$srcdir/${pkgname::-4}"
-	git apply "$srcdir/fix-prefix-cache-flush.patch"
+	for p in "$srcdir"/0*.patch; do git apply "$p"; done
 	export RUSTUP_TOOLCHAIN=stable
 	cargo fetch --locked --target host-tuple
 }

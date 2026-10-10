@@ -1,0 +1,839 @@
+From dcecaf6aff03cbd41b754c6584e48a87df6e41b2 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 02:02:03 +0200
+Subject: [PATCH 09/12] xgameruntime: Real Xbox Live identity and
+ XUserGetTokenAndSignature in XUser.
+
+Identity: the first XUserAddAsync asks xodus-service who is signed in
+(UserInfoRequest with the title's MSAAppId and decimal TitleId, 15 s cap)
+from the worker thread that completes the XAsyncBlock. With SignedIn=true
+the single local user becomes that account: XUserGetId returns the XUID,
+XUserGetGamertag the classic/modern/suffix/unique components, and
+XUserGetAgeGroup the reported age group. Without a service, with
+XODUS_OFFLINE=1, when nobody is signed in, or on any error or timeout the
+offline user stays exactly as before (XUID 0x0009000000000001, OS user
+name, Adult); later XUserAddAsync calls retry until a sign-in was seen.
+XUserGetGamertag now honours the component argument, is UTF-8 aware and
+reports the needed size on E_NOT_SUFFICIENT_BUFFER.
+
+Tokens: XUserGetTokenAndSignatureAsync/ResultSize/Result and the Utf16
+variants forward the game's request (method, url, headers, raw body,
+ForceRefresh) to the service through TokenAndSignatureRequest on a worker
+thread (XGameSave's async pattern), with a 60 s cap. The result is packed
+into the caller's buffer: XUserGetTokenAndSignatureData, then the
+NUL-terminated token and signature, pointers into the same buffer; an
+empty signature is NULL/0. A service <Error> completes the block with that
+HRESULT (E_GAMEUSER_SIGNED_OUT, E_GAMEUSER_RESOLVE_USER_ISSUE_REQUIRED, ...),
+transport failures with E_GAMEUSER_FAILED_TO_GET_TOKEN. While no real user
+is known the calls keep returning E_NOTIMPL as before. Token and signature
+values are never traced.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/System/XUser.cpp             | 642 ++++++++++++++++--
+ 1 file changed, 596 insertions(+), 46 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/System/XUser.cpp b/dlls/xgameruntime/GDKComponent/System/XUser.cpp
+index c71fe2d..faf2363 100644
+--- a/dlls/xgameruntime/GDKComponent/System/XUser.cpp
++++ b/dlls/xgameruntime/GDKComponent/System/XUser.cpp
+@@ -20,34 +20,226 @@
+  */
+ 
+ #include "../../private.h"
++#include "../InitInternalGDKC.h"
++#include "../../WineCoreUAP/Foundation/IWineAsync.hpp"
+ #include "User/UserImpl.h"
+ 
+-#include <cstring>
+ #include <atomic>
++#include <cstring>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
++using namespace ABI::Xodus;
+ 
+ /*
+- * Offline local player. Real Xbox Live sign-in (through xodus-service) is not wired up yet, so
+- * games get a single always-signed-in local user and keep working offline.
++ * Single local player. When xodus-service is reachable and an Xbox Live account is signed in, the
++ * first XUserAddAsync turns this user into that account (XUID, gamertags, age group come from the
++ * service's UserInfoResponse). Otherwise, or with XODUS_OFFLINE=1, it stays the offline local
++ * player: XUID 0x0009000000000001, gamertag = OS user name, Adult, all privileges. The handle is
++ * the same object either way, so lookups and comparisons keep working.
+  */
+-static XUser g_offline_user = { X_USER_SIGNATURE, nullptr };
+-static const UINT64 OfflineUserLocalId = 1;
++static XUser g_local_user = { X_USER_SIGNATURE, nullptr };
++static const UINT64 LocalUserLocalId = 1;
+ static const UINT64 OfflineUserXuid = 0x0009000000000001ull;
+ static const char XUserAddAsyncIdentity[] = "XUserAddAsync";
++static const char TokenAndSignatureIdentity[] = "XUserGetTokenAndSignatureAsync";
++static const char TokenAndSignatureUtf16Identity[] = "XUserGetTokenAndSignatureUtf16Async";
++
++struct UserIdentity
++{
++    bool real = false;                 /* true: xodus-service reported a signed-in Xbox Live user */
++    UINT64 xuid = OfflineUserXuid;
++    std::string gamertag;              /* classic */
++    std::string modernGamertag;
++    std::string modernGamertagSuffix;
++    std::string uniqueModernGamertag;
++    XUserAgeGroup ageGroup = XUserAgeGroup::Adult;
++};
++
++static std::mutex g_identity_lock;
++static UserIdentity g_identity;          /* guarded by g_identity_lock */
++static bool g_identity_initialised = false;
++
++static BOOL IsLocalUser( XUserHandle user )
++{
++    return user == &g_local_user;
++}
++
++static std::string OfflineGamertag()
++{
++    // gamertags are at most 15 characters; use the Windows (= Linux) user name
++    char name[16] = "Player";
++    DWORD len = sizeof(name);
++
++    if ( !GetUserNameA( name, &len ) ) lstrcpyA( name, "Player" );
++    name[15] = 0;
++    return name;
++}
++
++static UserIdentity GetIdentity()
++{
++    const std::lock_guard<std::mutex> lock( g_identity_lock );
++
++    if ( !g_identity_initialised )
++    {
++        std::string name = OfflineGamertag();
++        g_identity.gamertag = name;
++        g_identity.modernGamertag = name;
++        g_identity.modernGamertagSuffix.clear();
++        g_identity.uniqueModernGamertag = name;
++        g_identity_initialised = true;
++    }
++    return g_identity;
++}
++
++static bool HaveRealUser()
++{
++    const std::lock_guard<std::mutex> lock( g_identity_lock );
++    return g_identity.real;
++}
++
++static std::string Utf8FromHString( HSTRING str )
++{
++    UINT32 len = 0;
++    LPCWSTR buf = WindowsGetStringRawBuffer( str, &len );
++    int size;
++    std::string out;
++
++    if ( !len ) return out;
++    size = WideCharToMultiByte( CP_UTF8, 0, buf, len, nullptr, 0, nullptr, nullptr );
++    if ( size <= 0 ) return out;
++    out.resize( size );
++    WideCharToMultiByte( CP_UTF8, 0, buf, len, &out[0], size, nullptr, nullptr );
++    return out;
++}
+ 
+-static BOOL IsOfflineUser( XUserHandle user )
++static std::string Utf8FromWide( const WCHAR *str )
+ {
+-    return user == &g_offline_user;
++    int size;
++    std::string out;
++
++    if ( !str || !*str ) return out;
++    size = WideCharToMultiByte( CP_UTF8, 0, str, -1, nullptr, 0, nullptr, nullptr );
++    if ( size <= 1 ) return out;
++    out.resize( size );
++    WideCharToMultiByte( CP_UTF8, 0, str, -1, &out[0], size, nullptr, nullptr );
++    out.resize( size - 1 ); /* drop the terminator */
++    return out;
++}
++
++/* NUL-terminated UTF-16, count includes the terminator */
++static std::vector<WCHAR> WideFromUtf8( const std::string &str )
++{
++    int count = MultiByteToWideChar( CP_UTF8, 0, str.c_str(), -1, nullptr, 0 );
++    std::vector<WCHAR> out( count > 0 ? count : 1, 0 );
++
++    if ( count > 0 ) MultiByteToWideChar( CP_UTF8, 0, str.c_str(), -1, out.data(), count );
++    return out;
++}
++
++/*
++ * Asks xodus-service who is signed in and makes that account the local user. Runs on the
++ * XUserAddAsync worker thread, so the game is never blocked on its own thread; a service that is
++ * absent, offline (XODUS_OFFLINE=1), signed out, slow or answering with an error keeps the offline
++ * identity. Retried on later XUserAddAsync calls until a signed-in user was seen.
++ */
++static void AcquireUserIdentity()
++{
++    HRESULT hr, error = S_OK;
++    DWORD wait;
++    boolean signedIn = false;
++    UINT64 xuid = 0;
++    UINT32 ageGroup = 0;
++    HSTRING gamertag = nullptr, modern = nullptr, suffix = nullptr, unique = nullptr;
++    UserIdentity id;
++
++    IAsyncOperation<IUserInfoResponse *> *operation = nullptr;
++    IUserInfoResponse *info = nullptr;
++
++    if ( HaveRealUser() ) return;
++
++    if ( FAILED( hr = XodusEnsureService() ) )
++    {
++        TRACE( "xodus service unavailable (%#lx), using the offline user\n", hr );
++        return;
++    }
++
++    hr = xodus_service->UserInfoRequest( msaAppId ? msaAppId : "", titleId, FALSE, IPC_USER_INFO_TIMEOUT_MS, &operation );
++    if ( FAILED( hr ) )
++    {
++        TRACE( "UserInfoRequest could not be dispatched (%#lx), using the offline user\n", hr );
++        return;
++    }
++
++    wait = AsyncOperationCompletedHandler<IUserInfoResponse *>::await_AsyncOperation( operation, INFINITE ); /* bounded by IPC_USER_INFO_TIMEOUT_MS */
++    hr = wait == WAIT_OBJECT_0 ? operation->GetResults( &info ) : E_FAIL;
++    operation->Release();
++    if ( FAILED( hr ) || !info )
++    {
++        TRACE( "UserInfoRequest failed (%#lx), using the offline user\n", hr );
++        return;
++    }
++
++    info->get_Error( &error );
++    info->get_SignedIn( &signedIn );
++    info->get_Xuid( &xuid );
++
++    if ( FAILED( error ) )
++        TRACE( "xodus service reported %#lx, using the offline user\n", error );
++    else if ( !signedIn || !xuid )
++        TRACE( "no Xbox Live user is signed in to xodus, using the offline user\n" );
++    else
++    {
++        info->get_Gamertag( &gamertag );
++        info->get_ModernGamertag( &modern );
++        info->get_ModernGamertagSuffix( &suffix );
++        info->get_UniqueModernGamertag( &unique );
++        info->get_AgeGroup( &ageGroup );
++
++        id.real = true;
++        id.xuid = xuid;
++        id.gamertag = Utf8FromHString( gamertag );
++        id.modernGamertag = Utf8FromHString( modern );
++        id.modernGamertagSuffix = Utf8FromHString( suffix );
++        id.uniqueModernGamertag = Utf8FromHString( unique );
++        if ( id.gamertag.empty() && id.modernGamertag.empty() ) id.gamertag = id.modernGamertag = OfflineGamertag();
++        if ( id.gamertag.empty() ) id.gamertag = id.modernGamertag;
++        if ( id.modernGamertag.empty() ) id.modernGamertag = id.gamertag;
++        if ( id.uniqueModernGamertag.empty() )
++            id.uniqueModernGamertag = id.modernGamertagSuffix.empty() ? id.modernGamertag : id.modernGamertag + "#" + id.modernGamertagSuffix;
++        id.ageGroup = ageGroup <= static_cast<UINT32>(XUserAgeGroup::Adult) ? static_cast<XUserAgeGroup>(ageGroup) : XUserAgeGroup::Unknown;
++
++        {
++            const std::lock_guard<std::mutex> lock( g_identity_lock );
++            g_identity = id;
++            g_identity_initialised = true;
++        }
++        TRACE( "signed in as xuid %I64u, gamertag %s, modern %s#%s, age group %u\n", xuid, debugstr_a( id.gamertag.c_str() ),
++               debugstr_a( id.modernGamertag.c_str() ), debugstr_a( id.modernGamertagSuffix.c_str() ), ageGroup );
++
++        WindowsDeleteString( gamertag );
++        WindowsDeleteString( modern );
++        WindowsDeleteString( suffix );
++        WindowsDeleteString( unique );
++    }
++
++    info->Release();
+ }
+ 
+ static DWORD WINAPI
+-OfflineUserAddCompleteThread( void *param )
++UserAddCompleteThread( void *param )
+ {
+     XAsyncBlock *async = (XAsyncBlock *)param;
+     IXThreadingImpl *xthreading;
+ 
++    AcquireUserIdentity();
++
+     Sleep( 50 );
+     if ( SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) )
+     {
+@@ -58,9 +250,8 @@ OfflineUserAddCompleteThread( void *param )
+ }
+ 
+ static HRESULT WINAPI
+-OfflineUserAddProvider( XAsyncOp op, const XAsyncProviderData *data )
++UserAddProvider( XAsyncOp op, const XAsyncProviderData *data )
+ {
+-    IXThreadingImpl *xthreading;
+     HRESULT hr = S_OK;
+ 
+     TRACE( "op %d, data %p.\n", (int)op, data );
+@@ -72,14 +263,14 @@ OfflineUserAddProvider( XAsyncOp op, const XAsyncProviderData *data )
+             // Complete from another thread: games set up the state their completion callback uses
+             // after XUserAddAsync returns, so completing inside Begin re-enters them too early.
+             // (WineGDK's XAsyncSchedule path currently throws, so it is avoided here.)
+-            HANDLE thread = CreateThread( nullptr, 0, OfflineUserAddCompleteThread, data->async, 0, nullptr );
++            HANDLE thread = CreateThread( nullptr, 0, UserAddCompleteThread, data->async, 0, nullptr );
+             if ( !thread ) return HRESULT_FROM_WIN32( GetLastError() );
+             CloseHandle( thread );
+             break;
+         }
+ 
+         case XAsyncOp::GetResult:
+-            *(XUserHandle *)data->buffer = &g_offline_user;
++            *(XUserHandle *)data->buffer = &g_local_user;
+             break;
+ 
+         default:
+@@ -89,6 +280,310 @@ OfflineUserAddProvider( XAsyncOp op, const XAsyncProviderData *data )
+     return hr;
+ }
+ 
++/*
++ * Async helper (same pattern as XGameSave.cpp): work runs on its own thread and completes the
++ * XAsyncBlock afterwards; the result is packed into the caller's buffer from XAsyncOp::GetResult.
++ */
++struct AsyncJob
++{
++    std::function<HRESULT(AsyncJob *)> work;   /* worker thread; on success sets resultSize */
++    std::function<void(void *buffer)> fill;    /* caller's thread, inside GetResult */
++    SIZE_T resultSize = 0;
++    XAsyncBlock *async = nullptr;              /* engine-side block from Begin */
++    std::atomic<bool> cancelled{ false };
++};
++
++static DWORD WINAPI AsyncJobThread( void *param )
++{
++    AsyncJob *job = (AsyncJob *)param;
++    IXThreadingImpl *xthreading;
++    HRESULT hr = job->work( job );
++    XAsyncBlock *async = job->async;
++    SIZE_T size;
++
++    if ( SUCCEEDED( hr ) && job->cancelled ) hr = E_ABORT;
++    size = SUCCEEDED( hr ) ? job->resultSize : 0;
++
++    if ( SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) )
++    {
++        xthreading->XAsyncComplete( async, hr, size ); /* may run Cleanup and delete job */
++        xthreading->Release();
++    }
++    return 0;
++}
++
++static HRESULT WINAPI AsyncJobProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    AsyncJob *job = (AsyncJob *)data->context;
++
++    switch (op)
++    {
++        case XAsyncOp::Begin:
++        {
++            job->async = data->async;
++            HANDLE thread = CreateThread( nullptr, 0, AsyncJobThread, job, 0, nullptr );
++            if ( !thread ) return HRESULT_FROM_WIN32( GetLastError() );
++            CloseHandle( thread );
++            return S_OK;
++        }
++        case XAsyncOp::GetResult:
++            if ( job->fill ) job->fill( data->buffer );
++            return S_OK;
++        case XAsyncOp::Cancel:
++            /* best effort: the worker completes with E_ABORT once the request returns */
++            job->cancelled = true;
++            return S_OK;
++        case XAsyncOp::Cleanup:
++            delete job;
++            return S_OK;
++        default:
++            return S_OK;
++    }
++}
++
++static HRESULT BeginAsyncJob( XAsyncBlock *async, const void *identity, const char *name, AsyncJob *job )
++{
++    IXThreadingImpl *xthreading;
++    HRESULT hr;
++
++    if ( !async ) { delete job; return E_POINTER; }
++    if ( FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) ) { delete job; return hr; }
++    hr = xthreading->XAsyncBegin( async, job, identity, name, AsyncJobProvider );
++    xthreading->Release();
++    if ( FAILED( hr ) ) delete job; /* only then did the provider never see the job */
++    return hr;
++}
++
++static HRESULT GetAsyncJobResultSize( XAsyncBlock *async, SIZE_T *size )
++{
++    IXThreadingImpl *xthreading;
++    HRESULT hr;
++
++    if ( !async || !size ) return E_POINTER;
++    if ( FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) ) return hr;
++    hr = xthreading->XAsyncGetResultSize( async, size );
++    xthreading->Release();
++    return hr;
++}
++
++static HRESULT GetAsyncJobResult( XAsyncBlock *async, const void *identity, SIZE_T size, void *buffer, SIZE_T *used )
++{
++    IXThreadingImpl *xthreading;
++    HRESULT hr;
++
++    if ( !async ) return E_POINTER;
++    if ( FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) ) return hr;
++    hr = xthreading->XAsyncGetResult( async, identity, size, buffer, used );
++    xthreading->Release();
++    return hr;
++}
++
++/*
++ * XUserGetTokenAndSignature*: the game's HTTP request is forwarded to xodus-service, which
++ * answers with the XSTS Authorization value and the request signature.
++ */
++struct TokenRequest
++{
++    bool forceRefresh = false;
++    std::string method;
++    std::string url;
++    std::vector<std::string> headerNames;
++    std::vector<std::string> headerValues;
++    std::vector<BYTE> body;
++};
++
++struct TokenResult
++{
++    std::string token;                 /* "XBL3.0 x=<uhs>;<xsts>" */
++    std::string signature;             /* base64, empty when the endpoint is not signed */
++    std::vector<WCHAR> tokenW;         /* UTF-16 variants, NUL terminated */
++    std::vector<WCHAR> signatureW;
++};
++
++/*
++ * Transport problems map to E_GAMEUSER_FAILED_TO_GET_TOKEN; an <Error> from the service is
++ * returned verbatim (E_GAMEUSER_SIGNED_OUT, E_GAMEUSER_RESOLVE_USER_ISSUE_REQUIRED, E_FAIL, ...).
++ * Token and signature values are never traced, only their sizes.
++ */
++static HRESULT RequestTokenAndSignature( const TokenRequest &req, TokenResult &out )
++{
++    std::vector<LPCSTR> names, values;
++    HRESULT hr, error = S_OK;
++    DWORD wait;
++    HSTRING token = nullptr, signature = nullptr, message = nullptr;
++
++    IAsyncOperation<ITokenAndSignatureResponse *> *operation = nullptr;
++    ITokenAndSignatureResponse *response = nullptr;
++
++    if ( FAILED( hr = XodusEnsureService() ) )
++    {
++        TRACE( "xodus service unavailable (%#lx)\n", hr );
++        return E_GAMEUSER_FAILED_TO_GET_TOKEN;
++    }
++
++    for ( auto &n : req.headerNames ) names.push_back( n.c_str() );
++    for ( auto &v : req.headerValues ) values.push_back( v.c_str() );
++
++    hr = xodus_service->TokenAndSignatureRequest( msaAppId ? msaAppId : "", titleId, req.method.c_str(), req.url.c_str(),
++                                                  static_cast<UINT32>(names.size()), names.data(), values.data(),
++                                                  static_cast<UINT32>(req.body.size()), req.body.data(), req.forceRefresh,
++                                                  IPC_TOKEN_TIMEOUT_MS, &operation );
++    if ( FAILED( hr ) )
++    {
++        WARN( "TokenAndSignatureRequest could not be dispatched (%#lx)\n", hr );
++        return E_GAMEUSER_FAILED_TO_GET_TOKEN;
++    }
++
++    wait = AsyncOperationCompletedHandler<ITokenAndSignatureResponse *>::await_AsyncOperation( operation, INFINITE ); /* bounded by IPC_TOKEN_TIMEOUT_MS */
++    hr = wait == WAIT_OBJECT_0 ? operation->GetResults( &response ) : E_FAIL;
++    operation->Release();
++    if ( FAILED( hr ) || !response )
++    {
++        WARN( "token request failed (%#lx)\n", hr );
++        return E_GAMEUSER_FAILED_TO_GET_TOKEN;
++    }
++
++    response->get_Error( &error );
++    if ( FAILED( error ) )
++    {
++        response->get_Message( &message );
++        WARN( "xodus service refused the token request: %#lx (%s)\n", error, debugstr_hstring( message ) );
++        WindowsDeleteString( message );
++        response->Release();
++        return error;
++    }
++
++    response->get_Token( &token );
++    response->get_Signature( &signature );
++    out.token = Utf8FromHString( token );
++    out.signature = Utf8FromHString( signature );
++    WindowsDeleteString( token );
++    WindowsDeleteString( signature );
++    response->Release();
++
++    if ( out.token.empty() )
++    {
++        WARN( "the xodus service returned an empty token\n" );
++        return E_GAMEUSER_FAILED_TO_GET_TOKEN;
++    }
++
++    TRACE( "got a token of %Iu bytes and a signature of %Iu bytes\n", out.token.size(), out.signature.size() );
++    return S_OK;
++}
++
++/*
++ * Result layout handed to the game (XUserGetTokenAndSignatureData, then the strings, pointers into
++ * the same buffer): sizes/counts include the terminator, an unsigned request has signature NULL/0.
++ */
++static SIZE_T PackedTokenSize( const TokenResult &r )
++{
++    return sizeof(XUserGetTokenAndSignatureData) + r.token.size() + 1 + ( r.signature.empty() ? 0 : r.signature.size() + 1 );
++}
++
++static void PackToken( const TokenResult &r, void *buffer )
++{
++    XUserGetTokenAndSignatureData *data = (XUserGetTokenAndSignatureData *)buffer;
++    char *cursor = (char *)( data + 1 );
++
++    memcpy( cursor, r.token.c_str(), r.token.size() + 1 );
++    data->token = cursor;
++    data->tokenSize = r.token.size() + 1;
++    cursor += data->tokenSize;
++
++    if ( r.signature.empty() )
++    {
++        data->signature = nullptr;
++        data->signatureSize = 0;
++    }
++    else
++    {
++        memcpy( cursor, r.signature.c_str(), r.signature.size() + 1 );
++        data->signature = cursor;
++        data->signatureSize = r.signature.size() + 1;
++    }
++}
++
++static SIZE_T PackedTokenSizeW( const TokenResult &r )
++{
++    return sizeof(XUserGetTokenAndSignatureUtf16Data) + ( r.tokenW.size() + ( r.signature.empty() ? 0 : r.signatureW.size() ) ) * sizeof(WCHAR);
++}
++
++static void PackTokenW( const TokenResult &r, void *buffer )
++{
++    XUserGetTokenAndSignatureUtf16Data *data = (XUserGetTokenAndSignatureUtf16Data *)buffer;
++    WCHAR *cursor = (WCHAR *)( data + 1 );
++
++    memcpy( cursor, r.tokenW.data(), r.tokenW.size() * sizeof(WCHAR) );
++    data->token = cursor;
++    data->tokenCount = r.tokenW.size();
++    cursor += r.tokenW.size();
++
++    if ( r.signature.empty() )
++    {
++        data->signature = nullptr;
++        data->signatureCount = 0;
++    }
++    else
++    {
++        memcpy( cursor, r.signatureW.data(), r.signatureW.size() * sizeof(WCHAR) );
++        data->signature = cursor;
++        data->signatureCount = r.signatureW.size();
++    }
++}
++
++/* Everything one token request needs, shared between the worker and the GetResult packer. */
++struct TokenJobState
++{
++    TokenRequest request;
++    TokenResult result;
++    bool utf16 = false;
++};
++
++static HRESULT BeginTokenRequest( XUserHandle user, XUserGetTokenAndSignatureOptions options, std::unique_ptr<TokenRequest> req, bool utf16, XAsyncBlock *async )
++{
++    const UINT32 opts = static_cast<UINT32>(options);
++    const UINT32 known = static_cast<UINT32>(XUserGetTokenAndSignatureOptions::ForceRefresh) | static_cast<UINT32>(XUserGetTokenAndSignatureOptions::AllUsers);
++
++    if ( !async ) return E_POINTER;
++    if ( !IsLocalUser( user ) ) return E_INVALIDARG;
++    if ( opts & ~known ) FIXME( "unknown options %#x ignored\n", opts & ~known );
++
++    if ( !HaveRealUser() )
++    {
++        /* offline (no service, XODUS_OFFLINE, or nobody signed in): keep the historical E_NOTIMPL */
++        TRACE( "no signed-in Xbox Live user, returning E_NOTIMPL\n" );
++        return E_NOTIMPL;
++    }
++
++    auto state = std::make_shared<TokenJobState>();
++    AsyncJob *job = new AsyncJob();
++
++    state->request = std::move( *req );
++    state->request.forceRefresh = opts & static_cast<UINT32>(XUserGetTokenAndSignatureOptions::ForceRefresh);
++    state->utf16 = utf16;
++
++    job->work = [state]( AsyncJob *j ) -> HRESULT {
++        HRESULT hr = RequestTokenAndSignature( state->request, state->result );
++        if ( SUCCEEDED( hr ) )
++        {
++            if ( state->utf16 )
++            {
++                state->result.tokenW = WideFromUtf8( state->result.token );
++                state->result.signatureW = WideFromUtf8( state->result.signature );
++            }
++            j->resultSize = state->utf16 ? PackedTokenSizeW( state->result ) : PackedTokenSize( state->result );
++        }
++        return hr;
++    };
++    job->fill = [state]( void *buffer ) {
++        if ( state->utf16 ) PackTokenW( state->result, buffer );
++        else PackToken( state->result, buffer );
++    };
++
++    return BeginAsyncJob( async, utf16 ? TokenAndSignatureUtf16Identity : TokenAndSignatureIdentity,
++                          utf16 ? "XUserGetTokenAndSignatureUtf16Async" : "XUserGetTokenAndSignatureAsync", job );
++}
++
+ class XUserImpl : 
+     public IXUserImpl6,
+     public IXUserGamertagImpl
+@@ -201,7 +696,7 @@ public:
+     {
+         TRACE( "handle %p, duplicatedHandle %p\n", handle, duplicatedHandle );
+         if ( !duplicatedHandle ) return E_POINTER;
+-        if ( !IsOfflineUser( handle ) ) return E_INVALIDARG;
++        if ( !IsLocalUser( handle ) ) return E_INVALIDARG;
+         *duplicatedHandle = handle;
+         return S_OK;
+     }
+@@ -230,11 +725,11 @@ public:
+         IXThreadingImpl *xthreading;
+         HRESULT hr;
+ 
+-        TRACE( "options %d, async %p, adding offline user\n", (int)options, async );
++        TRACE( "options %d, async %p\n", (int)options, async );
+ 
+         if ( !async ) return E_POINTER;
+         if ( FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) ) return hr;
+-        hr = xthreading->XAsyncBegin( async, nullptr, XUserAddAsyncIdentity, "XUserAddAsync", OfflineUserAddProvider );
++        hr = xthreading->XAsyncBegin( async, nullptr, XUserAddAsyncIdentity, "XUserAddAsync", UserAddProvider );
+         xthreading->Release();
+         return hr;
+     }
+@@ -257,8 +752,8 @@ public:
+     {
+         TRACE( "user %p, userLocalId %p\n", user, userLocalId );
+         if ( !userLocalId ) return E_POINTER;
+-        if ( !IsOfflineUser( user ) ) return E_INVALIDARG;
+-        userLocalId->value = OfflineUserLocalId;
++        if ( !IsLocalUser( user ) ) return E_INVALIDARG;
++        userLocalId->value = LocalUserLocalId;
+         return S_OK;
+     }
+ 
+@@ -266,8 +761,8 @@ public:
+     {
+         TRACE( "userLocalId %I64u, handle %p\n", userLocalId.value, handle );
+         if ( !handle ) return E_POINTER;
+-        if ( userLocalId.value != OfflineUserLocalId ) return E_GAMEUSER_USER_NOT_FOUND;
+-        *handle = &g_offline_user;
++        if ( userLocalId.value != LocalUserLocalId ) return E_GAMEUSER_USER_NOT_FOUND;
++        *handle = &g_local_user;
+         return S_OK;
+     }
+ 
+@@ -275,8 +770,8 @@ public:
+     {
+         TRACE( "user %p, userId %p\n", user, userId );
+         if ( !userId ) return E_POINTER;
+-        if ( !IsOfflineUser( user ) ) return E_INVALIDARG;
+-        *userId = OfflineUserXuid;
++        if ( !IsLocalUser( user ) ) return E_INVALIDARG;
++        *userId = GetIdentity().xuid;
+         return S_OK;
+     }
+ 
+@@ -284,8 +779,8 @@ public:
+     {
+         TRACE( "userId %I64u, handle %p\n", userId, handle );
+         if ( !handle ) return E_POINTER;
+-        if ( userId != OfflineUserXuid ) return E_GAMEUSER_USER_NOT_FOUND;
+-        *handle = &g_offline_user;
++        if ( userId != GetIdentity().xuid ) return E_GAMEUSER_USER_NOT_FOUND;
++        *handle = &g_local_user;
+         return S_OK;
+     }
+ 
+@@ -301,7 +796,7 @@ public:
+     {
+         TRACE( "user %p, state %p\n", user, state );
+         if ( !state ) return E_POINTER;
+-        *state = IsOfflineUser( user ) ? XUserState::SignedIn : XUserState::SignedOut;
++        *state = IsLocalUser( user ) ? XUserState::SignedIn : XUserState::SignedOut;
+         return S_OK;
+     }
+ 
+@@ -333,7 +828,7 @@ public:
+     {
+         TRACE( "user %p, ageGroup %p\n", user, ageGroup );
+         if ( !ageGroup ) return E_POINTER;
+-        *ageGroup = XUserAgeGroup::Adult;
++        *ageGroup = GetIdentity().ageGroup;
+         return S_OK;
+     }
+ 
+@@ -360,38 +855,86 @@ public:
+ 
+     HRESULT WINAPI XUserGetTokenAndSignatureAsync( XUserHandle user, XUserGetTokenAndSignatureOptions options, const char *method, const char *url, SIZE_T headerCount, const XUserGetTokenAndSignatureHttpHeader *headers, SIZE_T bodySize, const void *bodyBuffer, XAsyncBlock *async ) override
+     {
+-        FIXME( "user %p, options %d, method %s, url %s, headerCount %Iu, headers %p, bodySize %Iu, bodyBuffer %p, async %p stub!\n", user, (int)options, debugstr_a( method ), debugstr_a( url ), headerCount, headers, bodySize, bodyBuffer, async );
+-        return E_NOTIMPL;
++        std::unique_ptr<TokenRequest> req;
++
++        /* url/method/sizes only: header values and the body are the game's request data */
++        TRACE( "user %p, options %#x, method %s, url %s, headerCount %Iu, headers %p, bodySize %Iu, bodyBuffer %p, async %p\n", user, (int)options, debugstr_a( method ), debugstr_a( url ), headerCount, headers, bodySize, bodyBuffer, async );
++
++        if ( !async ) return E_POINTER;
++        if ( !method || !url || ( headerCount && !headers ) || ( bodySize && !bodyBuffer ) ) return E_INVALIDARG;
++
++        /* deep copy: the game's buffers are only valid during this call */
++        req.reset( new TokenRequest() );
++        req->method = method;
++        req->url = url;
++        for ( SIZE_T i = 0; i < headerCount; i++ )
++        {
++            req->headerNames.emplace_back( headers[i].name ? headers[i].name : "" );
++            req->headerValues.emplace_back( headers[i].value ? headers[i].value : "" );
++        }
++        if ( bodySize ) req->body.assign( (const BYTE *)bodyBuffer, (const BYTE *)bodyBuffer + bodySize );
++
++        return BeginTokenRequest( user, options, std::move( req ), false, async );
+     }
+ 
+     HRESULT WINAPI XUserGetTokenAndSignatureResultSize( XAsyncBlock *async, SIZE_T *bufferSize ) override
+     {
+-        FIXME( "async %p, bufferSize %p stub!\n", async, bufferSize );
+-        return E_NOTIMPL;
++        TRACE( "async %p, bufferSize %p\n", async, bufferSize );
++        return GetAsyncJobResultSize( async, bufferSize ); /* E_PENDING with 0 until the worker completed */
+     }
+ 
+     HRESULT WINAPI XUserGetTokenAndSignatureResult( XAsyncBlock *async, SIZE_T bufferSize, void *buffer, XUserGetTokenAndSignatureData **ptrToBuffer, SIZE_T *bufferUsed ) override
+     {
+-        FIXME( "async %p, bufferSize %Iu, buffer %p, ptrToBuffer %p, bufferUsed %p stub!\n", async, bufferSize, buffer, ptrToBuffer, bufferUsed );
+-        return E_NOTIMPL;
++        HRESULT hr;
++
++        TRACE( "async %p, bufferSize %Iu, buffer %p, ptrToBuffer %p, bufferUsed %p\n", async, bufferSize, buffer, ptrToBuffer, bufferUsed );
++
++        if ( !ptrToBuffer ) return E_POINTER;
++        *ptrToBuffer = nullptr;
++        if ( FAILED( hr = GetAsyncJobResult( async, TokenAndSignatureIdentity, bufferSize, buffer, bufferUsed ) ) ) return hr;
++        *ptrToBuffer = (XUserGetTokenAndSignatureData *)buffer;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI XUserGetTokenAndSignatureUtf16Async( XUserHandle user, XUserGetTokenAndSignatureOptions options, const WCHAR *method, const WCHAR *url, SIZE_T headerCount, const XUserGetTokenAndSignatureUtf16HttpHeader *headers, SIZE_T bodySize, const void *bodyBuffer, XAsyncBlock *async ) override
+     {
+-        FIXME( "user %p, options %d, method %s, url %s, headerCount %Iu, headers %p, bodySize %Iu, bodyBuffer %p, async %p stub!\n", user, (int)options, debugstr_w( method ), debugstr_w( url ), headerCount, headers, bodySize, bodyBuffer, async );
+-        return E_NOTIMPL;
++        std::unique_ptr<TokenRequest> req;
++
++        TRACE( "user %p, options %#x, method %s, url %s, headerCount %Iu, headers %p, bodySize %Iu, bodyBuffer %p, async %p\n", user, (int)options, debugstr_w( method ), debugstr_w( url ), headerCount, headers, bodySize, bodyBuffer, async );
++
++        if ( !async ) return E_POINTER;
++        if ( !method || !url || ( headerCount && !headers ) || ( bodySize && !bodyBuffer ) ) return E_INVALIDARG;
++
++        req.reset( new TokenRequest() );
++        req->method = Utf8FromWide( method );
++        req->url = Utf8FromWide( url );
++        for ( SIZE_T i = 0; i < headerCount; i++ )
++        {
++            req->headerNames.push_back( Utf8FromWide( headers[i].name ) );
++            req->headerValues.push_back( Utf8FromWide( headers[i].value ) );
++        }
++        if ( bodySize ) req->body.assign( (const BYTE *)bodyBuffer, (const BYTE *)bodyBuffer + bodySize );
++
++        return BeginTokenRequest( user, options, std::move( req ), true, async );
+     }
+ 
+     HRESULT WINAPI XUserGetTokenAndSignatureUtf16ResultSize( XAsyncBlock *async, SIZE_T *bufferSize ) override
+     {
+-        FIXME( "async %p, bufferSize %p stub!\n", async, bufferSize );
+-        return E_NOTIMPL;
++        TRACE( "async %p, bufferSize %p\n", async, bufferSize );
++        return GetAsyncJobResultSize( async, bufferSize );
+     }
+ 
+     HRESULT WINAPI XUserGetTokenAndSignatureUtf16Result( XAsyncBlock *async, SIZE_T bufferSize, void *buffer, XUserGetTokenAndSignatureUtf16Data **ptrToBuffer, SIZE_T *bufferUsed ) override
+     {
+-        FIXME( "async %p, bufferSize %Iu, buffer %p, ptrToBuffer %p, bufferUsed %p stub!\n", async, bufferSize, buffer, ptrToBuffer, bufferUsed );
+-        return E_NOTIMPL;
++        HRESULT hr;
++
++        TRACE( "async %p, bufferSize %Iu, buffer %p, ptrToBuffer %p, bufferUsed %p\n", async, bufferSize, buffer, ptrToBuffer, bufferUsed );
++
++        if ( !ptrToBuffer ) return E_POINTER;
++        *ptrToBuffer = nullptr;
++        if ( FAILED( hr = GetAsyncJobResult( async, TokenAndSignatureUtf16Identity, bufferSize, buffer, bufferUsed ) ) ) return hr;
++        *ptrToBuffer = (XUserGetTokenAndSignatureUtf16Data *)buffer;
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI XUserResolveIssueWithUiAsync( XUserHandle user, const char *url, XAsyncBlock *async ) override
+@@ -525,22 +1068,29 @@ public:
+ 
+     HRESULT WINAPI XUserGetGamertag( XUserHandle user, XUserGamertagComponent gamertagComponent, SIZE_T gamertagSize, char *gamertag, SIZE_T *gamertagUsed ) override
+     {
+-        char name[16] = "Player";
+-        DWORD len = sizeof(name);
++        UserIdentity id;
++        const std::string *value;
+         SIZE_T needed;
+ 
+         TRACE( "user %p, gamertagComponent %d, gamertagSize %Iu, gamertag %p, gamertagUsed %p\n", user, (int)gamertagComponent, gamertagSize, gamertag, gamertagUsed );
+ 
+         if ( !gamertag ) return E_POINTER;
+-        if ( !IsOfflineUser( user ) ) return E_INVALIDARG;
+-        // gamertags are at most 15 characters; use the Windows (= Linux) user name
+-        if ( !GetUserNameA( name, &len ) ) lstrcpyA( name, "Player" );
+-        name[15] = 0;
++        if ( !IsLocalUser( user ) ) return E_INVALIDARG;
+ 
+-        needed = std::strlen( name ) + 1;
+-        if ( gamertagSize < needed ) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+-        std::memcpy( gamertag, name, needed );
++        id = GetIdentity();
++        switch ( gamertagComponent )
++        {
++            case XUserGamertagComponent::Classic: value = &id.gamertag; break;
++            case XUserGamertagComponent::Modern: value = &id.modernGamertag; break;
++            case XUserGamertagComponent::ModernSuffix: value = &id.modernGamertagSuffix; break;
++            case XUserGamertagComponent::UniqueModern: value = &id.uniqueModernGamertag; break;
++            default: return E_INVALIDARG;
++        }
++
++        needed = value->size() + 1; /* UTF-8 bytes including the terminator */
+         if ( gamertagUsed ) *gamertagUsed = needed;
++        if ( gamertagSize < needed ) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++        std::memcpy( gamertag, value->c_str(), needed );
+         return S_OK;
+     }
+ 
+-- 
+2.56.0
+

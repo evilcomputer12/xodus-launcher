@@ -1,3 +1,25 @@
+From c0ed81d8ad0b58b9d8c0b31500ab7b41a358bddf Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Fri, 9 Oct 2026 23:34:24 +0200
+Subject: [PATCH 1/8] msixvc: flush PrefixCacheFile writes before exposing them
+ to the reader
+
+PrefixCacheFile keeps two handles on the cache file: cache_writer (a
+tokio::fs::File whose writes complete in the background) and cache_reader.
+cached_len was advanced as soon as poll_write returned, so a following read
+through cache_reader could run before the bytes had reached the file and
+fail with "cache ended before cached_len" (UnexpectedEof), which made
+`xodus-cli streaming` panic a few hundred KB into every download here.
+
+Add a Flushing state to the cache write state machine: after a write, poll
+cache_writer's flush and only then advance cached_len and release the
+pending chunk.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ crates/msixvc/src/streaming.rs | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
 diff --git a/crates/msixvc/src/streaming.rs b/crates/msixvc/src/streaming.rs
 index 824f9c2..e0534fb 100644
 --- a/crates/msixvc/src/streaming.rs
@@ -41,3 +63,6 @@ index 824f9c2..e0534fb 100644
                              return Poll::Ready(Ok(()));
                          }
                          Poll::Ready(Err(err)) => {
+-- 
+2.56.0
+

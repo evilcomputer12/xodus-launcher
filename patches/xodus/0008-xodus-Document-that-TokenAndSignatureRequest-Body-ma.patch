@@ -1,0 +1,137 @@
+From 626c0f07e85620c73920eee5c4da7db24f9065be Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 02:33:53 +0200
+Subject: [PATCH 8/8] xodus: Document that TokenAndSignatureRequest Body may be
+ a prefix.
+
+WineGDK sends the whole request body when it fits the u16-sized frame
+and only its first BODY_PREFIX_BYTES (8192) otherwise, which is
+MaxBodyBytes of the signature policy ordinary endpoints use, so
+sign_request already hashes exactly those bytes. Pin the constant on
+this side with a test against the title endpoint table, and warn when a
+request to one of the few whole-body endpoints carries exactly that
+many bytes, the one case a cut body would be signed wrongly.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ crates/xodus-service/src/connection/xml.rs    | 36 ++++++++++++-------
+ crates/xodus/src/models/xgameruntime/xuser.rs | 35 +++++++++++++++++-
+ 2 files changed, 57 insertions(+), 14 deletions(-)
+
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index edf35dd..b0e43dc 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -8,8 +8,8 @@ use xodus::models::secrets::Token;
+ use xodus::models::soap;
+ use xodus::models::xbox::XstsResponse;
+ use xodus::models::xgameruntime::xuser::{
+-    MSATokenRequest, MSATokenResponse, TokenAndSignatureRequest, TokenAndSignatureResponse,
+-    UserIdentity, UserInfoRequest, UserInfoResponse,
++    BODY_PREFIX_BYTES, MSATokenRequest, MSATokenResponse, TokenAndSignatureRequest,
++    TokenAndSignatureResponse, UserIdentity, UserInfoRequest, UserInfoResponse,
+ };
+ use xodus::proto::xodus::XodusMessageType;
+ 
+@@ -419,17 +419,27 @@ async fn title_bound_token(
+     let authorization = authorization_value(&xsts.identity, &xsts.token.token)?;
+ 
+     let signature = match &resolved.signature_policy {
+-        Some(policy) => signing::sign_request(
+-            &xsts.proof_key,
+-            i32::from(policy.version),
+-            policy.max_body_bytes as usize,
+-            chrono::Utc::now(),
+-            method,
+-            &signing::path_and_query(url),
+-            &authorization,
+-            body,
+-        )
+-        .map_err(|err| TokenError::new(E_FAIL, format!("request signing failed: {err}")))?,
++        Some(policy) => {
++            if body.len() == BODY_PREFIX_BYTES && policy.max_body_bytes as usize > BODY_PREFIX_BYTES
++            {
++                // the runtime sends at most BODY_PREFIX_BYTES of a body too large for its frame
++                tracing::warn!(
++                    "{url}: the signature policy covers {} body bytes but at most {BODY_PREFIX_BYTES} were sent; the signature is wrong if the body was cut",
++                    policy.max_body_bytes
++                );
++            }
++            signing::sign_request(
++                &xsts.proof_key,
++                i32::from(policy.version),
++                policy.max_body_bytes as usize,
++                chrono::Utc::now(),
++                method,
++                &signing::path_and_query(url),
++                &authorization,
++                body,
++            )
++            .map_err(|err| TokenError::new(E_FAIL, format!("request signing failed: {err}")))?
++        }
+         None => String::new(),
+     };
+ 
+diff --git a/crates/xodus/src/models/xgameruntime/xuser.rs b/crates/xodus/src/models/xgameruntime/xuser.rs
+index f01839f..e5f0a37 100644
+--- a/crates/xodus/src/models/xgameruntime/xuser.rs
++++ b/crates/xodus/src/models/xgameruntime/xuser.rs
+@@ -122,6 +122,14 @@ fn hresult_string(hresult: u32) -> String {
+     format!("0x{hresult:08X}")
+ }
+ 
++/// Longest body prefix the runtime guarantees to carry in [`TokenAndSignatureRequest::body`].
++/// The socket frame has a u16 length, so WineGDK sends the whole body when it fits and only
++/// its first `BODY_PREFIX_BYTES` otherwise. That is `MaxBodyBytes` of the signature policy
++/// every ordinary endpoint uses (title.mgt `SignaturePolicies[0]`), so the signature comes out
++/// the same; the few endpoints whose policy covers the whole body only ever see small requests.
++/// Keep in sync with `IPC_TOKEN_BODY_PREFIX_BYTES` in WineGDK's dlls/xgameruntime/private.h.
++pub const BODY_PREFIX_BYTES: usize = 8192;
++
+ /// `XUserGetTokenAndSignatureAsync` forwarded by the runtime: get an XSTS token (and the
+ /// Xbox Live request signature) for one HTTP request.
+ #[derive(Debug, Deserialize)]
+@@ -139,7 +147,8 @@ pub struct TokenAndSignatureRequest {
+     pub method: Option<String>,
+     #[serde(default)]
+     pub headers: Option<TokenRequestHeaders>,
+-    /// Request body, base64 encoded.
++    /// Request body, base64 encoded. It may be only a prefix of the body the game sends, see
++    /// [`BODY_PREFIX_BYTES`]; the signature never covers more than that for ordinary endpoints.
+     #[serde(default)]
+     pub body: Option<String>,
+     #[serde(default)]
+@@ -298,6 +307,30 @@ mod test {
+     use xal::response::{XSTSDisplayClaims, XSTSToken};
+ 
+     use super::*;
++    use crate::api::xbox::title::resolve_relying_party;
++    use crate::models::xbox::TitleMgtResponse;
++
++    /// A body cut to [`BODY_PREFIX_BYTES`] must sign exactly like the whole body for the
++    /// policy of the endpoints that take large bodies (title storage, achievements, ...).
++    #[test]
++    fn body_prefix_covers_default_signature_policy() {
++        let table: TitleMgtResponse =
++            serde_json::from_str(include_str!("../../../testdata/title_endpoints.json")).unwrap();
++        for url in [
++            "https://titlestorage.xboxlive.com/trustedplatform/users/xuid(1)/scids/0/data/save.dat,binary",
++            "https://achievements.xboxlive.com/users/xuid(1)/achievements?titleId=5",
++            "https://sessiondirectory.xboxlive.com/serviceconfigs/0/sessiontemplates/t/sessions/s",
++        ] {
++            let policy = resolve_relying_party(url, &table)
++                .and_then(|r| r.signature_policy)
++                .expect(url);
++            assert!(
++                policy.max_body_bytes as usize <= BODY_PREFIX_BYTES,
++                "{url}: policy signs {} bytes, the runtime may send only {BODY_PREFIX_BYTES}",
++                policy.max_body_bytes
++            );
++        }
++    }
+ 
+     /// `xui[0]` of an XSTS token for http://xboxlive.com (values made up).
+     fn claims() -> HashMap<String, String> {
+-- 
+2.56.0
+

@@ -260,6 +260,65 @@ def find_manifest(game_dir):
     return None
 
 
+def game_identity(game_dir):
+    """(MSAAppId, TitleId as decimal) from MicrosoftGame.config, or (None, None)."""
+    manifest = find_manifest(game_dir)
+    if manifest is None:
+        return None, None
+    try:
+        root = ET.parse(manifest).getroot()
+    except ET.ParseError:
+        return None, None
+    msa = title = None
+    for el in root.iter():
+        tag = el.tag.split("}")[-1]
+        if tag == "MSAAppId" and el.text:
+            msa = el.text.strip()
+        elif tag == "TitleId" and el.text:
+            try:
+                title = int(el.text.strip(), 16)  # hex in the config, decimal on the wire
+            except ValueError:
+                pass
+    return msa, title
+
+
+def prewarm_identity(game_dir, log=print):
+    """Ask xodus-service for the signed-in user's identity before the game does.
+
+    The first lookup after the service starts can take 30+ s (full Xbox Live flow);
+    the service caches it, so doing it while the game loads makes sign-in instant."""
+    import socket
+    import struct
+    msa, title = game_identity(game_dir)
+    sock_path = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "xodus.sock"
+    ident = ""
+    if msa and title:
+        ident = f"<ClientId>{msa}</ClientId><TitleId>{title}</TitleId>"
+    body = f"<UserInfoRequest>{ident}</UserInfoRequest>".encode()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(120)
+            s.connect(str(sock_path))
+            s.sendall(struct.pack("<IHH", 0x58445358, 7, len(body)) + body)
+            hdr = b""
+            while len(hdr) < 8:
+                chunk = s.recv(8 - len(hdr))
+                if not chunk:
+                    return
+                hdr += chunk
+            _, rtype, size = struct.unpack("<IHH", hdr)
+            data = b""
+            while len(data) < size:
+                chunk = s.recv(size - len(data))
+                if not chunk:
+                    break
+                data += chunk
+        log("identity pre-warm: " + ("signed in" if b"<SignedIn>true" in data else
+                                    "not signed in" if b"<SignedIn>false" in data else f"reply type {rtype}"))
+    except OSError as e:
+        log(f"identity pre-warm skipped: {e}")
+
+
 def find_executable(game_dir):
     """Main PC executable from MicrosoftGame.config (same rules as xodus PR #124)."""
     manifest = find_manifest(game_dir)
@@ -624,7 +683,8 @@ def launch_game(cfg, game_dir, log=print, on_start=None):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logfile = LOG_DIR / (safe_dirname(Path(game_dir).name) + ".log")
     env = wine_env(cfg, wine)
-    ensure_xodus_service(log)
+    if ensure_xodus_service(log):
+        threading.Thread(target=prewarm_identity, args=(game_dir, log), daemon=True).start()
     code, tail = 1, ""
     for cand in candidates:
         cmd = [cfg["xodus_cli"], "run", str(game_dir), wine, "-m", cfg["market"]]

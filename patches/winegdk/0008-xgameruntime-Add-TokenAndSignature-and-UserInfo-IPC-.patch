@@ -1,0 +1,2523 @@
+From 53ad48d38c22eb26fc79b13d5f4468e9038b0082 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 01:55:25 +0200
+Subject: [PATCH 08/12] xgameruntime: Add TokenAndSignature and UserInfo IPC
+ messages to the xodus layer.
+
+Protocol (XML over xodus.sock, service replies with type + 1):
+- type 5/6 TokenAndSignatureRequest/Response (ClientId, TitleId decimal, Url,
+  Method, Headers, Body base64, ForceRefresh -> Token, Signature, Expiry or
+  Error/Message, plus the optional identity elements Xuid, Gamertag,
+  ModernGamertag, ModernGamertagSuffix, UniqueModernGamertag, AgeGroup, Uhs).
+- type 7/8 UserInfoRequest/Response (ClientId, TitleId, ForceRefresh ->
+  SignedIn + identity elements, SignedIn=false, or Error/Message).
+- XodusMessageType enum mirroring common.proto replaces the literal ids.
+
+Plumbing: ITokenAndSignatureResponse/IUserInfoResponse objects, libxml2
+builders/parsers (xmlNewTextChild so URLs with '&' stay valid, no token
+or XML content in traces), IXodusService::TokenAndSignatureRequest and
+UserInfoRequest with a shared send/receive helper, a per-request timeout
+on IIPCLayer::SendRequestAsync.
+
+IPC layer fixes needed for any reply larger than a PONG: replies are
+AddRef'd before being handed to the waiting request, requests are
+serialised (no correlation id on the wire), the receive buffer grows to a
+full 64 KB frame and lives on the heap, timeouts are failures instead of
+HRESULT_FROM_NT(STATUS_TIMEOUT), a closed connection wakes the request in
+flight, bad magic resets the buffer instead of wedging the reader.
+
+Startup: the socket is no longer connected during XGameRuntimeInitialize.
+XodusEnsureService() connects lazily (socket, reader, PING) once, honours
+XODUS_OFFLINE=1 and fails quietly so games keep their offline user when
+the service is absent. The MessageBox on a refused connect is gone.
+
+IWineAsync: results are owned references (GetResults hands them out,
+AsyncInfo releases its copy), the outer operation reference taken by
+Start() is released when the callback ends, the callback's PROPVARIANT is
+initialised, failed Create paths no longer touch an unset AsyncInfo.
+
+MsaToken path: ClientId element in PascalCase as the service expects, the
+body no longer includes the trailing NUL, errors are returned instead of
+an unconditional S_OK, and the response XML is no longer traced.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/InitInternalGDKC.cpp         |  96 ++++-
+ .../GDKComponent/InitInternalGDKC.h           |   7 +
+ .../GDKComponent/Xodus/IPCLayer.cpp           | 347 +++++++++++-----
+ .../GDKComponent/Xodus/Structs.cpp            | 263 +++++++++++-
+ .../xgameruntime/GDKComponent/Xodus/Structs.h | 122 ++++++
+ .../GDKComponent/Xodus/Unix/socket.c          |  74 ++--
+ .../GDKComponent/Xodus/XodusService.cpp       | 350 ++++++++++++++--
+ .../GDKComponent/Xodus/XodusXMLBuilder.cpp    | 388 +++++++++++++++++-
+ .../WineCoreUAP/Foundation/IWineAsync.cpp     |  41 +-
+ dlls/xgameruntime/main.c                      |  19 +-
+ dlls/xgameruntime/private.h                   |  10 +-
+ dlls/xgameruntime/xodusprovider.idl           |  56 ++-
+ 12 files changed, 1575 insertions(+), 198 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
+index a68361b..90b095e 100644
+--- a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
++++ b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
+@@ -28,6 +28,10 @@
+ #include <ntstatus.h>
+ #include <shlwapi.h>
+ 
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkct);
+ 
+ using namespace ABI::Windows::Foundation;
+@@ -38,46 +42,100 @@ LPCSTR msaAppId;
+ UINT32 titleId;
+ BOOLEAN fullTrust;
+ 
+-static HRESULT WINAPI
+-InitializeXodusService()
++static std::mutex g_service_lock;
++static bool g_service_attempted = false;
++static HRESULT g_service_status = HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
++
++/*
++ * Socket connect + reader thread + PING round trip. Every failure is reported with TRACE only and
++ * leaves the runtime in offline mode; nothing here may surface to the game.
++ */
++static HRESULT
++ConnectXodusService()
+ {
+-    DWORD async;
++    const char *offline = getenv( "XODUS_OFFLINE" );
++    NTSTATUS nts;
+     HRESULT hr;
++    DWORD wait;
+ 
+     IAsyncAction *pingAction = nullptr;
+ 
++    if ( offline && *offline && strcmp( offline, "0" ) )
++    {
++        TRACE( "XODUS_OFFLINE is set, not connecting to the xodus service.\n" );
++        return HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
++    }
++
++    if ( !unixlib )
++    {
++        TRACE( "unix lib not loaded, staying offline.\n" );
++        return HRESULT_FROM_WIN32( ERROR_MOD_NOT_FOUND );
++    }
++
++    nts = __wine_unix_call( unixhandle, conn_socket, (void *)XODUS_SOCKET_SUFFIX );
++    if ( nts != STATUS_SUCCESS )
++    {
++        TRACE( "could not connect to the xodus service socket (status %#lx), staying offline.\n", nts );
++        return HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
++    }
++
+     hr = xodus_ipclayer->InitializeSocket();
+-    if ( FAILED( hr ) ) 
++    if ( FAILED( hr ) )
+     {
+-        WARN("Socket initialization failed with %#lx\n", hr);
++        TRACE( "socket reader could not be started (%#lx), staying offline.\n", hr );
+         return hr;
+     }
++
+     hr = xodus_service->Ping( &pingAction );
+-    if ( FAILED( hr ) ) 
++    if ( FAILED( hr ) )
+     {
+-        WARN("Xodus Ping Dispatch failed with %#lx\n", hr);
++        TRACE( "PING could not be dispatched (%#lx), staying offline.\n", hr );
+         return hr;
+     }
+ 
+-    async = AsyncActionCompletedHandler::await_AsyncAction( pingAction, 10000 );
+-    if ( async )
++    wait = AsyncActionCompletedHandler::await_AsyncAction( pingAction, IPC_PING_TIMEOUT_MS + 1000 );
++    if ( wait == WAIT_OBJECT_0 )
++        hr = pingAction->GetResults();
++    else
++        hr = HRESULT_FROM_WIN32( ERROR_TIMEOUT );
++    pingAction->Release();
++
++    if ( FAILED( hr ) )
+     {
+-        if ( async == STATUS_TIMEOUT )
+-        {
+-            WARN("Timeout while waiting for PING response.\n");
+-            return HRESULT_FROM_WIN32( ERROR_TIMEOUT );
+-        }
+-            
+-        WARN("Async action await failed. Status was %ld\n", async);
+-        return E_FAIL;
++        TRACE( "the xodus service did not answer the PING (%#lx), staying offline.\n", hr );
++        return hr;
+     }
+ 
+-    hr = pingAction->GetResults();
++    TRACE( "connected to the xodus service.\n" );
++    return S_OK;
++}
++
++HRESULT WINAPI
++XodusEnsureService()
++{
++    const std::lock_guard<std::mutex> lock( g_service_lock );
++
++    if ( !g_service_attempted )
++    {
++        g_service_attempted = true;
++        g_service_status = ConnectXodusService();
++    }
++
++    return g_service_status;
++}
++
++#if XODUS_INTEROP
++static HRESULT WINAPI
++InitializeXodusService()
++{
++    HRESULT hr = XodusEnsureService();
++
+     if ( FAILED( hr ) )
+-        WARN("PING response error. HR was %#lx\n", hr);
++        WARN("xodus service unavailable: %#lx\n", hr);
+ 
+     return hr;
+ }
++#endif
+ 
+ static HRESULT WINAPI
+ ObtainMsaAppId( INITIALIZE_OPTIONS *options )
+diff --git a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.h b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.h
+index b6d871f..644d614 100644
+--- a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.h
++++ b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.h
+@@ -27,6 +27,13 @@ extern "C" {
+ 
+ HRESULT WINAPI InitializeGDKComponent( INITIALIZE_OPTIONS *options );
+ 
++/*
++ * Connects to xodus-service once (socket, reader thread, PING) and caches the outcome. Fails quietly
++ * when XODUS_OFFLINE is set, the unix lib is missing, the socket is absent or the service does not
++ * answer; callers then stay with the offline user.
++ */
++HRESULT WINAPI XodusEnsureService( void );
++
+ #ifdef __cplusplus
+ }
+ #endif
+\ No newline at end of file
+diff --git a/dlls/xgameruntime/GDKComponent/Xodus/IPCLayer.cpp b/dlls/xgameruntime/GDKComponent/Xodus/IPCLayer.cpp
+index 558064e..370e3c6 100644
+--- a/dlls/xgameruntime/GDKComponent/Xodus/IPCLayer.cpp
++++ b/dlls/xgameruntime/GDKComponent/Xodus/IPCLayer.cpp
+@@ -28,6 +28,8 @@
+ #include "robuffer.h"
+ 
+ #include <atomic>
++#include <memory>
++#include <mutex>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xodus);
+ 
+@@ -36,6 +38,13 @@ using namespace ABI::Xodus;
+ using namespace ABI::Windows::Foundation;
+ using namespace ABI::Windows::Storage::Streams;
+ 
++/*
++ * Wire format (both directions, little endian, no padding): u32 magic, u16 message type,
++ * u16 body length, body. The service answers every request with type + 1 on the same
++ * connection, one request at a time. Replies carry no correlation id, so requests are
++ * serialised here (m_RequestLock) and the single reader thread hands every received frame to
++ * the handler of the request in flight.
++ */
+ class ABI::Xodus::IPCLayer :
+     public IIPCLayer
+ {
+@@ -110,22 +119,54 @@ public:
+     }
+ 
+     /* IIPCLayer Methods */
++
++    /* Starts the reader thread once. The socket must already be connected (conn_socket). */
+     HRESULT WINAPI
+-    InitializeSocket()
++    InitializeSocket() override
+     {
+-        IAsyncAction *operation;
++        IAsyncAction *operation = nullptr;
++        HRESULT hr;
++        bool expected = false;
++
+         TRACE("\n");
+-        return AsyncAction::Create( static_cast<IUnknown *>(this), nullptr, InitializeSocketThread, &operation );
++
++        if ( !m_ReaderStarted.compare_exchange_strong( expected, true ) )
++            return S_OK; /* already running (or gone: nothing reconnects) */
++
++        m_ReaderAlive = true;
++        hr = AsyncAction::Create( static_cast<IUnknown *>(this), nullptr, InitializeSocketThread, &operation );
++        if ( FAILED( hr ) )
++        {
++            m_ReaderAlive = false;
++            return hr;
++        }
++        operation->Release(); /* the reader keeps running until the connection closes */
++        return S_OK;
+     }
+ 
+     HRESULT WINAPI
+-    SendRequestAsync( IXodusIPCPacket *packet, IAsyncOperation<IXodusIPCPacket *> **operation ) override
++    SendRequestAsync( IXodusIPCPacket *packet, UINT32 timeoutMs, IAsyncOperation<IXodusIPCPacket *> **operation ) override
+     {
+         HRESULT hr;
++        SendRequestParams *params;
+ 
+-        packet->AddRef();        
+-        hr = AsyncOperation<IXodusIPCPacket *>::Create( static_cast<IUnknown *>(this), 
+-                                packet, SendRequest, operation );
++        TRACE("packet %p, timeoutMs %u, operation %p.\n", packet, timeoutMs, operation);
++
++        if ( !packet || !operation ) return E_POINTER;
++        if ( !m_ReaderAlive )
++        {
++            TRACE("not connected to the xodus service.\n");
++            return HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
++        }
++
++        params = new SendRequestParams{ packet, timeoutMs };
++        packet->AddRef();
++        hr = AsyncOperation<IXodusIPCPacket *>::Create( static_cast<IUnknown *>(this), params, SendRequest, operation );
++        if ( FAILED( hr ) )
++        {
++            packet->Release();
++            delete params;
++        }
+ 
+         return hr;
+     }
+@@ -134,10 +175,11 @@ public:
+     add_ResponseReceived( IIPCResponseHandler *handler, EventRegistrationToken *token ) override
+     {
+         response_received_callback *newCallback = new response_received_callback();
+-        newCallback->handler = handler;
++        const std::lock_guard<std::mutex> lock( m_CallbacksLock );
+ 
+         TRACE("handler %p, token %p.\n", handler, token);
+ 
++        newCallback->handler = handler;
+         handler->AddRef();
+         token->value = m_NextEventToken++;
+         newCallback->token = token->value;
+@@ -150,6 +192,7 @@ public:
+     remove_ResponseReceived( EventRegistrationToken token ) override
+     {
+         response_received_callback *oldCallback;
++        const std::lock_guard<std::mutex> lock( m_CallbacksLock );
+ 
+         TRACE("token %lld.\n", token.value);
+ 
+@@ -157,8 +200,9 @@ public:
+         {
+             if ( oldCallback->token == token.value )
+             {
+-                oldCallback->handler->Release();
+                 list_remove( &oldCallback->entry );
++                oldCallback->handler->Release();
++                delete oldCallback;
+                 return S_OK;
+             }
+         }
+@@ -174,11 +218,18 @@ private:
+         UINT16 MessageLength;
+     };
+ 
++    /* Same layout as IPCFrame in Unix/socket.c (the unix side is always 64-bit). */
+     struct IPCFrame
+     {
+-        UINT32 frameSize;
++        SIZE_T frameSize;
+         BYTE* frame;
+     };
++
++    struct SendRequestParams
++    {
++        IXodusIPCPacket *packet;
++        UINT32 timeoutMs;
++    };
+     
+     struct SendRequestContext
+     {
+@@ -186,100 +237,182 @@ private:
+         IXodusIPCPacket *response;
+     };
+ 
++    /*
++     * Frames the packet, sends it and waits up to timeoutMs for the reply. Results:
++     *   S_OK                                   result holds the reply packet (owned reference)
++     *   HRESULT_FROM_WIN32(ERROR_TIMEOUT)      no reply in time
++     *   HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED) connection gone (before or while waiting)
++     *   E_INVALIDARG                           body larger than the u16 length field
++     */
+     static HRESULT WINAPI 
+     SendRequest( IUnknown *invoker, PVOID param, PROPVARIANT *result )
+     {
+         auto iface = static_cast<IPCLayer *>( invoker );
+-        auto packet = static_cast<IXodusIPCPacket *>( param );
++        auto params = static_cast<SendRequestParams *>( param );
++        IXodusIPCPacket *packet = params->packet;
++        UINT32 timeoutMs = params->timeoutMs;
+ 
+-        BYTE* messageBuffer;
+-        DWORD asyncres;
++        BYTE* messageBuffer = nullptr;
++        DWORD asyncres = WAIT_FAILED;
+         HRESULT status = S_OK;
+         NTSTATUS nts;
++        UINT32 messageLength = 0;
+         IPCFrame frame{};
+         IPCHeader_CTYPE header{};
+         EventRegistrationToken token{};
+-        SendRequestContext context{ .event = CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+-        IPCResponseHandler *handler = new IPCResponseHandler( SendRequestResponseHandler, (PVOID)&context );
++        SendRequestContext context{};
++        IPCResponseHandler *handler = nullptr;
+ 
+-        IBuffer *message;
+-        IBufferByteAccess *messageBufferByteAccess;
++        IBuffer *message = nullptr;
++        IBufferByteAccess *messageBufferByteAccess = nullptr;
+ 
+         TRACE("invoker %p, param %p, result %p\n", invoker, param, result);
+ 
++        PropVariantInit( result );
++        delete params;
++
+         packet->get_Magic( &header.Magic );
+         packet->get_MessageType( &header.Message_Type );
+         packet->get_Message( &message );
+         packet->Release();
++        packet = nullptr;
+ 
+-        status = message->get_Length( &frame.frameSize );
+-        if ( FAILED( status ) ) return status;
++        status = message->get_Length( &messageLength );
++        if ( FAILED( status ) ) goto _CLEANUP;
++        if ( messageLength > 0xFFFF )
++        {
++            WARN( "message of %u bytes does not fit the u16 length field.\n", messageLength );
++            status = E_INVALIDARG;
++            goto _CLEANUP;
++        }
+         status = message->QueryInterface<IBufferByteAccess>( &messageBufferByteAccess );
+-        message->Release();
+-        if ( FAILED( status ) ) return status;
++        if ( FAILED( status ) ) goto _CLEANUP;
+         status = messageBufferByteAccess->Buffer( &messageBuffer );
+-        messageBufferByteAccess->Release();
+-        if ( FAILED( status ) ) return status;
+-
+-        header.MessageLength = frame.frameSize;
++        if ( FAILED( status ) ) goto _CLEANUP;
+ 
+-        frame.frameSize += sizeof(IPCHeader_CTYPE);
+-
+-        frame.frame = (PBYTE)CoTaskMemAlloc( sizeof(BYTE) * frame.frameSize );
++        header.MessageLength = static_cast<UINT16>(messageLength);
++        frame.frameSize = sizeof(IPCHeader_CTYPE) + messageLength;
++        frame.frame = (PBYTE)CoTaskMemAlloc( frame.frameSize );
+         if ( !frame.frame )
+-            return E_OUTOFMEMORY;
++        {
++            status = E_OUTOFMEMORY;
++            goto _CLEANUP;
++        }
+ 
+         RtlCopyMemory( frame.frame, &header.Magic, sizeof(MagicHeaderType) );
+         RtlCopyMemory( frame.frame + sizeof(MagicHeaderType), &header.Message_Type, sizeof(UINT16) );
+         RtlCopyMemory( frame.frame + sizeof(MagicHeaderType) + sizeof(UINT16), &header.MessageLength, sizeof(UINT16) );
+-        RtlCopyMemory( frame.frame + sizeof(IPCHeader_CTYPE), messageBuffer, header.MessageLength );
++        if ( messageLength )
++            RtlCopyMemory( frame.frame + sizeof(IPCHeader_CTYPE), messageBuffer, messageLength );
+ 
+-        status = iface->add_ResponseReceived( handler, &token );
+-        if ( FAILED( status ) ) return status;
++        messageBufferByteAccess->Release();
++        messageBufferByteAccess = nullptr;
++        message->Release();
++        message = nullptr;
+ 
+-        nts = __wine_unix_call( unixhandle, send_frame, (void *)&frame );
+-        CoTaskMemFree( frame.frame );
+-        if ( FAILED( nts ) ) return HRESULT_FROM_NT( nts );
++        context.event = CreateEventW( nullptr, TRUE, FALSE, nullptr );
++        if ( !context.event )
++        {
++            status = HRESULT_FROM_WIN32( GetLastError() );
++            goto _CLEANUP;
++        }
++        handler = new IPCResponseHandler( SendRequestResponseHandler, (PVOID)&context );
+ 
+-        asyncres = WaitForSingleObject( context.event, IPC_REQUEST_TIMEOUT_MS );
+-        status = iface->remove_ResponseReceived( token );
+-        if ( FAILED( status ) ) return status;
+-        if ( asyncres )
+         {
+-            WARN("Timeout while waiting for %p to respond.\n", handler);
+-            return HRESULT_FROM_NT( STATUS_TIMEOUT );
++            /* one request in flight per connection, from handler registration to removal */
++            const std::lock_guard<std::mutex> request_lock( iface->m_RequestLock );
++
++            if ( !iface->m_ReaderAlive )
++            {
++                TRACE( "connection to the xodus service is gone.\n" );
++                status = HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
++            }
++            else if ( SUCCEEDED( status = iface->add_ResponseReceived( handler, &token ) ) )
++            {
++                TRACE( "sending type %u, %u byte body, timeout %u ms\n", header.Message_Type, messageLength, timeoutMs );
++                nts = __wine_unix_call( unixhandle, send_frame, (void *)&frame );
++                if ( nts != STATUS_SUCCESS )
++                {
++                    WARN( "send_frame failed with %#lx\n", nts );
++                    status = HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
++                }
++                else
++                    asyncres = WaitForSingleObject( context.event, timeoutMs );
++
++                iface->remove_ResponseReceived( token ); /* after this no handler invocation is in progress */
++
++                if ( SUCCEEDED( status ) )
++                {
++                    if ( asyncres == WAIT_TIMEOUT )
++                    {
++                        WARN( "no reply to type %u within %u ms.\n", header.Message_Type, timeoutMs );
++                        status = HRESULT_FROM_WIN32( ERROR_TIMEOUT );
++                    }
++                    else if ( asyncres != WAIT_OBJECT_0 )
++                        status = E_FAIL;
++                    else if ( !context.response )
++                    {
++                        TRACE( "connection closed while waiting for the reply to type %u.\n", header.Message_Type );
++                        status = HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
++                    }
++                }
++            }
+         }
+ 
+-        result->vt = VT_UNKNOWN;
+-        result->punkVal = context.response;
++        if ( SUCCEEDED( status ) )
++        {
++            /* the reference the handler took moves into the result */
++            result->vt = VT_UNKNOWN;
++            result->punkVal = context.response;
++            context.response = nullptr;
++        }
+ 
+-        return S_OK;
++_CLEANUP:
++        if ( context.response ) context.response->Release(); /* reply that arrived after a failure */
++        if ( handler ) handler->Release();
++        if ( context.event ) CloseHandle( context.event );
++        if ( frame.frame ) CoTaskMemFree( frame.frame );
++        if ( messageBufferByteAccess ) messageBufferByteAccess->Release();
++        if ( message ) message->Release();
++        if ( packet ) packet->Release();
++        return status;
+     }
+ 
++    /* Reader -> waiting request. packet == NULL means the connection is gone. */
+     static HRESULT WINAPI
+     SendRequestResponseHandler( PVOID context, IXodusIPCPacket *packet )
+     {
+         auto ctx = reinterpret_cast<SendRequestContext *>( context );
+-
+-        HRESULT status;
+-        UINT16 messageType;
++        UINT16 messageType = 0;
+ 
+         TRACE("context %p, packet %p\n", context, packet);
+ 
+-        status = packet->get_MessageType( &messageType );
+-        if ( FAILED( status ) ) return status;
+-
+-        if ( messageType == 1 /* PING */ )
+-            return S_OK; //Skip the packet we sent.
++        if ( packet )
++        {
++            packet->get_MessageType( &messageType );
++            TRACE( "reply type %u\n", messageType );
+ 
+-        if ( messageType == 2 /* PONG */ )
+-            TRACE("Got PONGED!\n");
++            /* the reader releases its reference right after the handlers ran: keep the packet alive */
++            packet->AddRef();
++            if ( ctx->response ) ctx->response->Release();
++            ctx->response = packet;
++        }
+ 
+-        ctx->response = packet;
+         SetEvent( ctx->event );
+         return S_OK;
+     }
+ 
++    void DispatchPacket( IXodusIPCPacket *packet )
++    {
++        response_received_callback *currCallback;
++        const std::lock_guard<std::mutex> lock( m_CallbacksLock );
++
++        LIST_FOR_EACH_ENTRY( currCallback, &m_Callbacks, response_received_callback, entry )
++        {
++            currCallback->handler->Invoke( packet );
++        }
++    }
++
+     static HRESULT WINAPI 
+     InitializeSocketThread( IUnknown *invoker, PVOID param, PROPVARIANT *result )
+     {
+@@ -287,10 +420,11 @@ private:
+ 
+         BYTE* messageBuffer = nullptr;
+         SIZE_T offset = 0;
+-        HSTRING bufferClass;
+-        NTSTATUS status = STATUS_SUCCESS;
+-        POLL_SOCKET_ARGS currentPoll{};
+-        response_received_callback *currCallback;
++        HSTRING bufferClass = nullptr;
++        HRESULT status = S_OK;
++        NTSTATUS nts;
++        /* 64 KB: lives on the heap, not on the threadpool thread's stack */
++        std::unique_ptr<POLL_SOCKET_ARGS> currentPoll( new POLL_SOCKET_ARGS() );
+ 
+         IBuffer *message = nullptr;
+         IBufferByteAccess *messageBufferAccess = nullptr;
+@@ -299,19 +433,26 @@ private:
+ 
+         TRACE("invoker %p, param %p, result %p\n", invoker, param, result);
+ 
++        PropVariantInit( result );
++
+         status = WindowsCreateString( RuntimeClass_Windows_Storage_Streams_Buffer, lstrlenW( RuntimeClass_Windows_Storage_Streams_Buffer ), &bufferClass );
+-        if ( FAILED( status ) ) return status;
++        if ( FAILED( status ) ) goto _EXIT;
+ 
+         status = RoGetActivationFactory( bufferClass, __uuidof( IBufferFactory ), (void **)&bufferFactory );
+         WindowsDeleteString( bufferClass );
+-        if ( FAILED( status ) ) return status;
++        if ( FAILED( status ) ) goto _EXIT;
+ 
+-        // Automatically broken when the DLL is detatched. 
++        // Runs until the service closes the connection or the process exits.
+         while ( TRUE )
+         {
+             // poll_sock()
+-            status = __wine_unix_call( unixhandle, poll_socket, (void *)&currentPoll );
+-            if ( FAILED( status ) ) return HRESULT_FROM_NT( status );
++            nts = __wine_unix_call( unixhandle, poll_socket, (void *)currentPoll.get() );
++            if ( nts != STATUS_SUCCESS )
++            {
++                TRACE( "poll_socket returned %#lx, reader exiting.\n", nts );
++                status = HRESULT_FROM_NT( nts );
++                break;
++            }
+ 
+             // Multiple messages may arrive at the same time.
+             // Try to parse them all
+@@ -321,71 +462,73 @@ private:
+             {
+                 IPCHeader_CTYPE *header;
+ 
+-                if ( currentPoll.curr_buffer_size - offset < sizeof(IPCHeader_CTYPE) )
++                if ( currentPoll->curr_buffer_size - offset < sizeof(IPCHeader_CTYPE) )
+                     break; //Not received the full header yet.
+ 
+-                header = reinterpret_cast<IPCHeader_CTYPE *>( currentPoll.curr_buffer + offset );
++                header = reinterpret_cast<IPCHeader_CTYPE *>( currentPoll->curr_buffer + offset );
+                 
+-                if ( header->Magic == MagicHeaderType::Proto )
+-                {
+-                    FIXME("Proto is not yet supported!\n");
+-                    break;
+-                }
+-                else if ( header->Magic != MagicHeaderType::XML )
++                if ( header->Magic != MagicHeaderType::XML )
+                 {
+-                    FIXME("Invalid magic header %#x received!\n", (int)header->Magic);
++                    /* Proto frames are not supported and anything else means the stream is out of sync: drop what we have. */
++                    WARN( "unexpected magic %#x, dropping %Iu buffered bytes.\n", (int)header->Magic, currentPoll->curr_buffer_size );
++                    currentPoll->curr_buffer_size = 0;
++                    offset = 0;
+                     break;
+                 }
+ 
+-                if ( currentPoll.curr_buffer_size - offset < sizeof(IPCHeader_CTYPE) + header->MessageLength )
++                if ( currentPoll->curr_buffer_size - offset < sizeof(IPCHeader_CTYPE) + header->MessageLength )
+                     break; //We have not received the full message yet.
+-                TRACE("header->Message_Type is %d!\n", header->Message_Type);
+-
+-                /**
+-                 * TODO: Should we ignore messages sent by ourselves?
+-                 * if ( header->Message_Type == MessageType::Ping ||
+-                 *     header->Message_Type == MessageType::XstsTokenRequest )
+-                 *    break;
+-                 */
++                TRACE( "received type %u, %u byte body\n", header->Message_Type, header->MessageLength );
+ 
+                 status = bufferFactory->Create( header->MessageLength + 1, &message );
+-                if ( FAILED( status ) ) return status; //something went horribly wrong.
++                if ( FAILED( status ) ) goto _EXIT; //something went horribly wrong.
+                 status = message->QueryInterface<IBufferByteAccess>( &messageBufferAccess );
+-                if ( FAILED( status ) ) return status; //something went horribly wrong.
++                if ( FAILED( status ) ) goto _EXIT; //something went horribly wrong.
+                 status = messageBufferAccess->Buffer( &messageBuffer );
+-                if ( FAILED( status ) ) return status; //something went horribly wrong.
++                messageBufferAccess->Release();
++                messageBufferAccess = nullptr;
++                if ( FAILED( status ) ) goto _EXIT; //something went horribly wrong.
+ 
+                 if ( !messageBuffer )
+-                    return E_OUTOFMEMORY;
++                {
++                    status = E_OUTOFMEMORY;
++                    goto _EXIT;
++                }
+ 
+-                RtlCopyMemory( (PVOID)messageBuffer, (PVOID)(currentPoll.curr_buffer + offset + sizeof(IPCHeader_CTYPE)), header->MessageLength );
++                RtlCopyMemory( (PVOID)messageBuffer, (PVOID)(currentPoll->curr_buffer + offset + sizeof(IPCHeader_CTYPE)), header->MessageLength );
++                messageBuffer[header->MessageLength] = '\0'; /* bodies are NUL terminated for the XML parser */
+                 status = message->put_Length( static_cast<UINT32>(header->MessageLength) );
++                if ( FAILED( status ) ) goto _EXIT;
+                 offset += sizeof(IPCHeader_CTYPE) + header->MessageLength;
+ 
+-                messageBuffer[header->MessageLength] = '\0';
+-
+                 xodusPacket = new XodusIPCPacket( header->Magic, header->Message_Type, message );
++                message->Release(); /* owned by the packet now */
++                message = nullptr;
+ 
+-                messageBufferAccess->Release();
+-
+-                LIST_FOR_EACH_ENTRY( currCallback, &iface->m_Callbacks, response_received_callback, entry )
+-                {
+-                    currCallback->handler->Invoke( xodusPacket );
+-                }
+-                // ---- //
++                iface->DispatchPacket( xodusPacket );
+ 
+                 xodusPacket->Release();
++                xodusPacket = nullptr;
+             }
+ 
+             if ( offset > 0 )
+             {
+-                memmove( currentPoll.curr_buffer, currentPoll.curr_buffer + offset, currentPoll.curr_buffer_size - offset );
+-                currentPoll.curr_buffer_size -= offset;
++                memmove( currentPoll->curr_buffer, currentPoll->curr_buffer + offset, currentPoll->curr_buffer_size - offset );
++                /* consumed frames may have carried tokens: wipe the stale tail */
++                SecureZeroMemory( currentPoll->curr_buffer + currentPoll->curr_buffer_size - offset, offset );
++                currentPoll->curr_buffer_size -= offset;
+             }
+         }
+ 
+-        bufferFactory->Release();
+-        return S_OK;
++_EXIT:
++        iface->m_ReaderAlive = false;
++        iface->DispatchPacket( nullptr ); /* wake the request in flight: no reply will come */
++        if ( message ) message->Release();
++        if ( messageBufferAccess ) messageBufferAccess->Release();
++        if ( bufferFactory ) bufferFactory->Release();
++        if ( currentPoll ) SecureZeroMemory( currentPoll->curr_buffer, sizeof(currentPoll->curr_buffer) );
++        TRACE( "reader exiting with %#lx\n", status );
++        return status;
+     }
+ 
+     struct response_received_callback
+@@ -396,7 +539,11 @@ private:
+     };
+ 
+     struct list m_Callbacks = LIST_INIT( m_Callbacks );
++    std::mutex m_CallbacksLock;              /* protects m_Callbacks */
++    std::mutex m_RequestLock;                /* one request in flight per connection */
+     std::atomic<INT64> m_NextEventToken{ 0 };
++    std::atomic<bool> m_ReaderStarted{ false };
++    std::atomic<bool> m_ReaderAlive{ false }; /* false once the connection is gone: requests fail immediately */
+     std::atomic_long ref{ 1 };
+ };
+ 
+diff --git a/dlls/xgameruntime/GDKComponent/Xodus/Structs.cpp b/dlls/xgameruntime/GDKComponent/Xodus/Structs.cpp
+index 74d2409..1426f70 100644
+--- a/dlls/xgameruntime/GDKComponent/Xodus/Structs.cpp
++++ b/dlls/xgameruntime/GDKComponent/Xodus/Structs.cpp
+@@ -244,4 +244,265 @@ MsaTokenResponse::get_Expiry( ABI::Windows::Foundation::DateTime *out )
+     TRACE( "iface %p, out %p\n", this, out );
+     *out = Expiry;
+     return S_OK;
+-}
+\ No newline at end of file
++}
++/**
++ * UserInfoResponse: identity of the signed-in Xbox Live user (UserInfoResponse packets and the
++ * identity block of TokenAndSignatureResponse packets).
++ */
++UserInfoResponse::UserInfoResponse(
++    const XodusUserIdentityData &identity,
++    HRESULT error,
++    HSTRING message )
++: Error(error)
++{
++    Identity.signedIn = identity.signedIn;
++    Identity.xuid = identity.xuid;
++    Identity.ageGroup = identity.ageGroup;
++    WindowsDuplicateString( identity.gamertag, &Identity.gamertag );
++    WindowsDuplicateString( identity.modernGamertag, &Identity.modernGamertag );
++    WindowsDuplicateString( identity.modernGamertagSuffix, &Identity.modernGamertagSuffix );
++    WindowsDuplicateString( identity.uniqueModernGamertag, &Identity.uniqueModernGamertag );
++    WindowsDuplicateString( identity.uhs, &Identity.uhs );
++    WindowsDuplicateString( message, &Message );
++}
++
++HRESULT WINAPI
++UserInfoResponse::QueryInterface( REFIID iid, void **out ) noexcept
++{
++    TRACE( "iface %p, iid %s, out %p.\n", this, debugstr_guid( &iid ), out );
++
++    if (!out) return E_POINTER;
++    *out = nullptr;
++
++    if ( iid == __uuidof( IUnknown ) ||
++         iid == __uuidof( IInspectable ) ||
++         iid == __uuidof( IAgileObject ) ||
++         iid == __uuidof( IUserInfoResponse ) )
++    {
++        AddRef();
++        *out = static_cast<IUserInfoResponse *>(this);
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &iid ) );
++    *out = nullptr;
++    return E_NOINTERFACE;
++}
++
++ULONG WINAPI 
++UserInfoResponse::AddRef() noexcept
++{
++    ULONG curr = static_cast<ULONG>(++ref);
++    TRACE( "iface %p increasing refcount to %lu.\n", this, curr );
++    return curr;
++}
++
++ULONG WINAPI 
++UserInfoResponse::Release() noexcept
++{
++    ULONG curr = static_cast<ULONG>(--ref);
++    TRACE( "iface %p decreasing refcount to %lu.\n", this, curr );
++
++    if ( !curr )
++    {
++        WindowsDeleteString( Identity.gamertag );
++        WindowsDeleteString( Identity.modernGamertag );
++        WindowsDeleteString( Identity.modernGamertagSuffix );
++        WindowsDeleteString( Identity.uniqueModernGamertag );
++        WindowsDeleteString( Identity.uhs );
++        WindowsDeleteString( Message );
++        delete this;
++    }
++
++    return curr;
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_SignedIn( boolean *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    *out = Identity.signedIn;
++    return S_OK;
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_Xuid( UINT64 *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    *out = Identity.xuid;
++    return S_OK;
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_Gamertag( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( Identity.gamertag, out );
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_ModernGamertag( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( Identity.modernGamertag, out );
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_ModernGamertagSuffix( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( Identity.modernGamertagSuffix, out );
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_UniqueModernGamertag( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( Identity.uniqueModernGamertag, out );
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_AgeGroup( UINT32 *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    *out = Identity.ageGroup;
++    return S_OK;
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_Uhs( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( Identity.uhs, out );
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_Error( HRESULT *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    *out = Error;
++    return S_OK;
++}
++
++HRESULT WINAPI
++UserInfoResponse::get_Message( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( Message, out );
++}
++
++/**
++ * TokenAndSignatureResponse: wraps TokenAndSignatureResponse packets sent by Xodus.
++ * The token and signature values are never traced.
++ */
++TokenAndSignatureResponse::TokenAndSignatureResponse(
++    HSTRING token,
++    HSTRING signature,
++    ABI::Windows::Foundation::DateTime expiry,
++    HRESULT error,
++    HSTRING message,
++    IUserInfoResponse *userInfo )
++: Expiry(expiry),
++  Error(error),
++  UserInfo(userInfo)
++{
++    WindowsDuplicateString( token, &Token );
++    WindowsDuplicateString( signature, &Signature );
++    WindowsDuplicateString( message, &Message );
++    if ( UserInfo ) UserInfo->AddRef();
++}
++
++HRESULT WINAPI
++TokenAndSignatureResponse::QueryInterface( REFIID iid, void **out ) noexcept
++{
++    TRACE( "iface %p, iid %s, out %p.\n", this, debugstr_guid( &iid ), out );
++
++    if (!out) return E_POINTER;
++    *out = nullptr;
++
++    if ( iid == __uuidof( IUnknown ) ||
++         iid == __uuidof( IInspectable ) ||
++         iid == __uuidof( IAgileObject ) ||
++         iid == __uuidof( ITokenAndSignatureResponse ) )
++    {
++        AddRef();
++        *out = static_cast<ITokenAndSignatureResponse *>(this);
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &iid ) );
++    *out = nullptr;
++    return E_NOINTERFACE;
++}
++
++ULONG WINAPI 
++TokenAndSignatureResponse::AddRef() noexcept
++{
++    ULONG curr = static_cast<ULONG>(++ref);
++    TRACE( "iface %p increasing refcount to %lu.\n", this, curr );
++    return curr;
++}
++
++ULONG WINAPI 
++TokenAndSignatureResponse::Release() noexcept
++{
++    ULONG curr = static_cast<ULONG>(--ref);
++    TRACE( "iface %p decreasing refcount to %lu.\n", this, curr );
++
++    if ( !curr )
++    {
++        WindowsDeleteString( Token );
++        WindowsDeleteString( Signature );
++        WindowsDeleteString( Message );
++        if ( UserInfo ) UserInfo->Release();
++        delete this;
++    }
++
++    return curr;
++}
++
++HRESULT WINAPI
++TokenAndSignatureResponse::get_Token( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( Token, out );
++}
++
++HRESULT WINAPI
++TokenAndSignatureResponse::get_Signature( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( Signature, out );
++}
++
++HRESULT WINAPI
++TokenAndSignatureResponse::get_Expiry( ABI::Windows::Foundation::DateTime *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    *out = Expiry;
++    return S_OK;
++}
++
++HRESULT WINAPI
++TokenAndSignatureResponse::get_Error( HRESULT *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    *out = Error;
++    return S_OK;
++}
++
++HRESULT WINAPI
++TokenAndSignatureResponse::get_Message( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( Message, out );
++}
++
++HRESULT WINAPI
++TokenAndSignatureResponse::get_UserInfo( IUserInfoResponse **out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    *out = UserInfo;
++    if ( UserInfo ) UserInfo->AddRef();
++    return S_OK;
++}
+diff --git a/dlls/xgameruntime/GDKComponent/Xodus/Structs.h b/dlls/xgameruntime/GDKComponent/Xodus/Structs.h
+index d20e802..6275470 100644
+--- a/dlls/xgameruntime/GDKComponent/Xodus/Structs.h
++++ b/dlls/xgameruntime/GDKComponent/Xodus/Structs.h
+@@ -31,6 +31,48 @@ using namespace ABI::Xodus;
+ 
+ typedef HRESULT (CALLBACK *IPCResponseHandlerCallback)( PVOID context, IXodusIPCPacket *response );
+ 
++/*
++ * Message type ids of the xodus.sock protocol. Mirrors XodusMessageType in
++ * crates/xodus/proto/xodus/common.proto; the service answers every request with type + 1.
++ */
++enum class XodusMessageType : UINT16
++{
++    Unknown = 0,
++    Ping = 1,
++    Pong = 2,
++    MsaTokenRequest = 3,
++    MsaTokenResponse = 4,
++    TokenAndSignatureRequest = 5,
++    TokenAndSignatureResponse = 6,
++    UserInfoRequest = 7,
++    UserInfoResponse = 8,
++};
++
++/* Age group values carried by IUserInfoResponse::AgeGroup (same numbering as XUserAgeGroup). */
++enum class XodusAgeGroup : UINT32
++{
++    Unknown = 0,
++    Child = 1,
++    Teen = 2,
++    Adult = 3,
++};
++
++/*
++ * Plain holder for the identity elements of a response. The strings are owned by whoever fills the
++ * struct; the response objects below duplicate them.
++ */
++struct XodusUserIdentityData
++{
++    boolean signedIn = false;
++    UINT64 xuid = 0;
++    HSTRING gamertag = nullptr;
++    HSTRING modernGamertag = nullptr;
++    HSTRING modernGamertagSuffix = nullptr;
++    HSTRING uniqueModernGamertag = nullptr;
++    UINT32 ageGroup = static_cast<UINT32>(XodusAgeGroup::Unknown);
++    HSTRING uhs = nullptr;
++};
++
+ struct XodusIPCPacket :
+     public IXodusIPCPacket
+ {
+@@ -120,4 +162,84 @@ private:
+     std::atomic_long ref{ 1 };
+ };
+ 
++struct UserInfoResponse :
++    public IUserInfoResponse
++{
++public:
++    UserInfoResponse() = default;
++    virtual ~UserInfoResponse() = default;
++
++    UserInfoResponse(
++        const XodusUserIdentityData &identity,
++        HRESULT error,
++        HSTRING message );
++
++    UserInfoResponse( const UserInfoResponse& ) = delete;
++    UserInfoResponse& operator=( const UserInfoResponse& ) = delete;
++
++    /* IUnknown Methods */
++    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override;
++    ULONG WINAPI AddRef() noexcept override;
++    ULONG WINAPI Release() noexcept override;
++
++    /* IUserInfoResponse Methods */
++    HRESULT WINAPI get_SignedIn( boolean *out ) override;
++    HRESULT WINAPI get_Xuid( UINT64 *out ) override;
++    HRESULT WINAPI get_Gamertag( HSTRING *out ) override;
++    HRESULT WINAPI get_ModernGamertag( HSTRING *out ) override;
++    HRESULT WINAPI get_ModernGamertagSuffix( HSTRING *out ) override;
++    HRESULT WINAPI get_UniqueModernGamertag( HSTRING *out ) override;
++    HRESULT WINAPI get_AgeGroup( UINT32 *out ) override;
++    HRESULT WINAPI get_Uhs( HSTRING *out ) override;
++    HRESULT WINAPI get_Error( HRESULT *out ) override;
++    HRESULT WINAPI get_Message( HSTRING *out ) override;
++
++private:
++    XodusUserIdentityData Identity{};
++    HRESULT Error = S_OK;
++    HSTRING Message = nullptr;
++    std::atomic_long ref{ 1 };
++};
++
++struct TokenAndSignatureResponse :
++    public ITokenAndSignatureResponse
++{
++public:
++    TokenAndSignatureResponse() = default;
++    virtual ~TokenAndSignatureResponse() = default;
++
++    TokenAndSignatureResponse(
++        HSTRING token,
++        HSTRING signature,
++        ABI::Windows::Foundation::DateTime expiry,
++        HRESULT error,
++        HSTRING message,
++        IUserInfoResponse *userInfo );
++
++    TokenAndSignatureResponse( const TokenAndSignatureResponse& ) = delete;
++    TokenAndSignatureResponse& operator=( const TokenAndSignatureResponse& ) = delete;
++
++    /* IUnknown Methods */
++    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override;
++    ULONG WINAPI AddRef() noexcept override;
++    ULONG WINAPI Release() noexcept override;
++
++    /* ITokenAndSignatureResponse Methods */
++    HRESULT WINAPI get_Token( HSTRING *out ) override;
++    HRESULT WINAPI get_Signature( HSTRING *out ) override;
++    HRESULT WINAPI get_Expiry( ABI::Windows::Foundation::DateTime *out ) override;
++    HRESULT WINAPI get_Error( HRESULT *out ) override;
++    HRESULT WINAPI get_Message( HSTRING *out ) override;
++    HRESULT WINAPI get_UserInfo( IUserInfoResponse **out ) override;
++
++private:
++    ABI::Windows::Foundation::DateTime Expiry{};
++    HSTRING Token = nullptr;
++    HSTRING Signature = nullptr;
++    HRESULT Error = S_OK;
++    HSTRING Message = nullptr;
++    IUserInfoResponse *UserInfo = nullptr;
++    std::atomic_long ref{ 1 };
++};
++
+ #endif
+\ No newline at end of file
+diff --git a/dlls/xgameruntime/GDKComponent/Xodus/Unix/socket.c b/dlls/xgameruntime/GDKComponent/Xodus/Unix/socket.c
+index e6fcf34..5c1882c 100644
+--- a/dlls/xgameruntime/GDKComponent/Xodus/Unix/socket.c
++++ b/dlls/xgameruntime/GDKComponent/Xodus/Unix/socket.c
+@@ -102,12 +102,15 @@
+ # define HAS_IRDA
+ #endif
+ 
+-#define POLL_BUFFER_SIZE 2048
++/* Largest frame: 8-byte header + u16 body. Keep in sync with dlls/xgameruntime/private.h. */
++#define POLL_BUFFER_SIZE (65536 + 8)
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xodus);
+ 
+ // Persist connection
+ static int sockfd = 0;
++// Set once the peer closed the connection; the fd is kept (never reused) so a racing send cannot hit a recycled descriptor.
++static int sock_dead = 0;
+ 
+ typedef struct _POLL_SOCKET_ARGS
+ {
+@@ -125,40 +128,39 @@ static NTSTATUS conn_sock( void *args )
+ {
+     struct sockaddr_un addr;
+     LPCSTR socket_suffix = (LPCSTR)args;
++    int fd;
+ 
+ #ifdef __linux__
+     const char *runtime = getenv( "XDG_RUNTIME_DIR" );
+     if ( !runtime )
+-        return E_NOT_VALID_STATE;
++        return STATUS_NOT_FOUND;
+ #elif defined(__APPLE__)
+     const char *runtime = "/tmp";
+ #endif
+ 
+-    size_t len = strlen( runtime ) + strlen( socket_suffix ) + 1;
+-    char *socket_path = malloc( len );
+-
+     TRACE( "args %p\n", args );
+ 
+-    if ( !socket_path )
+-        return STATUS_NO_MEMORY;
+-
+-    snprintf( socket_path, len + 1, "%s/%s", runtime, socket_suffix );
+-
+-    sockfd = socket( AF_UNIX, SOCK_STREAM, 0 );
+-    if ( sockfd < 0 ) 
+-        return STATUS_ABANDONED;
++    if ( sockfd > 0 )
++        return sock_dead ? STATUS_CONNECTION_DISCONNECTED : STATUS_SUCCESS; /* already connected */
+ 
+     memset( &addr, 0, sizeof(addr) );
+     addr.sun_family = AF_UNIX;
+-    lstrcpynA( addr.sun_path, socket_path, sizeof(addr.sun_path) - 1 );
++    if ( snprintf( addr.sun_path, sizeof(addr.sun_path), "%s/%s", runtime, socket_suffix ) >= (int)sizeof(addr.sun_path) )
++        return STATUS_NAME_TOO_LONG;
++
++    fd = socket( AF_UNIX, SOCK_STREAM, 0 );
++    if ( fd < 0 )
++        return STATUS_INSUFFICIENT_RESOURCES;
+ 
+-    if ( connect( sockfd, (struct sockaddr*)&addr, sizeof(addr) ) < 0 ) 
++    if ( connect( fd, (struct sockaddr*)&addr, sizeof(addr) ) < 0 ) 
+     {
+-        TRACE( "failed to load socket %s\n", socket_path );
+-        TRACE( "socket connection failed with %d\n", errno );
++        TRACE( "could not connect to %s: errno %d\n", addr.sun_path, errno );
++        close( fd );
+         return STATUS_CONNECTION_REFUSED;
+     }
+ 
++    sockfd = fd;
++    TRACE( "connected to %s\n", addr.sun_path );
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -172,9 +174,12 @@ static NTSTATUS poll_sock( void *args )
+ 
+     TRACE( "args %p\n", args );
+ 
+-    if ( !sockfd )
++    if ( !sockfd || sock_dead )
+         return STATUS_CONNECTION_INVALID;
+ 
++    if ( socket_args->curr_buffer_size >= POLL_BUFFER_SIZE )
++        return STATUS_BUFFER_OVERFLOW; /* cannot happen with well-formed frames: the reader resets on bad magic */
++
+     fds[0].fd = sockfd;
+     fds[0].events = POLLIN;
+ 
+@@ -183,16 +188,30 @@ static NTSTATUS poll_sock( void *args )
+     } while ( ret < 0 && errno == EINTR );
+ 
+     if ( ret < 0 )
++    {
++        sock_dead = 1;
+         return STATUS_CONNECTION_DISCONNECTED;
++    }
+ 
+     if ( fds[0].revents & POLLIN ) 
+     {
+         n = read( sockfd, socket_args->curr_buffer + socket_args->curr_buffer_size, POLL_BUFFER_SIZE - socket_args->curr_buffer_size );
+         if ( n <= 0 ) 
++        {
++            TRACE( "connection closed by the service\n" );
++            sock_dead = 1;
++            shutdown( sockfd, SHUT_RDWR );
+             return STATUS_CONNECTION_DISCONNECTED;
++        }
+ 
+         socket_args->curr_buffer_size += n;
+     }
++    else if ( fds[0].revents & (POLLHUP | POLLERR | POLLNVAL) )
++    {
++        TRACE( "connection lost (revents %#x)\n", fds[0].revents );
++        sock_dead = 1;
++        return STATUS_CONNECTION_DISCONNECTED;
++    }
+ 
+     return STATUS_SUCCESS;
+ }
+@@ -204,24 +223,25 @@ static NTSTATUS send_frm( void *args )
+ 
+     TRACE( "args %p\n", args );
+ 
+-    UINT32 magic = *(UINT32 *)frame->frame;
+-    UINT16 type  = *(UINT16 *)(frame->frame + sizeof(UINT32));
+-    UINT16 len   = *(UINT16 *)(frame->frame + sizeof(UINT32) + sizeof(UINT16));
+-    BYTE* body  = frame->frame + 8;
++    if ( !sockfd || sock_dead )
++        return STATUS_CONNECTION_INVALID;
++
++    if ( frame->frameSize < 8 )
++        return STATUS_INVALID_PARAMETER;
+ 
+-    TRACE("magic is %#x\n", magic);
+-    TRACE("type is %d\n", type);
+-    TRACE("len is %d\n", len);
+-    TRACE("body is %s\n", body);
++    /* header only: the body may carry tokens or the game's request data */
++    TRACE( "magic %#x, type %u, len %u\n", *(UINT32 *)frame->frame, *(UINT16 *)(frame->frame + sizeof(UINT32)),
++           *(UINT16 *)(frame->frame + sizeof(UINT32) + sizeof(UINT16)) );
+ 
+     while ( sent < frame->frameSize )
+     {
+-        ssize_t n = write( sockfd, (char *)frame->frame + sent, frame->frameSize - sent );
++        ssize_t n = send( sockfd, (char *)frame->frame + sent, frame->frameSize - sent, MSG_NOSIGNAL );
+ 
+         if ( n < 0 )
+         {
+             if ( errno == EINTR )
+                 continue;
++            TRACE( "send failed with errno %d\n", errno );
+             return STATUS_CONNECTION_RESET;
+         }
+ 
+diff --git a/dlls/xgameruntime/GDKComponent/Xodus/XodusService.cpp b/dlls/xgameruntime/GDKComponent/Xodus/XodusService.cpp
+index da8524f..5640572 100644
+--- a/dlls/xgameruntime/GDKComponent/Xodus/XodusService.cpp
++++ b/dlls/xgameruntime/GDKComponent/Xodus/XodusService.cpp
+@@ -26,6 +26,8 @@
+ 
+ #include "robuffer.h"
+ #include <atomic>
++#include <string>
++#include <vector>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xodus);
+ 
+@@ -133,6 +135,57 @@ public:
+                     static_cast<PVOID>(params), MsaTokenRequestAsync, operation );
+     }
+ 
++    HRESULT WINAPI
++    TokenAndSignatureRequest( LPCSTR clientId, UINT32 titleId, LPCSTR method, LPCSTR url, UINT32 headerCount, LPCSTR *headerNames, LPCSTR *headerValues,
++                              UINT32 bodySize, const BYTE *body, boolean forceRefresh, UINT32 timeoutMs, IAsyncOperation<ITokenAndSignatureResponse *> **operation ) override
++    {
++        TokenAndSignatureParams *params;
++
++        /* url/method are the game's request, never the token; body bytes are not traced */
++        TRACE( "clientId %s, titleId %u, method %s, url %s, headerCount %u, bodySize %u, forceRefresh %d, timeoutMs %u, operation %p.\n",
++               debugstr_a( clientId ), titleId, debugstr_a( method ), debugstr_a( url ), headerCount, bodySize, forceRefresh, timeoutMs, operation );
++
++        if ( !operation ) return E_POINTER;
++        if ( !url || ( headerCount && ( !headerNames || !headerValues ) ) || ( bodySize && !body ) ) return E_INVALIDARG;
++
++        /* the callback runs on a threadpool thread after we return: copy everything */
++        params = new TokenAndSignatureParams();
++        params->clientId = clientId ? clientId : "";
++        params->titleId = titleId;
++        params->method = method ? method : "";
++        params->url = url;
++        for ( UINT32 i = 0; i < headerCount; i++ )
++        {
++            params->headerNames.emplace_back( headerNames[i] ? headerNames[i] : "" );
++            params->headerValues.emplace_back( headerValues[i] ? headerValues[i] : "" );
++        }
++        if ( bodySize ) params->body.assign( body, body + bodySize );
++        params->forceRefresh = forceRefresh;
++        params->timeoutMs = timeoutMs;
++
++        return AsyncOperation<ITokenAndSignatureResponse *>::Create( static_cast<IUnknown *>(this),
++                    static_cast<PVOID>(params), TokenAndSignatureRequestAsync, operation );
++    }
++
++    HRESULT WINAPI
++    UserInfoRequest( LPCSTR clientId, UINT32 titleId, boolean forceRefresh, UINT32 timeoutMs, IAsyncOperation<IUserInfoResponse *> **operation ) override
++    {
++        UserInfoParams *params;
++
++        TRACE( "clientId %s, titleId %u, forceRefresh %d, timeoutMs %u, operation %p.\n", debugstr_a( clientId ), titleId, forceRefresh, timeoutMs, operation );
++
++        if ( !operation ) return E_POINTER;
++
++        params = new UserInfoParams();
++        params->clientId = clientId ? clientId : "";
++        params->titleId = titleId;
++        params->forceRefresh = forceRefresh;
++        params->timeoutMs = timeoutMs;
++
++        return AsyncOperation<IUserInfoResponse *>::Create( static_cast<IUnknown *>(this),
++                    static_cast<PVOID>(params), UserInfoRequestAsync, operation );
++    }
++
+ private:
+     struct MsaTokenRequestParams
+     {
+@@ -141,27 +194,248 @@ private:
+         boolean fullTrust;
+     };
+ 
++    struct TokenAndSignatureParams
++    {
++        std::string clientId;
++        UINT32 titleId = 0;
++        std::string method;
++        std::string url;
++        std::vector<std::string> headerNames;
++        std::vector<std::string> headerValues;
++        std::vector<BYTE> body;
++        boolean forceRefresh = false;
++        UINT32 timeoutMs = IPC_REQUEST_TIMEOUT_MS;
++    };
++
++    struct UserInfoParams
++    {
++        std::string clientId;
++        UINT32 titleId = 0;
++        boolean forceRefresh = false;
++        UINT32 timeoutMs = IPC_REQUEST_TIMEOUT_MS;
++    };
++
++    /*
++     * Sends one XML request (exactly lstrlenA(xml) bytes, no trailing NUL) and returns the body of
++     * the service's reply as a NUL-terminated CoTaskMemAlloc'ed string. Fails when the IPC layer
++     * fails (not connected, timeout, ...), when the reply type is not the expected one, or when the
++     * service answered with a PING (what it sends for a message type it does not know).
++     * Neither the request nor the response body is traced here: they may carry tokens.
++     */
++    static HRESULT
++    SendXmlRequest( XodusMessageType requestType, LPCSTR xml, UINT32 timeoutMs, XodusMessageType expectedType, LPSTR *responseXml )
++    {
++        BYTE *messageBuffer = nullptr;
++        DWORD ret;
++        UINT16 messageType = 0;
++        UINT32 messageLength = 0;
++        HRESULT status;
++        HSTRING bufferClass = nullptr;
++        size_t xmlLen = xml ? strlen( xml ) : 0;
++
++        IXodusIPCPacket *xodusPacket = nullptr;
++        IXodusIPCPacket *responsePacket = nullptr;
++        IBufferByteAccess *messageByteAccess = nullptr;
++        IBuffer *message = nullptr;
++        IBufferFactory *bufferFactory = nullptr;
++        IAsyncOperation<IXodusIPCPacket *> *response = nullptr;
++
++        TRACE( "requestType %u, %Iu bytes, timeoutMs %u, expectedType %u\n", (unsigned)requestType, xmlLen, timeoutMs, (unsigned)expectedType );
++
++        *responseXml = nullptr;
++        if ( !xmlLen || xmlLen > 0xFFFF ) return E_INVALIDARG; /* u16 length on the wire */
++
++        status = WindowsCreateString( RuntimeClass_Windows_Storage_Streams_Buffer, lstrlenW( RuntimeClass_Windows_Storage_Streams_Buffer ), &bufferClass );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        status = RoGetActivationFactory( bufferClass, __uuidof( IBufferFactory ), (void **)&bufferFactory );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        status = bufferFactory->Create( static_cast<UINT32>(xmlLen), &message );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        status = message->QueryInterface<IBufferByteAccess>( &messageByteAccess );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        status = messageByteAccess->Buffer( &messageBuffer );
++        messageByteAccess->Release();
++        messageByteAccess = nullptr;
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        RtlCopyMemory( messageBuffer, xml, xmlLen );
++        status = message->put_Length( static_cast<UINT32>(xmlLen) );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        xodusPacket = new XodusIPCPacket( MagicHeaderType::XML, static_cast<UINT16>(requestType), message );
++        message->Release(); /* the packet holds its own reference */
++        message = nullptr;
++
++        status = xodus_ipclayer->SendRequestAsync( xodusPacket, timeoutMs, &response );
++        xodusPacket->Release();
++        xodusPacket = nullptr;
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        ret = AsyncOperationCompletedHandler<IXodusIPCPacket *>::await_AsyncOperation( response, INFINITE ); /* bounded by timeoutMs inside the IPC layer */
++        if ( ret )
++        {
++            WARN( "await failed with %lu\n", ret );
++            status = E_FAIL;
++            goto _CLEANUP;
++        }
++
++        status = response->GetResults( &responsePacket );
++        if ( FAILED( status ) )
++        {
++            TRACE( "request failed with %#lx\n", status );
++            goto _CLEANUP;
++        }
++        if ( !responsePacket )
++        {
++            status = E_UNEXPECTED;
++            goto _CLEANUP;
++        }
++
++        responsePacket->get_MessageType( &messageType );
++        if ( messageType == static_cast<UINT16>(XodusMessageType::Ping) )
++        {
++            /* UNKNOWN + 1: the service does not implement this message type */
++            WARN( "the xodus service does not support message type %u\n", (unsigned)requestType );
++            status = HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED );
++            goto _CLEANUP;
++        }
++        if ( messageType != static_cast<UINT16>(expectedType) )
++        {
++            WARN( "unexpected reply type %u (wanted %u)\n", messageType, (unsigned)expectedType );
++            status = E_UNEXPECTED;
++            goto _CLEANUP;
++        }
++
++        status = responsePacket->get_Message( &message );
++        if ( FAILED( status ) ) goto _CLEANUP;
++        status = message->get_Length( &messageLength );
++        if ( FAILED( status ) ) goto _CLEANUP;
++        status = message->QueryInterface<IBufferByteAccess>( &messageByteAccess );
++        if ( FAILED( status ) ) goto _CLEANUP;
++        status = messageByteAccess->Buffer( &messageBuffer );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        *responseXml = (LPSTR)CoTaskMemAlloc( messageLength + 1 );
++        if ( !*responseXml )
++        {
++            status = E_OUTOFMEMORY;
++            goto _CLEANUP;
++        }
++        RtlCopyMemory( *responseXml, messageBuffer, messageLength );
++        (*responseXml)[messageLength] = 0;
++        TRACE( "got reply type %u, %u bytes\n", messageType, messageLength );
++
++_CLEANUP:
++        if ( bufferClass ) WindowsDeleteString( bufferClass );
++        if ( bufferFactory ) bufferFactory->Release();
++        if ( message ) message->Release();
++        if ( messageByteAccess ) messageByteAccess->Release();
++        if ( xodusPacket ) xodusPacket->Release();
++        if ( responsePacket ) responsePacket->Release();
++        if ( response ) response->Release();
++        return status;
++    }
++
++    static HRESULT WINAPI
++    TokenAndSignatureRequestAsync( IUnknown *invoker, PVOID param, PROPVARIANT *result )
++    {
++        auto params = static_cast<TokenAndSignatureParams *>(param);
++        std::vector<LPCSTR> names, values;
++        LPSTR xmlStr = nullptr, responseXml = nullptr;
++        HRESULT status;
++        ITokenAndSignatureResponse *tokenResponse = nullptr;
++
++        TRACE( "invoker %p, param %p, result %p\n", invoker, param, result );
++
++        PropVariantInit( result );
++
++        for ( auto &n : params->headerNames ) names.push_back( n.c_str() );
++        for ( auto &v : params->headerValues ) values.push_back( v.c_str() );
++
++        status = xodus_xml_builder->BuildTokenAndSignatureRequestXml( params->clientId.c_str(), params->titleId, params->method.c_str(), params->url.c_str(),
++                                                                      static_cast<UINT32>(names.size()), names.data(), values.data(),
++                                                                      static_cast<UINT32>(params->body.size()), params->body.data(), params->forceRefresh, &xmlStr );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        status = SendXmlRequest( XodusMessageType::TokenAndSignatureRequest, xmlStr, params->timeoutMs, XodusMessageType::TokenAndSignatureResponse, &responseXml );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        status = xodus_xml_builder->FromTokenAndSignatureResponseXml( responseXml, &tokenResponse );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        /* ownership of tokenResponse moves into the PROPVARIANT; a service-side <Error> is reported through get_Error */
++        result->vt = VT_UNKNOWN;
++        result->punkVal = tokenResponse;
++
++_CLEANUP:
++        if ( xmlStr ) CoTaskMemFree( xmlStr );
++        if ( responseXml )
++        {
++            SecureZeroMemory( responseXml, strlen( responseXml ) ); /* carried the token */
++            CoTaskMemFree( responseXml );
++        }
++        delete params;
++        return status;
++    }
++
++    static HRESULT WINAPI
++    UserInfoRequestAsync( IUnknown *invoker, PVOID param, PROPVARIANT *result )
++    {
++        auto params = static_cast<UserInfoParams *>(param);
++        LPSTR xmlStr = nullptr, responseXml = nullptr;
++        HRESULT status;
++        IUserInfoResponse *userInfo = nullptr;
++
++        TRACE( "invoker %p, param %p, result %p\n", invoker, param, result );
++
++        PropVariantInit( result );
++
++        status = xodus_xml_builder->BuildUserInfoRequestXml( params->clientId.c_str(), params->titleId, params->forceRefresh, &xmlStr );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        status = SendXmlRequest( XodusMessageType::UserInfoRequest, xmlStr, params->timeoutMs, XodusMessageType::UserInfoResponse, &responseXml );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        status = xodus_xml_builder->FromUserInfoResponseXml( responseXml, &userInfo );
++        if ( FAILED( status ) ) goto _CLEANUP;
++
++        result->vt = VT_UNKNOWN;
++        result->punkVal = userInfo;
++
++_CLEANUP:
++        if ( xmlStr ) CoTaskMemFree( xmlStr );
++        if ( responseXml ) CoTaskMemFree( responseXml );
++        delete params;
++        return status;
++    }
++
+     static HRESULT WINAPI
+     MsaTokenRequestAsync( IUnknown *invoker, PVOID param, PROPVARIANT *result )
+     {
+         auto params = static_cast<MsaTokenRequestParams *>(param);
+ 
+-        BYTE *messageBuffer;
++        BYTE *messageBuffer = nullptr;
+         DWORD ret;
+-        LPSTR xmlStr;
+-        UINT16 messageType;
++        LPSTR xmlStr = nullptr;
++        UINT16 messageType = 0;
+         HRESULT status = S_OK;
+-        HSTRING bufferClass;
++        HSTRING bufferClass = nullptr;
+ 
+         IMsaTokenResponse *tokenResponse = nullptr;
+         IXodusIPCPacket *xodusPacket = nullptr;
+         IBufferByteAccess *messageByteAccess = nullptr;
+         IBuffer *message = nullptr;
+         IBufferFactory *bufferFactory = nullptr;
+-        IAsyncOperation<IXodusIPCPacket *> *response;
++        IAsyncOperation<IXodusIPCPacket *> *response = nullptr;
+ 
+         TRACE("invoker %p, param %p, result %p\n", invoker, param, result);
+ 
++        PropVariantInit( result );
++
+         status = WindowsCreateString( RuntimeClass_Windows_Storage_Streams_Buffer, lstrlenW( RuntimeClass_Windows_Storage_Streams_Buffer ), &bufferClass );
+         if ( FAILED( status ) ) goto _CLEANUP;
+ 
+@@ -172,7 +446,8 @@ private:
+         status = xodus_xml_builder->BuildMsaTokenRequestXml( params->clientId, params->allowUI, params->fullTrust, &xmlStr );
+         if ( FAILED( status ) ) goto _CLEANUP;
+ 
+-        status = bufferFactory->Create( lstrlenA( xmlStr ) + 1, &message );
++        /* exactly the XML bytes: the service reads MessageLength bytes and parses them as a document */
++        status = bufferFactory->Create( lstrlenA( xmlStr ), &message );
+         if ( FAILED( status ) ) goto _CLEANUP;
+ 
+         status = message->QueryInterface<IBufferByteAccess>( &messageByteAccess );
+@@ -183,17 +458,19 @@ private:
+         messageByteAccess = nullptr;
+         if ( FAILED( status ) ) goto _CLEANUP;
+ 
+-        RtlCopyMemory( messageBuffer, xmlStr, lstrlenA( xmlStr ) + 1 );
+-        status = message->put_Length( lstrlenA( xmlStr ) + 1 );
++        RtlCopyMemory( messageBuffer, xmlStr, lstrlenA( xmlStr ) );
++        status = message->put_Length( lstrlenA( xmlStr ) );
++        if ( FAILED( status ) ) goto _CLEANUP;
+ 
+         // Construct a new IPC Packet
+         xodusPacket = new XodusIPCPacket(
+             MagicHeaderType::XML,
+-            3 /* MsaTokenRequest */,
++            static_cast<UINT16>(XodusMessageType::MsaTokenRequest),
+             message
+         );
+ 
+-        xodus_ipclayer->SendRequestAsync( xodusPacket, &response );
++        status = xodus_ipclayer->SendRequestAsync( xodusPacket, IPC_MSA_TOKEN_TIMEOUT_MS, &response );
++        if ( FAILED( status ) ) goto _CLEANUP;
+ 
+         ret = AsyncOperationCompletedHandler<IXodusIPCPacket *>::await_AsyncOperation( response, INFINITE );
+         if ( ret )
+@@ -210,8 +487,20 @@ private:
+ 
+         status = response->GetResults( &xodusPacket );
+         if ( FAILED( status ) ) goto _CLEANUP;
++        if ( !xodusPacket )
++        {
++            status = E_UNEXPECTED;
++            goto _CLEANUP;
++        }
+ 
+         xodusPacket->get_MessageType( &messageType );
++        if ( messageType != static_cast<UINT16>(XodusMessageType::MsaTokenResponse) )
++        {
++            WARN( "unexpected reply type %u\n", messageType );
++            status = E_UNEXPECTED;
++            goto _CLEANUP;
++        }
++
+         xodusPacket->get_Message( &message );
+         status = message->QueryInterface<IBufferByteAccess>( &messageByteAccess );
+         if ( FAILED( status ) ) goto _CLEANUP;
+@@ -219,16 +508,12 @@ private:
+         status = messageByteAccess->Buffer( &messageBuffer );
+         if ( FAILED( status ) ) goto _CLEANUP;
+ 
++        /* the reader NUL-terminates every received body */
+         status = xodus_xml_builder->FromMsaTokenResponseXml( reinterpret_cast<LPCSTR>(messageBuffer), &tokenResponse );
++        if ( FAILED( status ) ) goto _CLEANUP;
+ 
+-        if ( SUCCEEDED( status ) )
+-        {
+-            result->vt = VT_UNKNOWN;
+-            result->punkVal = tokenResponse;
+-
+-            if ( messageType != 4 /* MsaTokenResponse */ )
+-                status = E_INVALIDARG;
+-        }
++        result->vt = VT_UNKNOWN;
++        result->punkVal = tokenResponse;
+         
+ _CLEANUP:
+         if ( bufferClass ) WindowsDeleteString( bufferClass );
+@@ -240,24 +525,26 @@ _CLEANUP:
+         if ( response ) response->Release();
+         if ( params->clientId ) WindowsDeleteString( params->clientId );
+         if ( params ) delete params;
+-        return S_OK;
++        return status;
+     }
+ 
+     static HRESULT WINAPI
+     PingAsync( IUnknown *invoker, PVOID param, PROPVARIANT *result )
+     {
+         DWORD ret;
+-        UINT16 messageType;
++        UINT16 messageType = 0;
+         HRESULT status;
+-        HSTRING bufferClass;
++        HSTRING bufferClass = nullptr;
+ 
+         IXodusIPCPacket *xodusPacket = nullptr;
+         IBuffer *message = nullptr;
+         IBufferFactory *bufferFactory = nullptr;
+-        IAsyncOperation<IXodusIPCPacket *> *response;
++        IAsyncOperation<IXodusIPCPacket *> *response = nullptr;
+ 
+         TRACE("invoker %p, param %p, result %p\n", invoker, param, result);
+ 
++        PropVariantInit( result );
++
+         status = WindowsCreateString( RuntimeClass_Windows_Storage_Streams_Buffer, lstrlenW( RuntimeClass_Windows_Storage_Streams_Buffer ), &bufferClass );
+         if ( FAILED( status ) ) goto _CLEANUP;
+ 
+@@ -270,11 +557,12 @@ _CLEANUP:
+         // Construct a new IPC Packet
+         xodusPacket = new XodusIPCPacket(
+             MagicHeaderType::XML,
+-            1 /* PING */,
++            static_cast<UINT16>(XodusMessageType::Ping),
+             message
+         );
+ 
+-        xodus_ipclayer->SendRequestAsync( xodusPacket, &response );
++        status = xodus_ipclayer->SendRequestAsync( xodusPacket, IPC_PING_TIMEOUT_MS, &response );
++        if ( FAILED( status ) ) goto _CLEANUP;
+ 
+         ret = AsyncOperationCompletedHandler<IXodusIPCPacket *>::await_AsyncOperation( response, INFINITE );
+         if ( ret )
+@@ -291,10 +579,18 @@ _CLEANUP:
+ 
+         // confirm that we actually PONGed
+         status = response->GetResults( &xodusPacket );
+-        if ( FAILED( status ) ) return status;
++        if ( FAILED( status ) ) goto _CLEANUP;
++        if ( !xodusPacket )
++        {
++            status = E_UNEXPECTED;
++            goto _CLEANUP;
++        }
+         xodusPacket->get_MessageType( &messageType );
+-        if ( messageType != 2 /* PONG */)
+-            return E_INVALIDARG;
++        if ( messageType != static_cast<UINT16>(XodusMessageType::Pong) )
++        {
++            WARN( "unexpected reply type %u to PING\n", messageType );
++            status = E_UNEXPECTED;
++        }
+         
+ _CLEANUP:
+         if ( bufferClass ) WindowsDeleteString( bufferClass );
+diff --git a/dlls/xgameruntime/GDKComponent/Xodus/XodusXMLBuilder.cpp b/dlls/xgameruntime/GDKComponent/Xodus/XodusXMLBuilder.cpp
+index 4342a74..2c41892 100644
+--- a/dlls/xgameruntime/GDKComponent/Xodus/XodusXMLBuilder.cpp
++++ b/dlls/xgameruntime/GDKComponent/Xodus/XodusXMLBuilder.cpp
+@@ -27,7 +27,9 @@
+ #include <libxml/parser.h>
+ #include <libxml/tree.h>
+ #include <atomic>
++#include <cstring>
+ #include <windows.h>
++#include <wincrypt.h>
+ #include <winstring.h>
+ 
+ #define WINDOWS_TICK 10000000
+@@ -40,6 +42,197 @@ using namespace ABI::Xodus;
+ using namespace ABI::Windows::Foundation;
+ using namespace ABI::Windows::Foundation::Collections;
+ 
++/* Parse flags for service responses: never touch the network, keep libxml quiet on malformed input. */
++#define RESPONSE_PARSE_OPTIONS (XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING)
++
++static inline LPCSTR XmlStr( const xmlChar *str )
++{
++    return reinterpret_cast<LPCSTR>(str);
++}
++
++static inline bool IsElement( xmlNodePtr node, LPCSTR name )
++{
++    return node->type == XML_ELEMENT_NODE && !strcmp( XmlStr( node->name ), name );
++}
++
++/* UTF-8 (NUL terminated, may be NULL) -> HSTRING. */
++static HRESULT HStringFromUtf8( LPCSTR str, HSTRING *out )
++{
++    INT strLen;
++    LPWSTR strW;
++    HRESULT hr;
++
++    *out = nullptr;
++    if ( !str || !*str ) return S_OK; /* NULL HSTRING is the empty string */
++
++    strLen = MultiByteToWideChar( CP_UTF8, 0, str, -1, nullptr, 0 );
++    if ( !strLen ) return HRESULT_FROM_WIN32( GetLastError() );
++    strW = (LPWSTR)CoTaskMemAlloc( strLen * sizeof(WCHAR) );
++    if ( !strW ) return E_OUTOFMEMORY;
++    MultiByteToWideChar( CP_UTF8, 0, str, -1, strW, strLen );
++    hr = WindowsCreateString( strW, strLen - 1, out );
++    CoTaskMemFree( strW );
++    return hr;
++}
++
++/* Content of an element -> HSTRING (replacing any previous value). */
++static HRESULT HStringFromNode( xmlNodePtr node, HSTRING *out )
++{
++    xmlChar *content = xmlNodeGetContent( node );
++    HRESULT hr;
++
++    WindowsDeleteString( *out );
++    hr = HStringFromUtf8( XmlStr( content ), out );
++    xmlFree( content );
++    return hr;
++}
++
++static void FreeIdentityStrings( XodusUserIdentityData &identity )
++{
++    WindowsDeleteString( identity.gamertag );
++    WindowsDeleteString( identity.modernGamertag );
++    WindowsDeleteString( identity.modernGamertagSuffix );
++    WindowsDeleteString( identity.uniqueModernGamertag );
++    WindowsDeleteString( identity.uhs );
++    identity.gamertag = identity.modernGamertag = identity.modernGamertagSuffix = identity.uniqueModernGamertag = identity.uhs = nullptr;
++}
++
++static UINT32 ParseAgeGroup( LPCSTR value )
++{
++    if ( !value ) return static_cast<UINT32>(XodusAgeGroup::Unknown);
++    if ( !strcmp( value, "Child" ) ) return static_cast<UINT32>(XodusAgeGroup::Child);
++    if ( !strcmp( value, "Teen" ) ) return static_cast<UINT32>(XodusAgeGroup::Teen);
++    if ( !strcmp( value, "Adult" ) ) return static_cast<UINT32>(XodusAgeGroup::Adult);
++    return static_cast<UINT32>(XodusAgeGroup::Unknown);
++}
++
++/*
++ * Reads one of the identity elements shared by UserInfoResponse and TokenAndSignatureResponse.
++ * Returns true when the node was one of them (consumed), false otherwise. *present is set when an
++ * identity element was seen at all.
++ */
++static bool ReadIdentityElement( xmlNodePtr node, XodusUserIdentityData &identity, bool *present, HRESULT *hr )
++{
++    xmlChar *content;
++
++    if ( node->type != XML_ELEMENT_NODE ) return false;
++
++    if ( IsElement( node, "Xuid" ) )
++    {
++        content = xmlNodeGetContent( node );
++        identity.xuid = content ? strtoull( XmlStr( content ), nullptr, 10 ) : 0;
++        xmlFree( content );
++    }
++    else if ( IsElement( node, "Gamertag" ) ) *hr = HStringFromNode( node, &identity.gamertag );
++    else if ( IsElement( node, "ModernGamertag" ) ) *hr = HStringFromNode( node, &identity.modernGamertag );
++    else if ( IsElement( node, "ModernGamertagSuffix" ) ) *hr = HStringFromNode( node, &identity.modernGamertagSuffix );
++    else if ( IsElement( node, "UniqueModernGamertag" ) ) *hr = HStringFromNode( node, &identity.uniqueModernGamertag );
++    else if ( IsElement( node, "Uhs" ) ) *hr = HStringFromNode( node, &identity.uhs );
++    else if ( IsElement( node, "AgeGroup" ) )
++    {
++        content = xmlNodeGetContent( node );
++        identity.ageGroup = ParseAgeGroup( XmlStr( content ) );
++        xmlFree( content );
++    }
++    else return false;
++
++    *present = true;
++    return true;
++}
++
++/* <Error>0x89245101</Error> -> HRESULT */
++static HRESULT ParseErrorElement( xmlNodePtr node )
++{
++    xmlChar *content = xmlNodeGetContent( node );
++    HRESULT hr = content ? static_cast<HRESULT>(strtoul( XmlStr( content ), nullptr, 16 )) : E_FAIL;
++    xmlFree( content );
++    return hr;
++}
++
++/* <Expiry>unix seconds</Expiry> -> DateTime (FILETIME ticks) */
++static DateTime ParseExpiryElement( xmlNodePtr node )
++{
++    xmlChar *content = xmlNodeGetContent( node );
++    LONGLONG expiryUnix = content ? strtoll( XmlStr( content ), nullptr, 10 ) : 0;
++    DateTime expiry{};
++
++    expiry.UniversalTime = ((INT64)expiryUnix + SEC_TO_UNIX_EPOCH) * WINDOWS_TICK;
++    xmlFree( content );
++    return expiry;
++}
++
++/* Pretty-printed document -> CoTaskMemAlloc'ed NUL-terminated string. */
++static HRESULT DumpDocument( xmlDocPtr doc, LPSTR *xml_string )
++{
++    xmlChar *xmlBuff = nullptr;
++    INT bufSize = 0;
++
++    *xml_string = nullptr;
++    xmlDocDumpFormatMemory( doc, &xmlBuff, &bufSize, 1 );
++    if ( !xmlBuff || bufSize <= 0 )
++    {
++        if ( xmlBuff ) xmlFree( xmlBuff );
++        return E_FAIL;
++    }
++
++    *xml_string = (LPSTR)CoTaskMemAlloc( bufSize + 1 );
++    if ( !*xml_string )
++    {
++        xmlFree( xmlBuff );
++        return E_OUTOFMEMORY;
++    }
++    memcpy( *xml_string, xmlBuff, bufSize );
++    (*xml_string)[bufSize] = 0;
++    xmlFree( xmlBuff );
++    return S_OK;
++}
++
++/* Base64 (no line breaks) of a byte range, CoTaskMemAlloc'ed. */
++static HRESULT Base64Encode( const BYTE *data, UINT32 size, LPSTR *out )
++{
++    DWORD len = 0;
++
++    *out = nullptr;
++    if ( !CryptBinaryToStringA( data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &len ) )
++        return HRESULT_FROM_WIN32( GetLastError() );
++    *out = (LPSTR)CoTaskMemAlloc( len + 1 );
++    if ( !*out ) return E_OUTOFMEMORY;
++    if ( !CryptBinaryToStringA( data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, *out, &len ) )
++    {
++        CoTaskMemFree( *out );
++        *out = nullptr;
++        return HRESULT_FROM_WIN32( GetLastError() );
++    }
++    (*out)[len] = 0;
++    return S_OK;
++}
++
++/* Text element with proper escaping of '&', '<' and '>' (xmlNewChild would not escape them). */
++static inline xmlNodePtr AddTextChild( xmlNodePtr parent, LPCSTR name, LPCSTR value )
++{
++    return xmlNewTextChild( parent, nullptr, BAD_CAST name, BAD_CAST (value ? value : "") );
++}
++
++static HRESULT ParseResponseDocument( LPCSTR xml_string, LPCSTR rootName, xmlDocPtr *doc, xmlNodePtr *root )
++{
++    *doc = nullptr;
++    *root = nullptr;
++
++    /* An empty body is what the service sends when it could not parse the request. */
++    if ( !xml_string || !*xml_string ) return E_FAIL;
++
++    if ( !( *doc = xmlReadMemory( xml_string, strlen( xml_string ), nullptr, nullptr, RESPONSE_PARSE_OPTIONS ) ) ) return E_FAIL;
++    if ( !( *root = xmlDocGetRootElement( *doc ) ) || strcmp( XmlStr( (*root)->name ), rootName ) )
++    {
++        WARN( "unexpected response root element (wanted %s)\n", rootName );
++        xmlFreeDoc( *doc );
++        *doc = nullptr;
++        *root = nullptr;
++        return E_FAIL;
++    }
++    return S_OK;
++}
++
+ class ABI::Xodus::XodusXMLBuilder :
+     public IXodusXMLBuilder
+ {
+@@ -144,7 +337,7 @@ public:
+ 
+         root = xmlNewNode( nullptr, BAD_CAST "MsaTokenRequest" );
+         xmlDocSetRootElement(doc, root);
+-        xmlNewChild( root, nullptr, BAD_CAST "clientId", BAD_CAST clientIdStr );
++        AddTextChild( root, "ClientId", clientIdStr ); /* PascalCase: the service's MSATokenRequest model has no lowercase alias */
+         CoTaskMemFree( clientIdStr );
+         xmlNewChild( root, nullptr, BAD_CAST "AllowUi", BAD_CAST (allowUI ? "true" : "false") );
+         xmlNewChild( root, nullptr, BAD_CAST "MsaFullTrust", BAD_CAST (fullTrust ? "true" : "false") );
+@@ -172,9 +365,11 @@ public:
+         xmlDocPtr doc;
+         xmlNodePtr curr_child, root;
+ 
+-        TRACE( "xml_string %s, response %p.\n", debugstr_a( xml_string ), response );
++        /* the response carries the token: trace only its length */
++        TRACE( "xml_string %p (%Iu bytes), response %p.\n", xml_string, xml_string ? strlen( xml_string ) : 0, response );
+ 
+-        if ( !( doc = xmlReadMemory( xml_string, strlen( xml_string ), nullptr, nullptr, 0 ) ) ) return E_FAIL;
++        if ( !xml_string || !*xml_string ) return E_FAIL;
++        if ( !( doc = xmlReadMemory( xml_string, strlen( xml_string ), nullptr, nullptr, RESPONSE_PARSE_OPTIONS ) ) ) return E_FAIL;
+         if ( !( root = xmlDocGetRootElement( doc ) ) )
+         {
+             xmlFreeDoc( doc );
+@@ -215,10 +410,197 @@ public:
+             }
+ 
+         *response = new MsaTokenResponse( token, expiry );
++        WindowsDeleteString( token );
+         xmlFreeDoc( doc );
+         return S_OK;
+     }
+ 
++    /*
++     * <TokenAndSignatureRequest> as crates/xodus/src/models/xgameruntime/xuser.rs deserialises it:
++     * ClientId and TitleId (decimal) are omitted when unknown, Body is base64 of the raw bytes.
++     */
++    HRESULT WINAPI
++    BuildTokenAndSignatureRequestXml( LPCSTR clientId, UINT32 titleId, LPCSTR method, LPCSTR url, UINT32 headerCount, LPCSTR *headerNames, LPCSTR *headerValues, UINT32 bodySize, const BYTE *body, boolean forceRefresh, LPSTR *xml_string ) override
++    {
++        HRESULT hr;
++        CHAR titleIdStr[16];
++        LPSTR bodyBase64 = nullptr;
++        xmlDocPtr doc;
++        xmlNodePtr root, headers, header;
++
++        TRACE( "clientId %s, titleId %u, method %s, url %s, headerCount %u, bodySize %u, forceRefresh %d, xml_string %p.\n",
++               debugstr_a( clientId ), titleId, debugstr_a( method ), debugstr_a( url ), headerCount, bodySize, forceRefresh, xml_string );
++
++        if ( !xml_string ) return E_POINTER;
++        if ( !url || ( headerCount && ( !headerNames || !headerValues ) ) || ( bodySize && !body ) ) return E_INVALIDARG;
++        *xml_string = nullptr;
++
++        if ( bodySize && FAILED( hr = Base64Encode( body, bodySize, &bodyBase64 ) ) ) return hr;
++
++        doc = xmlNewDoc( BAD_CAST "1.0" );
++        root = xmlNewNode( nullptr, BAD_CAST "TokenAndSignatureRequest" );
++        xmlDocSetRootElement( doc, root );
++
++        if ( clientId && *clientId ) AddTextChild( root, "ClientId", clientId );
++        if ( titleId )
++        {
++            snprintf( titleIdStr, sizeof(titleIdStr), "%u", titleId );
++            AddTextChild( root, "TitleId", titleIdStr );
++        }
++        AddTextChild( root, "Url", url );
++        AddTextChild( root, "Method", method && *method ? method : "GET" );
++        if ( headerCount )
++        {
++            headers = xmlNewChild( root, nullptr, BAD_CAST "Headers", nullptr );
++            for ( UINT32 i = 0; i < headerCount; i++ )
++            {
++                header = xmlNewChild( headers, nullptr, BAD_CAST "Header", nullptr );
++                AddTextChild( header, "Name", headerNames[i] );
++                AddTextChild( header, "Value", headerValues[i] );
++            }
++        }
++        if ( bodyBase64 ) AddTextChild( root, "Body", bodyBase64 );
++        AddTextChild( root, "ForceRefresh", forceRefresh ? "true" : "false" );
++
++        hr = DumpDocument( doc, xml_string );
++        xmlFreeDoc( doc );
++        CoTaskMemFree( bodyBase64 );
++        return hr;
++    }
++
++    /*
++     * <TokenAndSignatureResponse>: Token/Signature/Expiry (+ optional identity elements) or
++     * Error/Message. Neither the XML nor the token/signature values are traced.
++     */
++    HRESULT WINAPI
++    FromTokenAndSignatureResponseXml( LPCSTR xml_string, ITokenAndSignatureResponse **response ) override
++    {
++        HRESULT hr = S_OK, error = S_OK;
++        HSTRING token = nullptr, signature = nullptr, message = nullptr;
++        DateTime expiry{};
++        XodusUserIdentityData identity{};
++        bool identityPresent = false;
++        IUserInfoResponse *userInfo = nullptr;
++        xmlDocPtr doc;
++        xmlNodePtr root, child;
++
++        TRACE( "xml_string %p (%Iu bytes), response %p.\n", xml_string, xml_string ? strlen( xml_string ) : 0, response );
++
++        if ( !response ) return E_POINTER;
++        *response = nullptr;
++
++        if ( FAILED( hr = ParseResponseDocument( xml_string, "TokenAndSignatureResponse", &doc, &root ) ) ) return hr;
++
++        for ( child = root->children; child && SUCCEEDED( hr ); child = child->next )
++        {
++            if ( child->type != XML_ELEMENT_NODE ) continue;
++            if ( IsElement( child, "Token" ) ) hr = HStringFromNode( child, &token );
++            else if ( IsElement( child, "Signature" ) ) hr = HStringFromNode( child, &signature );
++            else if ( IsElement( child, "Expiry" ) ) expiry = ParseExpiryElement( child );
++            else if ( IsElement( child, "Error" ) ) error = ParseErrorElement( child );
++            else if ( IsElement( child, "Message" ) ) hr = HStringFromNode( child, &message );
++            else if ( ReadIdentityElement( child, identity, &identityPresent, &hr ) ) continue;
++            else TRACE( "ignoring element %s\n", debugstr_a( XmlStr( child->name ) ) );
++        }
++
++        if ( SUCCEEDED( hr ) )
++        {
++            if ( identityPresent )
++            {
++                identity.signedIn = true;
++                userInfo = new UserInfoResponse( identity, S_OK, nullptr );
++            }
++            *response = new TokenAndSignatureResponse( token, signature, expiry, error, message, userInfo );
++            if ( userInfo ) userInfo->Release();
++            TRACE( "parsed response: error %#lx, token %s, signature %s, identity %d\n", error,
++                   token ? "present" : "absent", signature ? "present" : "empty", identityPresent );
++        }
++
++        WindowsDeleteString( token );
++        WindowsDeleteString( signature );
++        WindowsDeleteString( message );
++        FreeIdentityStrings( identity );
++        xmlFreeDoc( doc );
++        return hr;
++    }
++
++    /* <UserInfoRequest>: ClientId/TitleId optional (then the stored user token is used), ForceRefresh. */
++    HRESULT WINAPI
++    BuildUserInfoRequestXml( LPCSTR clientId, UINT32 titleId, boolean forceRefresh, LPSTR *xml_string ) override
++    {
++        HRESULT hr;
++        CHAR titleIdStr[16];
++        xmlDocPtr doc;
++        xmlNodePtr root;
++
++        TRACE( "clientId %s, titleId %u, forceRefresh %d, xml_string %p.\n", debugstr_a( clientId ), titleId, forceRefresh, xml_string );
++
++        if ( !xml_string ) return E_POINTER;
++        *xml_string = nullptr;
++
++        doc = xmlNewDoc( BAD_CAST "1.0" );
++        root = xmlNewNode( nullptr, BAD_CAST "UserInfoRequest" );
++        xmlDocSetRootElement( doc, root );
++
++        if ( clientId && *clientId ) AddTextChild( root, "ClientId", clientId );
++        if ( titleId )
++        {
++            snprintf( titleIdStr, sizeof(titleIdStr), "%u", titleId );
++            AddTextChild( root, "TitleId", titleIdStr );
++        }
++        AddTextChild( root, "ForceRefresh", forceRefresh ? "true" : "false" );
++
++        hr = DumpDocument( doc, xml_string );
++        xmlFreeDoc( doc );
++        return hr;
++    }
++
++    /* <UserInfoResponse>: SignedIn + identity elements, or SignedIn=false, or Error/Message. */
++    HRESULT WINAPI
++    FromUserInfoResponseXml( LPCSTR xml_string, IUserInfoResponse **response ) override
++    {
++        HRESULT hr = S_OK, error = S_OK;
++        HSTRING message = nullptr;
++        XodusUserIdentityData identity{};
++        bool identityPresent = false;
++        xmlChar *content;
++        xmlDocPtr doc;
++        xmlNodePtr root, child;
++
++        TRACE( "xml_string %p (%Iu bytes), response %p.\n", xml_string, xml_string ? strlen( xml_string ) : 0, response );
++
++        if ( !response ) return E_POINTER;
++        *response = nullptr;
++
++        if ( FAILED( hr = ParseResponseDocument( xml_string, "UserInfoResponse", &doc, &root ) ) ) return hr;
++
++        for ( child = root->children; child && SUCCEEDED( hr ); child = child->next )
++        {
++            if ( child->type != XML_ELEMENT_NODE ) continue;
++            if ( IsElement( child, "SignedIn" ) )
++            {
++                content = xmlNodeGetContent( child );
++                identity.signedIn = content && !strcmp( XmlStr( content ), "true" );
++                xmlFree( content );
++            }
++            else if ( IsElement( child, "Error" ) ) error = ParseErrorElement( child );
++            else if ( IsElement( child, "Message" ) ) hr = HStringFromNode( child, &message );
++            else if ( ReadIdentityElement( child, identity, &identityPresent, &hr ) ) continue;
++            else TRACE( "ignoring element %s\n", debugstr_a( XmlStr( child->name ) ) );
++        }
++
++        if ( SUCCEEDED( hr ) )
++        {
++            *response = new UserInfoResponse( identity, error, message );
++            TRACE( "parsed response: error %#lx, signedIn %d, xuid %I64u, ageGroup %u\n", error, identity.signedIn, identity.xuid, identity.ageGroup );
++        }
++
++        WindowsDeleteString( message );
++        FreeIdentityStrings( identity );
++        xmlFreeDoc( doc );
++        return hr;
++    }
++
+ private:
+     std::atomic_long ref{ 1 };
+ };
+diff --git a/dlls/xgameruntime/WineCoreUAP/Foundation/IWineAsync.cpp b/dlls/xgameruntime/WineCoreUAP/Foundation/IWineAsync.cpp
+index 2deb963..cebc64f 100755
+--- a/dlls/xgameruntime/WineCoreUAP/Foundation/IWineAsync.cpp
++++ b/dlls/xgameruntime/WineCoreUAP/Foundation/IWineAsync.cpp
+@@ -80,6 +80,7 @@ AsyncInfo::Release() noexcept
+         Close();
+ 
+         if ( invoker ) invoker->Release();
++        PropVariantClear( &result );
+ 
+         delete this;
+     }
+@@ -338,6 +339,8 @@ AsyncInfo::async_info_callback( TP_CALLBACK_INSTANCE *instance, void *iface, TP_
+ 
+     TRACE( "instace %p, iface %p, work %p\n", instance, iface, work );
+ 
++    /* callbacks that fail early may leave the result untouched: never copy garbage */
++    PropVariantInit( &result );
+     hr = impl->callback( impl->invoker, impl->param, &result );
+ 
+     {
+@@ -354,18 +357,22 @@ AsyncInfo::async_info_callback( TP_CALLBACK_INSTANCE *instance, void *iface, TP_
+ 
+         if ( impl->handler != nullptr && impl->handler != HANDLER_NOT_SET )
+         {
++            /* take over the reference put_Completed added */
+             handler = impl->handler;
+-            handler->AddRef();
+             status = impl->status;
+             impl->handler = nullptr;
+         }
+     }
++    PropVariantClear( &result );
+ 
+     if ( handler )
+     {
+         handler->Invoke( operation, status );
+         handler->Release();
+     }
++
++    /* Start() added a reference to the operation for the duration of the callback; this may free impl. */
++    operation->Release();
+ }
+ 
+ template<typename T>
+@@ -407,7 +414,10 @@ AsyncOperation<T>::Release() noexcept
+     TRACE( "iface %p decreasing refcount to %lu.\n", this, curr );
+ 
+     if ( !curr )
++    {
++        if ( info ) info->Release();
+         delete this;
++    }
+ 
+     return curr;
+ }
+@@ -479,10 +489,18 @@ AsyncOperation<T>::GetResults( T *results ) noexcept
+     PROPVARIANT result = {.vt = VT_NULL};
+     HRESULT hr;
+ 
++    if ( !results ) return E_POINTER;
++
+     hr = info->get_Result( &result );
+ 
+     if ( result.vt == VT_UNKNOWN )
++    {
++        /* the reference taken by the copy is handed to the caller, who must Release() it */
+         *results = static_cast<T>(result.punkVal);
++        result.vt = VT_EMPTY;
++    }
++    else
++        *results = T();
+ 
+     PropVariantClear( &result );
+ 
+@@ -497,8 +515,12 @@ AsyncOperation<T>::Create( IUnknown *invoker, PVOID param, async_operation_callb
+     AsyncOperation<T> *impl = new AsyncOperation<T>();
+     HRESULT hr;
+ 
+-    if ( FAILED( hr = AsyncInfo::Create( invoker, param, callback, static_cast<IInspectable *>(impl), &impl->info ) ) ||
+-         FAILED( hr = impl->info->Start() ) )
++    if ( FAILED( hr = AsyncInfo::Create( invoker, param, callback, static_cast<IInspectable *>(impl), &impl->info ) ) )
++    {
++        delete impl;
++        return hr;
++    }
++    if ( FAILED( hr = impl->info->Start() ) )
+     {
+         impl->info->Release();
+         delete impl;
+@@ -513,6 +535,8 @@ AsyncOperation<T>::Create( IUnknown *invoker, PVOID param, async_operation_callb
+ template class AsyncOperation<IInspectable*>;
+ template class AsyncOperation<ABI::Xodus::IXodusIPCPacket*>;
+ template class AsyncOperation<ABI::Xodus::IMsaTokenResponse*>;
++template class AsyncOperation<ABI::Xodus::ITokenAndSignatureResponse*>;
++template class AsyncOperation<ABI::Xodus::IUserInfoResponse*>;
+ 
+ HRESULT WINAPI
+ AsyncAction::QueryInterface( REFIID iid, void** out ) noexcept
+@@ -550,7 +574,10 @@ AsyncAction::Release() noexcept
+     TRACE( "iface %p decreasing refcount to %lu.\n", this, curr );
+ 
+     if ( !curr )
++    {
++        if ( info ) info->Release();
+         delete this;
++    }
+ 
+     return curr;
+ }
+@@ -629,8 +656,12 @@ AsyncAction::Create( IUnknown *invoker, PVOID param, async_operation_callback ca
+     AsyncAction *impl = new AsyncAction();
+     HRESULT hr;
+ 
+-    if ( FAILED( hr = AsyncInfo::Create( invoker, param, callback, static_cast<IInspectable *>(impl), &impl->info ) ) ||
+-         FAILED( hr = impl->info->Start() ) )
++    if ( FAILED( hr = AsyncInfo::Create( invoker, param, callback, static_cast<IInspectable *>(impl), &impl->info ) ) )
++    {
++        delete impl;
++        return hr;
++    }
++    if ( FAILED( hr = impl->info->Start() ) )
+     {
+         impl->info->Release();
+         delete impl;
+diff --git a/dlls/xgameruntime/main.c b/dlls/xgameruntime/main.c
+index 70e32dd..10e9967 100644
+--- a/dlls/xgameruntime/main.c
++++ b/dlls/xgameruntime/main.c
+@@ -34,12 +34,13 @@ unixlib_handle_t unixhandle;
+ 
+ static HRESULT LoadUnixLib()
+ {
+-    LPCSTR xodus_prefix = XODUS_SOCKET_SUFFIX;
+     NTSTATUS nts;
+     UNICODE_STRING modname;
+ 
+     // load the unix lib as well.
+     // The library is called xgameruntime.so on both macOS and Linux
++    // The service socket itself is connected lazily by XodusEnsureService() so that a missing
++    // xodus-service never breaks runtime initialisation: games keep working with the offline user.
+     RtlInitUnicodeString( &modname, (PCWSTR)L"xgameruntime.so" );
+     nts = __wine_load_unix_lib( &modname, &unixlib, &unixhandle );
+     if ( FAILED( nts ) )
+@@ -47,18 +48,6 @@ static HRESULT LoadUnixLib()
+         WARN("Failed to load unix lib %s\n", "xgameruntime.so");
+         return HRESULT_FROM_WIN32( ERROR_MOD_NOT_FOUND );
+     }
+-    nts = __wine_unix_call( unixhandle, conn_socket, (void *)xodus_prefix );
+-    if ( nts == STATUS_CONNECTION_REFUSED )
+-    {
+-        WARN("Failed to do unix call %s\n", "conn_socket");
+-        MessageBoxA( NULL, "Could not load Xodus's service socket.\nXbox account functionality will be missing.\n", "Attention Required!", MB_ICONEXCLAMATION );
+-        return HRESULT_FROM_NT( nts );
+-    }
+-    else if ( FAILED( nts ) )
+-    {
+-        WARN("Failed to do unix call %s\n", "conn_socket");
+-        return HRESULT_FROM_NT( nts );
+-    }
+ 
+     return S_OK;
+ }
+@@ -178,7 +167,9 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
+ #ifdef XODUS_INTEROP
+     if ( !unixlib )
+     {
+-        if ( FAILED( hr = LoadUnixLib() ) ) return hr;
++        /* non-fatal: without the unix lib the Xbox Live features simply stay offline */
++        if ( FAILED( hr = LoadUnixLib() ) )
++            TRACE("unix lib unavailable (%#lx), Xbox Live features will be offline.\n", hr);
+     }
+ #endif
+ 
+diff --git a/dlls/xgameruntime/private.h b/dlls/xgameruntime/private.h
+index 4081dec..1254cbb 100644
+--- a/dlls/xgameruntime/private.h
++++ b/dlls/xgameruntime/private.h
+@@ -103,9 +103,17 @@
+ 
+ #define FAIL_FAST_IF_FAILED(hr)                                 do { HRESULT __hrRet = hr; if (FAILED(__hrRet)) { FAIL_FAST_MSG("%s 0x%#lx", #hr, __hrRet); }} while (0)
+ 
+-#define POLL_BUFFER_SIZE 2048
++/* Receive buffer of the socket reader: the largest frame is an 8-byte header plus a u16-sized body.
++ * Keep in sync with GDKComponent/Xodus/Unix/socket.c (POLL_SOCKET_ARGS crosses the PE/unix boundary). */
++#define POLL_BUFFER_SIZE (65536 + 8)
+ #define XODUS_SOCKET_SUFFIX "xodus.sock"
++/* Per-request reply timeouts (ms). Token requests may trigger a sisu sign-in and XSTS exchange on the service side. */
+ #define IPC_REQUEST_TIMEOUT_MS 5000
++#define IPC_PING_TIMEOUT_MS 3000
++#define IPC_MSA_TOKEN_TIMEOUT_MS 30000
++#define IPC_USER_INFO_TIMEOUT_MS 15000
++#define IPC_TOKEN_TIMEOUT_MS 60000
++/* 1 restores the old eager service handshake during XGameRuntimeInitialize (fatal when the service is down). */
+ #define XODUS_INTEROP 0
+ 
+ extern IXThreadingImpl *x_threading_impl;
+diff --git a/dlls/xgameruntime/xodusprovider.idl b/dlls/xgameruntime/xodusprovider.idl
+index 5b34183..2291abd 100644
+--- a/dlls/xgameruntime/xodusprovider.idl
++++ b/dlls/xgameruntime/xodusprovider.idl
+@@ -48,6 +48,8 @@ namespace Xodus
+     interface IXodusIPCPacket;
+     interface IXodusXMLBuilder;
+     interface IMsaTokenResponse;
++    interface ITokenAndSignatureResponse;
++    interface IUserInfoResponse;
+ 
+     runtimeclass IPCLayer;
+     runtimeclass XodusXMLBuilder;
+@@ -66,6 +68,10 @@ namespace Xodus
+         interface Windows.Foundation.IAsyncOperation<Xodus.IXodusIPCPacket *>;
+         interface Windows.Foundation.AsyncOperationCompletedHandler<Xodus.IMsaTokenResponse *>;
+         interface Windows.Foundation.IAsyncOperation<Xodus.IMsaTokenResponse *>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Xodus.ITokenAndSignatureResponse *>;
++        interface Windows.Foundation.IAsyncOperation<Xodus.ITokenAndSignatureResponse *>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Xodus.IUserInfoResponse *>;
++        interface Windows.Foundation.IAsyncOperation<Xodus.IUserInfoResponse *>;
+     }
+ 
+     [
+@@ -98,7 +104,8 @@ namespace Xodus
+     interface IIPCLayer : IInspectable
+     {
+         HRESULT InitializeSocket();
+-        HRESULT SendRequestAsync( [in] Xodus.IXodusIPCPacket *packet, [out, retval] Windows.Foundation.IAsyncOperation<Xodus.IXodusIPCPacket *> **operation );
++        // timeoutMs bounds the wait for the service's reply; the operation fails with HRESULT_FROM_WIN32(ERROR_TIMEOUT) afterwards.
++        HRESULT SendRequestAsync( [in] Xodus.IXodusIPCPacket *packet, [in] UINT32 timeoutMs, [out, retval] Windows.Foundation.IAsyncOperation<Xodus.IXodusIPCPacket *> **operation );
+         [eventadd] HRESULT ResponseReceived( [in] Xodus.IPCResponseHandler *handler, [out, retval] EventRegistrationToken *token );
+         [eventremove] HRESULT ResponseReceived( [in] EventRegistrationToken token );
+     }
+@@ -110,6 +117,12 @@ namespace Xodus
+     {
+         HRESULT Ping( [out, retval] Windows.Foundation.IAsyncAction **operation );
+         HRESULT MsaTokenRequest( [in] HSTRING clientId, [in] boolean allowUI, [in] boolean fullTrust, [out, retval] Windows.Foundation.IAsyncOperation<Xodus.IMsaTokenResponse *> **operation );
++        // Message type 5 -> 6. clientId may be NULL/empty and titleId 0 (user-only, unsigned token).
++        // The operation succeeds whenever the service answered with a well-formed response, including one
++        // carrying <Error>; callers read ITokenAndSignatureResponse::Error. Transport failures fail the operation.
++        HRESULT TokenAndSignatureRequest( [in] LPCSTR clientId, [in] UINT32 titleId, [in] LPCSTR method, [in] LPCSTR url, [in] UINT32 headerCount, [in] LPCSTR *headerNames, [in] LPCSTR *headerValues, [in] UINT32 bodySize, [in] const BYTE *body, [in] boolean forceRefresh, [in] UINT32 timeoutMs, [out, retval] Windows.Foundation.IAsyncOperation<Xodus.ITokenAndSignatureResponse *> **operation );
++        // Message type 7 -> 8. Same error convention as TokenAndSignatureRequest.
++        HRESULT UserInfoRequest( [in] LPCSTR clientId, [in] UINT32 titleId, [in] boolean forceRefresh, [in] UINT32 timeoutMs, [out, retval] Windows.Foundation.IAsyncOperation<Xodus.IUserInfoResponse *> **operation );
+     }
+ 
+     [
+@@ -119,6 +132,10 @@ namespace Xodus
+     {
+         HRESULT BuildMsaTokenRequestXml( [in] HSTRING clientId, [in] boolean allowUI, [in] boolean fullTrust, [out, retval] LPSTR *xml_string );
+         HRESULT FromMsaTokenResponseXml( [in] LPCSTR xml_string, [out, retval] IMsaTokenResponse **response );
++        HRESULT BuildTokenAndSignatureRequestXml( [in] LPCSTR clientId, [in] UINT32 titleId, [in] LPCSTR method, [in] LPCSTR url, [in] UINT32 headerCount, [in] LPCSTR *headerNames, [in] LPCSTR *headerValues, [in] UINT32 bodySize, [in] const BYTE *body, [in] boolean forceRefresh, [out, retval] LPSTR *xml_string );
++        HRESULT FromTokenAndSignatureResponseXml( [in] LPCSTR xml_string, [out, retval] ITokenAndSignatureResponse **response );
++        HRESULT BuildUserInfoRequestXml( [in] LPCSTR clientId, [in] UINT32 titleId, [in] boolean forceRefresh, [out, retval] LPSTR *xml_string );
++        HRESULT FromUserInfoResponseXml( [in] LPCSTR xml_string, [out, retval] IUserInfoResponse **response );
+     }
+ 
+     
+@@ -131,6 +148,43 @@ namespace Xodus
+         [propget] HRESULT Expiry( [out, retval] Windows.Foundation.DateTime *out );
+     }
+ 
++    // Identity of the signed-in Xbox Live user, taken from the XSTS token's DisplayClaims (xui[0]).
++    // Carried by UserInfoResponse (type 8) and optionally by TokenAndSignatureResponse (type 6).
++    // AgeGroup uses the XUserAgeGroup numbering: Unknown = 0, Child = 1, Teen = 2, Adult = 3.
++    // Error is S_OK unless the service answered with <Error>; Message is the service's text (may be empty).
++    [
++        uuid(451120b0-dd68-4286-ac6c-b1d49713cb86)
++    ]
++    interface IUserInfoResponse : IUnknown
++    {
++        [propget] HRESULT SignedIn( [out, retval] boolean *out );
++        [propget] HRESULT Xuid( [out, retval] UINT64 *out );
++        [propget] HRESULT Gamertag( [out, retval] HSTRING *out );
++        [propget] HRESULT ModernGamertag( [out, retval] HSTRING *out );
++        [propget] HRESULT ModernGamertagSuffix( [out, retval] HSTRING *out );
++        [propget] HRESULT UniqueModernGamertag( [out, retval] HSTRING *out );
++        [propget] HRESULT AgeGroup( [out, retval] UINT32 *out );
++        [propget] HRESULT Uhs( [out, retval] HSTRING *out );
++        [propget] HRESULT Error( [out, retval] HRESULT *out );
++        [propget] HRESULT Message( [out, retval] HSTRING *out );
++    }
++
++    // Token is the full Authorization value ("XBL3.0 x=<uhs>;<xsts>"), Signature the base64 Signature
++    // header value (empty when the endpoint has no signature policy). Error/Message as above.
++    // UserInfo is NULL when the response carried no identity elements.
++    [
++        uuid(34b1fcf4-71a4-4f51-ae55-2fbf4c6c98a8)
++    ]
++    interface ITokenAndSignatureResponse : IUnknown
++    {
++        [propget] HRESULT Token( [out, retval] HSTRING *out );
++        [propget] HRESULT Signature( [out, retval] HSTRING *out );
++        [propget] HRESULT Expiry( [out, retval] Windows.Foundation.DateTime *out );
++        [propget] HRESULT Error( [out, retval] HRESULT *out );
++        [propget] HRESULT Message( [out, retval] HSTRING *out );
++        [propget] HRESULT UserInfo( [out, retval] IUserInfoResponse **out );
++    }
++
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0)
+     ]
+-- 
+2.56.0
+
