@@ -1,7 +1,7 @@
-From 21818f35160b64ec41c1d15e3798531363530743 Mon Sep 17 00:00:00 2001
+From 5bcad11978364243d110ae32f5177fa6442d1f67 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 03:59:38 +0200
-Subject: [PATCH 9/9] xodus-service: Do not panic or hang on MSA faults,
+Subject: [PATCH 09/11] xodus-service: Do not panic or hang on MSA faults,
  stalled requests or client disconnects
 
 - A client closing its connection between requests was logged as an error
@@ -75,6 +75,3 @@ index 0d850f6..5534fae 100644
              .build()
              .unwrap();
  
--- 
-2.56.0
-

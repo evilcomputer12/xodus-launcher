@@ -1,0 +1,38 @@
+From 1eba354264c769de72ebdacfc88940a7620ad0e4 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 10:23:04 +0200
+Subject: [PATCH 11/11] msixvc: Do not panic on file names that are not valid
+ UTF-16
+
+Both places that decode package file names used
+String::from_utf16(..).unwrap(), so a malformed name (as produced by the
+user data offset bug) aborted the whole download with a panic. Use the
+lossy conversion: a bad name becomes a bad name, not a crash.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ crates/msixvc/src/xvd.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crates/msixvc/src/xvd.rs b/crates/msixvc/src/xvd.rs
+index ed54db6..28f1b9d 100644
+--- a/crates/msixvc/src/xvd.rs
++++ b/crates/msixvc/src/xvd.rs
+@@ -477,7 +477,7 @@ impl XvdFile {
+                     .iter()
+                     .position(|&c| c == 0)
+                     .unwrap_or(fullname.len());
+-                let pfull_name: String = String::from_utf16(&fullname[..end]).unwrap();
++                let pfull_name: String = String::from_utf16_lossy(&fullname[..end]);
+ 
+                 files.insert(
+                     pfull_name,
+@@ -532,7 +532,7 @@ impl XvdFile {
+                 ))
+                 .await?;
+                 file.read_exact(buf.as_mut_bytes()).await?;
+-                let file_name: String = String::from_utf16(buf.as_slice()).unwrap();
++                let file_name: String = String::from_utf16_lossy(buf.as_slice());
+                 let page_length = if segment.filesize == 0 {
+                     1
+                 } else {

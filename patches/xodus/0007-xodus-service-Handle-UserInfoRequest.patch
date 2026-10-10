@@ -1,7 +1,7 @@
-From ac9d871e7a6212df1fc6cf7ff5289dd735582eec Mon Sep 17 00:00:00 2001
+From ae172d462c26fe17037599c4dbd0d2778bc2505f Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 01:34:15 +0200
-Subject: [PATCH 7/9] xodus-service: Handle UserInfoRequest.
+Subject: [PATCH 07/11] xodus-service: Handle UserInfoRequest.
 
 Answer the runtime's UserInfoRequest (7) with a UserInfoResponse (8) that
 says who is signed in: the identity claims of an XSTS token for the default
@@ -126,6 +126,3 @@ index a2b286a..edf35dd 100644
      #[tokio::test]
      async fn token_and_signature_request_signed_out() {
          let mut context = signed_out_context();
--- 
-2.56.0
-

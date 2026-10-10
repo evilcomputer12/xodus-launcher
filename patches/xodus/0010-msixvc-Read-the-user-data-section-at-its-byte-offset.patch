@@ -1,0 +1,34 @@
+From e427e2ce60ae3c07e33e6512335e10652faf1df5 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 10:35:35 +0200
+Subject: [PATCH 10/11] msixvc: Read the user data section at its byte offset
+
+parse_user_package_files took layout.user_data.start, which has been a
+page number since the layout rework (#168), as a byte offset, so the
+package file table was read from inside the XVD header. When the garbage
+user data type is not 0 the table is silently skipped (SegmentMetadata.bin
+is never used); for Brotato (9P9VNSQK1W3K) it is 0 and the garbage entries
+made `xodus-cli streaming` panic on a lone UTF-16 surrogate and then read
+past the end of the file with a bogus file count.
+
+Convert the page number to bytes like the hash tree, xvc info and drive
+data code already does.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ crates/msixvc/src/xvd.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crates/msixvc/src/xvd.rs b/crates/msixvc/src/xvd.rs
+index b74a7ae..ed54db6 100644
+--- a/crates/msixvc/src/xvd.rs
++++ b/crates/msixvc/src/xvd.rs
+@@ -448,7 +448,7 @@ impl XvdFile {
+     {
+         let mut files = HashMap::new();
+ 
+-        let user_data_offset = self.layout.user_data.start.0 as u64;
++        let user_data_offset = self.layout.user_data.start.to_bytes().0;
+         file.seek(SeekFrom::Start(user_data_offset)).await?;
+         let user_data_header = {
+             let mut buf = XvdUserDataHeader::buffer();

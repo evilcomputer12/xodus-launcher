@@ -1,8 +1,8 @@
-From 626c0f07e85620c73920eee5c4da7db24f9065be Mon Sep 17 00:00:00 2001
+From 9634199c62a06032826ffa818de5a0df80fbc316 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 02:33:53 +0200
-Subject: [PATCH 8/9] xodus: Document that TokenAndSignatureRequest Body may be
- a prefix.
+Subject: [PATCH 08/11] xodus: Document that TokenAndSignatureRequest Body may
+ be a prefix.
 
 WineGDK sends the whole request body when it fits the u16-sized frame
 and only its first BODY_PREFIX_BYTES (8192) otherwise, which is
@@ -132,6 +132,3 @@ index f01839f..e5f0a37 100644
  
      /// `xui[0]` of an XSTS token for http://xboxlive.com (values made up).
      fn claims() -> HashMap<String, String> {
--- 
-2.56.0
-
