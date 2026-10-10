@@ -197,7 +197,16 @@
       },
       "runtime": {
         "kind": "ge-proton",
-        "min_version": "GE-Proton11-1"
+        "min_version": "GE-Proton11-1",
+        "prefer_tools": [
+          "UMU-Proton-10",
+          "GE-Proton10",
+          "Proton 10"
+        ],
+        "release": {
+          "repo": "Open-Wine-Components/umu-proton",
+          "tag": "UMU-Proton-10.0-4"
+        }
       },
       "prefix": {
         "winetricks": [
@@ -328,14 +337,14 @@
           "--installpath=C:\\Program Files (x86)\\Battle.net"
         ],
         "sha256": "de5d32d4ea5eed5a9e120027fb68b370976dbfecc8f2a8f91305977f0b87fcaf",
-        "wait": "exit",
+        "wait": "exe",
         "success_codes": [
           0
         ],
         "timeout_seconds": 3600,
         "interactive": true,
         "interactive_note": "Battle.net Setup has no silent mode: click Install in its window and let it download the client (needs *.blizzard.com / *.battle.net). When it finishes it starts the client with the login window; you can sign in there or close it and open Battle.net from Xodus.",
-        "notes": "Pinned to the versioned file that the official rolling link https://downloader.battle.net/download/getInstaller?os=win&installer=Battle.net-Setup.exe 302-redirects to (verified 2026-10-10: 4,896,464 bytes, sha256 as pinned, identical to winget's InstallerSha256 for 1.19.3.3219; the versioned URL keeps serving that exact file, so the hash stays valid until this recipe is deliberately bumped to a newer setup). The rolling link itself is kept under installer.alternatives. Official publisher URL (the one winget's Blizzard.BattleNet manifest uses); it 302-redirects to https://downloader.battle.net/download/installer/win/1.0.66/Battle.net-Setup.exe (4,896,464 bytes, Last-Modified 2026-06-10, PE32 i386, FileVersion 1.19.3.3219). Lutris uses the equivalent https://www.battle.net/download/getInstallerForGame?os=win&version=LIVE&gameProgram=BATTLENET_APP which ends at the same file. The sha256 above was computed on 2026-10-10 from the official URL and is identical to winget's InstallerSha256 for 1.19.3.3219; it changes whenever Blizzard ships a new setup bootstrapper, so treat a mismatch as 'unknown build, re-verify against microsoft/winget-pkgs manifests/b/Blizzard/BattleNet' rather than a hard failure. The switches come from the winget manifest (Custom: --lang=enUS, InstallLocation: --installpath=\"<path>\"); there is NO fully silent mode (Blizzard forum thread 'Desktop App silent install', last confirmed 2024-11: UI still shows), so the setup window appears and the user clicks Install. Setup is only a bootstrapper: it downloads the Agent (C:\\ProgramData\\Battle.net\\Agent) and the client from Blizzard CDNs during install, so it needs network access to *.blizzard.com and *.battle.net (DNS filters/proxies cause 'Object moved' or BLZBNTBTS00000029 at ~25%). Lutris' recipe writes drive_c/users/<wine user>/AppData/Roaming/Battle.net/Battle.net.config BEFORE running setup with this JSON: {\"Client\":{\"GameLaunchWindowBehavior\":\"2\",\"GameSearch\":{\"BackgroundSearch\":\"true\"},\"HardwareAcceleration\":\"false\",\"Install\":{\"DownloadLimitNextPatchInBps\":\"0\"},\"Sound\":{\"Enabled\":\"false\"},\"Streaming\":{\"StreamingEnabled\":\"false\"}},\"Games\":{\"s2\":{\"AdditionalLaunchArguments\":\"-Displaymode 1\"}}} (hardware acceleration off avoids the spinning-icon/blank login window, streaming off avoids a black screen when a game starts, GameLaunchWindowBehavior 2 hides the client while a game runs). Note the Wine user directory is drive_c/users/<$USER> for a prefix made with wine directly but drive_c/users/steamuser for one made by GE-Proton's proton script. When setup finishes it auto-starts the client and shows the login window; Lutris tells the user not to log in there but to close it (then runs winekill); for a guided sign-in flow the user can simply log in at that point. Install into the prefix's own filesystem (ext4/btrfs), never NTFS (Lutris docs).",
+        "notes": "Pinned to the versioned file that the official rolling link https://downloader.battle.net/download/getInstaller?os=win&installer=Battle.net-Setup.exe 302-redirects to (verified 2026-10-10: 4,896,464 bytes, sha256 as pinned, identical to winget's InstallerSha256 for 1.19.3.3219; the versioned URL keeps serving that exact file, so the hash stays valid until this recipe is deliberately bumped to a newer setup). The rolling link itself is kept under installer.alternatives. Official publisher URL (the one winget's Blizzard.BattleNet manifest uses); it 302-redirects to https://downloader.battle.net/download/installer/win/1.0.66/Battle.net-Setup.exe (4,896,464 bytes, Last-Modified 2026-06-10, PE32 i386, FileVersion 1.19.3.3219). Lutris uses the equivalent https://www.battle.net/download/getInstallerForGame?os=win&version=LIVE&gameProgram=BATTLENET_APP which ends at the same file. The sha256 above was computed on 2026-10-10 from the official URL and is identical to winget's InstallerSha256 for 1.19.3.3219; it changes whenever Blizzard ships a new setup bootstrapper, so treat a mismatch as 'unknown build, re-verify against microsoft/winget-pkgs manifests/b/Blizzard/BattleNet' rather than a hard failure. The switches come from the winget manifest (Custom: --lang=enUS, InstallLocation: --installpath=\"<path>\"); there is NO fully silent mode (Blizzard forum thread 'Desktop App silent install', last confirmed 2024-11: UI still shows), so the setup window appears and the user clicks Install. Setup is only a bootstrapper: it downloads the Agent (C:\\ProgramData\\Battle.net\\Agent) and the client from Blizzard CDNs during install, so it needs network access to *.blizzard.com and *.battle.net (DNS filters/proxies cause 'Object moved' or BLZBNTBTS00000029 at ~25%). Lutris' recipe writes drive_c/users/<wine user>/AppData/Roaming/Battle.net/Battle.net.config BEFORE running setup with this JSON: {\"Client\":{\"GameLaunchWindowBehavior\":\"2\",\"GameSearch\":{\"BackgroundSearch\":\"true\"},\"HardwareAcceleration\":\"false\",\"Install\":{\"DownloadLimitNextPatchInBps\":\"0\"},\"Sound\":{\"Enabled\":\"false\"},\"Streaming\":{\"StreamingEnabled\":\"false\"}},\"Games\":{\"s2\":{\"AdditionalLaunchArguments\":\"-Displaymode 1\"}}} (hardware acceleration off avoids the spinning-icon/blank login window, streaming off avoids a black screen when a game starts, GameLaunchWindowBehavior 2 hides the client while a game runs). Note the Wine user directory is drive_c/users/<$USER> for a prefix made with wine directly but drive_c/users/steamuser for one made by GE-Proton's proton script. When setup finishes it auto-starts the client and shows the login window; Lutris tells the user not to log in there but to close it (then runs winekill); for a guided sign-in flow the user can simply log in at that point. Install into the prefix's own filesystem (ext4/btrfs), never NTFS (Lutris docs). Setup starts the client when it finishes and never exits on its own under Wine, so the launcher waits for Battle.net.exe to appear instead.",
         "alternatives": [
           {
             "name": "Battle.net Setup, current release (unversioned redirector)",
@@ -347,7 +356,16 @@
       },
       "runtime": {
         "kind": "ge-proton",
-        "min_version": "GE-Proton9-23"
+        "min_version": "GE-Proton9-23",
+        "prefer_tools": [
+          "UMU-Proton-10",
+          "GE-Proton10",
+          "Proton 10"
+        ],
+        "release": {
+          "repo": "Open-Wine-Components/umu-proton",
+          "tag": "UMU-Proton-10.0-4"
+        }
       },
       "prefix": {
         "winetricks": [],
@@ -503,7 +521,16 @@
       },
       "runtime": {
         "kind": "ge-proton",
-        "min_version": "GE-Proton11-7"
+        "min_version": "GE-Proton11-7",
+        "prefer_tools": [
+          "UMU-Proton-10",
+          "GE-Proton10",
+          "Proton 10"
+        ],
+        "release": {
+          "repo": "Open-Wine-Components/umu-proton",
+          "tag": "UMU-Proton-10.0-4"
+        }
       },
       "prefix": {
         "winetricks": [],
@@ -666,7 +693,16 @@
       },
       "runtime": {
         "kind": "ge-proton",
-        "min_version": null
+        "min_version": null,
+        "prefer_tools": [
+          "UMU-Proton-10",
+          "GE-Proton10",
+          "Proton 10"
+        ],
+        "release": {
+          "repo": "Open-Wine-Components/umu-proton",
+          "tag": "UMU-Proton-10.0-4"
+        }
       },
       "prefix": {
         "winetricks": [],
