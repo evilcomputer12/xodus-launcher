@@ -77,7 +77,7 @@
         "steps": [
           "Open Ubisoft Connect and sign in with your Ubisoft account (create one if needed).",
           "Link the Xbox account that has PC Game Pass: on https://account.ubisoft.com/linked-accounts choose Xbox and sign in with that Microsoft account. (An Ubisoft account that was ever linked to a different Xbox account cannot be relinked.)",
-          "Claim the Game Pass titles: go to https://gamepass.ubisoft.com, sign in with the same Xbox account, and click Claim/Activate on each game you want. They are not listed in Ubisoft Connect until claimed.",
+          "Claim the Game Pass titles: go to https://gamepass.ubisoft.com/ , sign in with the same Xbox account, and click Claim/Activate on each game you want. They are not listed in Ubisoft Connect until claimed.",
           "Restart Ubisoft Connect: the claimed games now appear in its Games library (Game Pass tag). Install them from there.",
           "Back in Xodus use \"Link installed game...\" on the title so Play starts it through Ubisoft Connect."
         ],
