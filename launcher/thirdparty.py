@@ -843,7 +843,12 @@ def find_proton_tool(prefixes):
     starts with one of the prefixes, in prefix order, newest copy first. Lets a recipe prefer e.g.
     Proton-CachyOS while GE-Proton lags behind a launcher update. Returns the directory or None."""
     found = []
-    for base in COMPAT_TOOL_DIRS + (_ge_root(),):
+    bases = list(COMPAT_TOOL_DIRS) + [_ge_root()]
+    try:  # Valve's own Proton builds ("Proton - Experimental", "Proton 10.0") live in the Steam libraries
+        bases += [lib / "steamapps/common" for lib in steam_libraries()]
+    except Exception:
+        pass
+    for base in bases:
         try:
             dirs = list(base.iterdir())
         except OSError:
