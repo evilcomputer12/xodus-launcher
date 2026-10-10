@@ -11,7 +11,9 @@ top of the [xodus](https://github.com/xodus-gaming/xodus) project and
 ## Status (October 2026)
 
 - Catalog browsing, sign-in, downloads and library management work.
-- Games launch through a patched WineGDK. **Balatro** is the first title confirmed running.
+- Games launch through a patched WineGDK. Confirmed so far: **Balatro** (playable) and
+  **Warhammer 40,000: Space Marine 2** (launches, passes the licence check to the menu; the
+  EasyAntiCheat bootstrapper is bypassed, so online modes are unavailable).
 - Games sign in with your real Xbox account through xodus-service: identity (gamertag, XUID)
   and signed Xbox Live tokens work, so achievements and other online calls can succeed.
   Cloud save sync is not implemented yet (saves are local).

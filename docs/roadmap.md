@@ -8,11 +8,11 @@ open source end to end. We get there in milestones that each ship something usab
 
 - [x] Catalog, sign-in, download, library, Play, Steam shortcuts (PySide6 GUI)
 - [x] WineGDK build with all 24 GDK runtime classes present (15 still stubs)
-- [x] First confirmed title: Balatro
+- [x] First confirmed titles: Balatro (playable), Space Marine 2 (launches to the menu)
 - [x] Real Xbox Live sign-in for games (`XUserGetTokenAndSignatureAsync` via xodus-service):
       real identity and signed tokens (verified with Balatro's achievements call)
 - [ ] Cloud save sync (XGameSave containers stay local for now)
-- [ ] `XStore` licence answers and `XPackage` package info so licence-checking games start
+- [x] `XStore` licence answers and `XPackage` package info so licence-checking games start
 - [ ] Per-game compatibility reports; a tested list of titles
 - [x] One-click setup: the launcher downloads the prebuilt WineGDK release (source build optional)
 - [x] Alt+F4 / close handling verified on KDE Wayland: a KWin close reaches the game as
