@@ -319,11 +319,30 @@ def prewarm_identity(game_dir, log=print):
         log(f"identity pre-warm skipped: {e}")
 
 
+def eac_real_executable(game_dir):
+    """If the game is wrapped by the EasyAntiCheat bootstrapper, the real game exe from
+    EasyAntiCheat/Settings.json (EAC has no Linux runtime in Game Pass builds, so the
+    bootstrapper itself can never run under Wine)."""
+    settings = Path(game_dir) / "EasyAntiCheat" / "Settings.json"
+    if not settings.exists():
+        return None
+    try:
+        exe = json.loads(settings.read_text()).get("executable", "")
+    except (OSError, ValueError):
+        return None
+    exe = exe.replace("/", "\\")
+    return exe if exe and (Path(game_dir) / exe.replace("\\", "/")).exists() else None
+
+
 def find_executable(game_dir):
-    """Main PC executable from MicrosoftGame.config (same rules as xodus PR #124)."""
+    """Main PC executable from MicrosoftGame.config (same rules as xodus PR #124),
+    bypassing an EasyAntiCheat bootstrapper when the config names one."""
     manifest = find_manifest(game_dir)
     if manifest is None:
         return None
+    real = eac_real_executable(game_dir)
+    if real:
+        return real
     try:
         root = ET.parse(manifest).getroot()
     except ET.ParseError:
