@@ -49,6 +49,10 @@ ICON_PATH = next((p for p in (HOME / ".local/share/icons/hicolor/256x256/apps/xo
 SELF_CMD = shutil.which("xodus-launcher") or str(HOME / ".local/bin/xodus-launcher")
 
 ALL_PC_GAMES_SIGL = "fdd9e2a7-0fee-49f6-ad69-4354098401ff"
+# EA Play (included with PC Game Pass) is a separate collection, mixed console/PC; PC titles are
+# delivered through the EA app, so they have no Windows.Desktop package (console-only ones have
+# Windows.Xbox packages and are dropped)
+EA_PLAY_SIGLS = ("1d33fbb9-b895-4732-a8ca-a55c8b99fa2c", "b8900d09-a491-44cc-916e-32b5acae621b")
 CATALOG_MAX_AGE = 12 * 3600
 UA = "xodus-launcher/1.0"
 
@@ -162,22 +166,29 @@ def _image_url(images, purposes, width):
     return ""
 
 
-def _parse_product(p):
+def _parse_product(p, collection=None):
     lp = (p.get("LocalizedProperties") or [{}])[0]
     images = lp.get("Images") or []
-    size = 0
+    size, platforms = 0, set()
     for avail in p.get("DisplaySkuAvailabilities") or []:
         for pkg in (avail.get("Sku", {}).get("Properties", {}).get("Packages") or []):
             deps = [d.get("PlatformName") for d in pkg.get("PlatformDependencies") or []]
+            platforms.update(d for d in deps if d)
             if "Windows.Desktop" in deps:
                 size = max(size, pkg.get("MaxDownloadSizeInBytes") or 0)
+    if collection == "EA Play" and platforms and "Windows.Desktop" not in platforms:
+        return None  # console-only EA Play title
     props = p.get("Properties") or {}
+    genres = list(props.get("Categories") or ([props["Category"]] if props.get("Category") else []))
+    if collection and collection not in genres:
+        genres.append(collection)
     return {
+        "collection": collection or "Game Pass",
         "id": p["ProductId"],
         "title": lp.get("ProductTitle", p["ProductId"]),
         "publisher": lp.get("PublisherName", ""),
         "description": lp.get("ShortDescription") or lp.get("ProductDescription", ""),
-        "genres": props.get("Categories") or ([props["Category"]] if props.get("Category") else []),
+        "genres": genres,
         "size": size,
         "poster": _image_url(images, ["Poster", "BoxArt", "BrandedKeyArt"], 300),
         "poster_big": _image_url(images, ["Poster", "BoxArt"], 600),
@@ -186,9 +197,20 @@ def _parse_product(p):
 
 
 def fetch_catalog(market, language, progress=None):
-    sigl = http_json(f"https://catalog.gamepass.com/sigls/v2?id={ALL_PC_GAMES_SIGL}"
-                     f"&language={language}&market={market}")
-    ids = [x["id"] for x in sigl if "id" in x]
+    def sigl_ids(sigl_id):
+        sigl = http_json(f"https://catalog.gamepass.com/sigls/v2?id={sigl_id}&language={language}&market={market}")
+        return [x["id"] for x in sigl if "id" in x]
+
+    ids = sigl_ids(ALL_PC_GAMES_SIGL)
+    seen = set(ids)
+    ea_ids = []
+    for sid in EA_PLAY_SIGLS:
+        try:
+            ea_ids += [i for i in sigl_ids(sid) if i not in seen and not seen.add(i)]
+        except (OSError, ValueError):
+            pass  # EA Play is optional: the Game Pass list still loads
+    collection_of = {i: "EA Play" for i in ea_ids}
+    ids = ids + ea_ids
     batches = [ids[i:i + 20] for i in range(0, len(ids), 20)]
     games, done = [], 0
 
@@ -207,9 +229,11 @@ def fetch_catalog(market, language, progress=None):
         for products in ex.map(fetch, batches):
             for p in products:
                 try:
-                    games.append(_parse_product(p))
+                    g = _parse_product(p, collection_of.get(p.get("ProductId")))
                 except (KeyError, IndexError, TypeError):
-                    pass
+                    continue
+                if g:
+                    games.append(g)
             done += 1
             if progress:
                 progress(done, len(batches))
@@ -1769,6 +1793,10 @@ def run_gui(install_id=None):
             self.setUniformItemSizes(True)
             self.setSpacing(6)
             self.setEditTriggers(QListView.NoEditTriggers)
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+            self.verticalScrollBar().setSingleStep(40)
+            self.setStyleSheet("QListView QScrollBar:vertical { width: 16px; }"
+                               "QListView QScrollBar::handle:vertical { min-height: 40px; }")
 
     class DownloadRow(QWidget):
         def __init__(self, title):
