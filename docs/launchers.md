@@ -241,6 +241,8 @@ When `umu-run` is installed the launchers (installer, client, games) run through
 Steam Linux Runtime container, exactly like Lutris and Heroic start them; Proton's 32-bit side
 needs libraries most hosts lack otherwise (Ubisoft Connect's UI thread overflowed its stack with
 a bare `files/bin/wine`). Set `"thirdparty_runner": "wine"` in config.json to run the Proton
-build directly instead. Known state on 2026-10-10: Ubisoft Connect 174.1 installs and its
-processes start under both GE-Proton 11-7 and Proton-CachyOS, but its window does not appear on
-the CachyOS/KDE Wayland test machine yet; this is being investigated.
+build directly instead. Known state on 2026-10-10: Ubisoft Connect 174.1 runs headless on every Wine 11 based build
+(GE-Proton 11, Proton-CachyOS 11, plain Wine 11: its UI thread overflows its stack inside Wine's
+32-bit ucrtbase after a burst of longjmp unwinds) and works on Wine 10 based builds, so its recipe
+prefers Proton 10 builds (`runtime.prefer_tools`) and downloads `UMU-Proton-10.0-4`
+(`runtime.release`, sha512-verified) when none is installed.

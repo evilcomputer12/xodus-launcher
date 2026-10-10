@@ -24,11 +24,14 @@
         "kind": "ge-proton",
         "min_version": "GE-Proton10-18",
         "prefer_tools": [
-          "Proton-CachyOS",
-          "proton-xodus",
-          "Proton - Experimental",
-          "GE-Proton"
-        ]
+          "UMU-Proton-10",
+          "GE-Proton10",
+          "Proton 10"
+        ],
+        "release": {
+          "repo": "Open-Wine-Components/umu-proton",
+          "tag": "UMU-Proton-10.0-4"
+        }
       },
       "prefix": {
         "winetricks": [
@@ -92,7 +95,7 @@
         "notes": "Ubisoft Connect itself has no anti-cheat. Of the 60 Ubisoft titles in the local Game Pass catalog index most are single-player (Assassin's Creed series, Far Cry 3/4/5/6/New Dawn/Primal, Watch Dogs 2, Immortals, Prince of Persia, Rayman, Child of Light, Star Wars Outlaws, Avatar, South Park, Trials...). Titles with anti-cheat, with AreWeAntiCheatYet status measured on the STEAM builds: Easy Anti-Cheat - For Honor (Supported), The Division 2 (Supported; Ubisoft enabled EAC's Proton support in Jan 2023, confirmed for Steam only; DX12 mode crashes), Far Cry 5 (Supported), Ghost Recon Wildlands (Broken), Brawlhalla (Supported); BattlEye - Rainbow Six Siege (Denied by Ubisoft: online play unavailable), Ghost Recon Breakpoint (Supported), Watch Dogs: Legion (Supported; BattlEye only guards Online mode), Riders Republic (Supported with tweaks), Skull and Bones (Running), The Crew Motorfest (Supported), The Crew 2 (Broken); FairFight (server-side) - The Division; Denuvo Anti-Cheat - Rainbow Six Extraction (Running); PunkBuster on old titles (AC III/IV/Brotherhood/Revelations, Far Cry 2/3) is inert. Mechanism: Proton's Wine (ValveSoftware/wine dlls/ntdll/unix/loader.c set_dll_path) appends $PROTON_BATTLEYE_RUNTIME/v1/lib/wine and /v1/lib64/wine plus $PROTON_EAC_RUNTIME/v2/lib32 and /v2/lib64 to the builtin DLL search path, so the game's EAC/BattlEye Windows modules are replaced by Valve's Linux builds; the runtimes are Steam apps 1826330 'Proton EasyAntiCheat Runtime' (steamapps/common/Proton EasyAntiCheat Runtime) and 1161040 'Proton BattlEye Runtime' (steamapps/common/Proton BattlEye Runtime). Steam exports the two env vars itself; outside Steam, Lutris sets PROTON_EAC_RUNTIME=<runtime_dir>/eac_runtime and PROTON_BATTLEYE_RUNTIME=<runtime_dir>/battleye_runtime (lutris/runners/wine.py) and Heroic does the same, both fetching the runtimes from https://lutris.net/api/runtimes (eac_runtime-20240114.tar.xz and battleeye_runtime.tar.xz on github.com/lutris/buildbot releases) - a third-party redistribution of Valve's runtime, so prefer reusing an existing Steam install and make the Lutris mirror an explicit opt-in. EAC additionally needs the game to ship its Linux module (EasyAntiCheat/easyanticheat_x64.so) and the publisher to enable Proton support on the EAC/BattlEye backend; those switches are per game, but it is unverified whether the Ubisoft Connect (Game Pass) builds ship the same modules as the Steam builds. Single-player bypass: no Ubisoft title is known to use the start_protected_game.exe bootstrapper pattern (EAC/BattlEye are loaded in-process), so the Space Marine 2 bypass does not apply; for titles whose anti-cheat only gates online modes (e.g. Watch Dogs: Legion Online) label online as unavailable unless the matching runtime is configured and the title is listed Supported."
       },
       "known_issues": [
-        "2026-10-10: with the client version built 2026-10-01 (174.1.13380) the UI thread of upc.exe overflows its stack under GE-Proton11-7 (fixme:ui:uisettings2_get_TextScaleFactor) and no window ever appears; Proton-CachyOS 11.0-20261005 and Proton Experimental show the login window. runtime.prefer_tools therefore prefers those builds when Steam has them installed.",
+        "2026-10-10: client 174.1.13380 (built 2026-10-01) shows no window on any Wine 11 based build (GE-Proton11-7, Proton-CachyOS 11, plain Wine 11): its UI thread does 48 longjmp unwinds and overflows its stack inside Wine's 32-bit ucrtbase, the client swallows the exception and runs headless. Wine 10 based builds work (UMU-Proton-10.0-4 verified: login window), so the recipe prefers Proton 10 builds and downloads UMU-Proton-10.0-4 when none is installed.",
         "Ubisoft Connect auto-updates itself and has repeatedly broken under Wine/Proton: 2023-02-01 ('Game starter version mismatch' / unrecoverable error; fixed the same day in Proton Experimental and by GE-Proton7-49), 2023-08-01 (needed WINE_SIMULATE_WRITECOPY=1 for UplayWebCore.exe; Proton Experimental 'Fixed Ubisoft Connect not working after its recent update', GE-Proton8-10 'fixes Ubisoft Connect'), 2025-09 ('Ubisoft connect has detected an unsolvable error and needs to be restarted'; fixed by moving to GE-Proton10-10 or newer, one report also needed a wiped, reinstalled prefix). Keep GE-Proton current and expect breakage right after client updates.",
         "ntsync: GE-Proton10-18 (2025-10-12) 'imported ntsync ubisoft connect fix'; on kernels with ntsync (CachyOS) use GE-Proton10-18 or newer, or set PROTON_NO_NTSYNC=1 as a fallback. Historically (6.21-GE-1) fsync made the client hang at 'Looking for patches' on a fresh prefix while esync worked.",
         "GE-Proton11-6 (2026-08-28) 'Removed a redundant packed-code split lock that delayed Ubisoft Connect startup by minutes' - earlier GE-Proton 11 builds start the client very slowly; prefer GE-Proton11-6 or newer.",

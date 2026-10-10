@@ -510,6 +510,10 @@ def validate_launchers_db(db):
             errors.append(f"{where}.runtime.min_version: GE-ProtonX-Y or null")
         if not all(isinstance(v, str) and v for v in rt.get("prefer_tools", []) or []):
             errors.append(f"{where}.runtime.prefer_tools: a list of directory-name prefixes")
+        relz = rt.get("release")
+        if relz is not None and not (isinstance(relz, dict) and re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", str(relz.get("repo", "")))
+                                     and re.match(r"^[A-Za-z0-9._-]+$", str(relz.get("tag", "")))):
+            errors.append(f"{where}.runtime.release: {{repo: owner/name, tag: release tag}}")
         pf = r.get("prefix") if isinstance(r.get("prefix"), dict) else {}
         if not all(isinstance(v, str) for v in pf.get("winetricks", [])):
             errors.append(f"{where}.prefix.winetricks: a list of verbs")
@@ -821,6 +825,23 @@ def find_proton_tool(prefixes):
     return None
 
 
+def ensure_proton_release(cfg, repo, tag, log=print, progress=None, cancel_event=None):
+    """A specific Proton release of a GitHub repo with GE's asset layout (<tag>[-x86_64].tar.gz +
+    .sha512sum), e.g. Open-Wine-Components/umu-proton UMU-Proton-10.0-4, installed under
+    DATA_DIR/ge-proton/<tag> (or reused from Steam / umu). Returns the directory."""
+    root = _ge_root()
+    if (root / tag / "files/bin/wine").exists():
+        return root / tag
+    tool = find_proton_tool([tag])
+    if tool:
+        return tool
+    if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", repo) or not re.match(r"^[A-Za-z0-9._-]+$", tag):
+        raise RuntimeError(f"invalid Proton release {repo} {tag}")
+    rel = _http_json(f"https://api.github.com/repos/{repo}/releases/tags/{tag}")
+    _install_proton_release(rel, tag, log, progress or (lambda *a: None), cancel_event, name=tag)
+    return root / tag
+
+
 def _foreign_ge_protons():
     """GE-Proton builds other tools installed (Steam's compatibilitytools.d, umu), newest first."""
     out, seen = [], set()
@@ -938,6 +959,18 @@ def ensure_ge_proton(cfg, log=print, progress=None, min_version=None, cancel_eve
     if (root / tag / "files/bin/wine").exists():
         (root / ".current").write_text(tag + "\n")
         return ge_proton_wine(tag)
+    _install_proton_release(rel, tag, log, progress, cancel_event)
+    (root / ".current").write_text(tag + "\n")
+    log(f"GE-Proton {tag} installed in {root / tag}")
+    return ge_proton_wine(tag)
+
+
+def _install_proton_release(rel, tag, log, progress, cancel_event, name="GE-Proton"):
+    """Download, verify (sha512sum asset + GitHub digest) and extract a Proton release into
+    DATA_DIR/ge-proton/<tag>."""
+    root = _ge_root()
+    root.mkdir(parents=True, exist_ok=True)
+    _, tar, chk = _ge_release_assets(rel)
     free = shutil.disk_usage(root).free
     if free < GE_MIN_FREE_BYTES:
         raise RuntimeError(f"not enough free space in {root} for GE-Proton ({human_size(free)} free, "
@@ -966,7 +999,7 @@ def ensure_ge_proton(cfg, log=print, progress=None, min_version=None, cancel_eve
         extract_tarball(tpath, staging, progress, "runtime", cancel_event)
         tops = [d for d in staging.iterdir()]
         if len(tops) != 1 or not (tops[0] / "files/bin/wine").exists():
-            raise RuntimeError(f"{tar['name']} does not look like a GE-Proton archive (no files/bin/wine)")
+            raise RuntimeError(f"{tar['name']} does not look like a Proton archive (no files/bin/wine)")
         target = root / tag
         if target.is_symlink() or target.exists():
             if target.is_symlink():
@@ -979,8 +1012,6 @@ def ensure_ge_proton(cfg, log=print, progress=None, min_version=None, cancel_eve
         raise
     shutil.rmtree(staging, ignore_errors=True)
     tpath.unlink(missing_ok=True)
-    (root / ".current").write_text(tag + "\n")
-    log(f"GE-Proton {tag} installed in {root / tag}")
     progress("runtime", 100, f"GE-Proton {tag} ready")
     return ge_proton_wine(tag)
 
@@ -1402,6 +1433,8 @@ class ThirdPartyLauncher:
         if rt.get("kind", "ge-proton") != "ge-proton":
             raise RuntimeError(f"{self.name}: runtime kind {rt.get('kind')!r} is not supported (only ge-proton)")
         tool = find_proton_tool(rt.get("prefer_tools"))
+        if not tool and rt.get("release"):
+            tool = ensure_proton_release(self.cfg, rt["release"]["repo"], rt["release"]["tag"], self.log)
         wine = str(tool / "files/bin/wine") if tool else \
             ensure_ge_proton(self.cfg, self.log, min_version=rt.get("min_version"))
         if not wine or not Path(wine).exists():
@@ -1745,6 +1778,10 @@ class ThirdPartyLauncher:
         rt = self.recipe.get("runtime") or {}
         progress("runtime", None, "Checking GE-Proton")
         tool = find_proton_tool(rt.get("prefer_tools"))
+        if not tool and rt.get("release"):
+            progress("runtime", None, f"Fetching {rt['release']['tag']}")
+            tool = ensure_proton_release(self.cfg, rt["release"]["repo"], rt["release"]["tag"], self.log,
+                                         progress, cancel_event)
         if tool:
             self.log(f"Using the Proton build {tool.name} at {tool} (preferred by the {self.name} recipe)")
             wine = str(tool / "files/bin/wine")
