@@ -12,17 +12,19 @@ provides=("${pkgname::-4}")
 conflicts=("${pkgname::-4}")
 options=(!lto)
 source=("git+$url.git"
-        "0001-msixvc-flush-PrefixCacheFile-writes-before-exposing-.patch"
-        "0002-xodus-Add-relying-party-resolution-and-Xbox-Live-req.patch"
-        "0003-xodus-Add-TokenAndSignature-protocol-messages-and-ti.patch"
-        "0004-xodus-service-Handle-TokenAndSignatureRequest.patch"
-        "0005-xodus-Add-user-identity-claims-and-UserInfo-protocol.patch"
-        "0006-xodus-service-Report-identity-claims-with-TokenAndSi.patch"
-        "0007-xodus-service-Handle-UserInfoRequest.patch"
-        "0008-xodus-Document-that-TokenAndSignatureRequest-Body-ma.patch"
-        "0009-xodus-service-Do-not-panic-or-hang-on-MSA-faults-sta.patch"
+        0001-msixvc-flush-PrefixCacheFile-writes-before-exposing-.patch
+        0002-xodus-Add-relying-party-resolution-and-Xbox-Live-req.patch
+        0003-xodus-Add-TokenAndSignature-protocol-messages-and-ti.patch
+        0004-xodus-service-Handle-TokenAndSignatureRequest.patch
+        0005-xodus-Add-user-identity-claims-and-UserInfo-protocol.patch
+        0006-xodus-service-Report-identity-claims-with-TokenAndSi.patch
+        0007-xodus-service-Handle-UserInfoRequest.patch
+        0008-xodus-Document-that-TokenAndSignatureRequest-Body-ma.patch
+        0009-xodus-service-Do-not-panic-or-hang-on-MSA-faults-sta.patch
+        0010-msixvc-Read-the-user-data-section-at-its-byte-offset.patch
+        0011-msixvc-Do-not-panic-on-file-names-that-are-not-valid.patch
 )
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 pkgver() {
 	# Todo: change this into the tag system when stable point builds are released!
