@@ -511,7 +511,7 @@ def wine_env(cfg, wine):
         "WINEDLLOVERRIDES": "d3d8,d3d9,d3d10core,d3d11,dxgi,d3d12,d3d12core=n,b;"
                             "xaudio2_7=n,b;x3daudio1_7=n,b;xgameruntime=n,b;winegstreamer=d;"
                             "mscoree,mshtml=",  # never block on the Mono/Gecko install prompt
-        "WINEDEBUG": "-all",
+        "WINEDEBUG": "fixme+gdkc,fixme+xgameruntime,err+all",  # cheap: only our runtime's gaps and errors
         "WINEFSYNC": "1",
         "WINEESYNC": "1",
         "VKD3D_CONFIG": "dxr11",
