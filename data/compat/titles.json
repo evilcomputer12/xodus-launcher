@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "generated": "2026-10-10",
+  "updated": "2026-10-10",
+  "defaults": {
+    "status": "untested",
+    "runtime": {
+      "wine": "wine-gdk",
+      "min_winegdk": ""
+    },
+    "prefix": "shared",
+    "dxvk": true,
+    "vkd3d": true,
+    "env": {},
+    "dll_overrides": {},
+    "launch": {
+      "executable": "",
+      "args": [],
+      "eac_bypass": null,
+      "working_dir": ""
+    },
+    "winetricks": [],
+    "registry": []
+  },
+  "titles": {
+    "9PK087LNGJC5": {
+      "title": "Balatro",
+      "status": "playable",
+      "notes": "Runs, renders and saves (saves stay local under AppData\\Local\\XodusGames). Real Xbox Live sign-in works: the game gets the signed-in gamertag and a signed achievements token through xodus-service. Closes on Alt+F4 / Stop (force-close watchdog).",
+      "tested": {
+        "date": "2026-10-10",
+        "launcher": "d22db67",
+        "winegdk": "winegdk-20261010-4afaf0a",
+        "gpu": "AMD Radeon RX 7600 XT (RADV, Mesa 26.2)",
+        "distro": "CachyOS"
+      },
+      "runtime": {
+        "wine": "wine-gdk",
+        "min_winegdk": "winegdk-20261010-4afaf0a"
+      }
+    },
+    "9N9PCZWHVP2L": {
+      "title": "Warhammer 40,000: Space Marine 2",
+      "status": "menu",
+      "notes": "The Game Pass build is wrapped by the EasyAntiCheat bootstrapper (start_protected_game.exe), which has no Linux runtime; the launcher starts the real executable instead, so online modes are impossible (\"ANTICHEAT FAILURE\" tag on the title screen is expected). Passes the title screen and the licence check with the XStore/XPackage runtime commits (WineGDK branch xodus-launcher at 283602e, newer than the winegdk-20261010-4afaf0a release). Campaign not tested yet.",
+      "tested": {
+        "date": "2026-10-10",
+        "launcher": "d22db67",
+        "winegdk": "xodus-launcher@283602e (source build)",
+        "gpu": "AMD Radeon RX 7600 XT (RADV, Mesa 26.2)",
+        "distro": "CachyOS"
+      },
+      "launch": {
+        "executable": "client_pc\\root\\bin\\pc\\Warhammer 40000 Space Marine 2 - Retail.exe",
+        "eac_bypass": true
+      }
+    },
+    "9P9VNSQK1W3K": {
+      "title": "Brotato",
+      "status": "launches",
+      "notes": "Godot 4 game. Launches, renders at native resolution (VKD3D-Proton) and signs in to Xbox Live. Asks the game-save object for an interface WineGDK does not know ({ab4ae4fb-6508-4950-a032-45fd4bf8c43b}, stored next to GameSaveImpl in Microsoft's xgameruntime.dll, so a newer game-save interface); the game tolerates the E_NOINTERFACE. Downloading needs xodus with PR #217 (carried in patches/xodus). Gameplay not confirmed yet.",
+      "tested": {
+        "date": "2026-10-10",
+        "launcher": "3ad46ae",
+        "winegdk": "xodus-launcher@283602e (source build)",
+        "gpu": "AMD Radeon RX 7600 XT (RADV, Mesa 26.2)",
+        "distro": "CachyOS"
+      }
+    }
+  }
+}

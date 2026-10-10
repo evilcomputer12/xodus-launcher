@@ -13,7 +13,10 @@ open source end to end. We get there in milestones that each ship something usab
       real identity and signed tokens (verified with Balatro's achievements call)
 - [ ] Cloud save sync (XGameSave containers stay local for now)
 - [x] `XStore` licence answers and `XPackage` package info so licence-checking games start
-- [ ] Per-game compatibility reports; a tested list of titles
+- [x] Per-title compatibility database (`data/compat/titles.json`: status, notes, Wine
+      build / prefix / overrides per Store ID, applied at launch, refreshed daily) with
+      badges, a catalog filter and one-click compatibility reports (docs/compat.md)
+- [ ] Grow the tested list: entries for every title people report
 - [x] One-click setup: the launcher downloads the prebuilt WineGDK release (source build optional)
 - [x] Alt+F4 / close handling verified on KDE Wayland: a KWin close reaches the game as
       SC_CLOSE, the force-close watchdog arms, Balatro exits (tools/kwin/close-game.js)

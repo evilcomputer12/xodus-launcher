@@ -47,6 +47,17 @@ sudo pacman -S --needed pyside6 python
 
 Then start **Xodus Launcher** from the app menu, sign in, pick a game, Install, Play.
 
+## Per-title compatibility
+
+`data/compat/titles.json` maps Game Pass titles (by Store ID) to a status, notes and the Wine
+configuration the launcher applies when it starts them: Wine build, shared or per-game prefix,
+DXVK/VKD3D on or off, environment, DLL overrides, executable override (EasyAntiCheat wrappers),
+winetricks verbs and registry keys. The launcher shows the status on the posters and in the
+details panel, filters the catalog by it, refreshes the database from this repository daily,
+and **Compatibility report…** writes a report (never containing tokens) and opens a prefilled
+issue so an entry can be added. Local overrides go in `~/.config/xodus-launcher/compat/<STOREID>.json`.
+See [docs/compat.md](docs/compat.md) and [data/compat/README.md](data/compat/README.md).
+
 ## Patches carried here (to be sent upstream)
 
 - `patches/xodus/`: a git series on xodus main: the streaming-download crash fix, and

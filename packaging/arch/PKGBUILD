@@ -28,10 +28,11 @@ package() {
 #!/bin/sh
 exec python3 /usr/share/xodus-launcher/xodus_launcher.py "$@"
 SH
+	install -Dm644 data/compat/titles.json "$pkgdir/usr/share/xodus-launcher/compat/titles.json"
 	install -Dm644 data/xodus-launcher.desktop "$pkgdir/usr/share/applications/xodus-launcher.desktop"
 	sed -i 's|^Exec=.*|Exec=xodus-launcher|' "$pkgdir/usr/share/applications/xodus-launcher.desktop"
 	install -Dm644 data/xodus.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/xodus.png"
 	install -Dm755 scripts/build-winegdk.sh "$pkgdir/usr/share/xodus-launcher/scripts/build-winegdk.sh"
 	install -Dm644 patches/winegdk/* -t "$pkgdir/usr/share/xodus-launcher/patches/winegdk/"
-	install -Dm644 README.md LICENSE -t "$pkgdir/usr/share/doc/xodus-launcher/"
+	install -Dm644 README.md LICENSE docs/compat.md -t "$pkgdir/usr/share/doc/xodus-launcher/"
 }

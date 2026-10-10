@@ -14,6 +14,7 @@ import concurrent.futures
 import fcntl
 import glob
 import hashlib
+import html
 import json
 import os
 import pty
@@ -27,6 +28,7 @@ import tarfile
 import termios
 import threading
 import time
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -49,6 +51,25 @@ SELF_CMD = shutil.which("xodus-launcher") or str(HOME / ".local/bin/xodus-launch
 ALL_PC_GAMES_SIGL = "fdd9e2a7-0fee-49f6-ad69-4354098401ff"
 CATALOG_MAX_AGE = 12 * 3600
 UA = "xodus-launcher/1.0"
+
+# per-title compatibility database: bundled with the launcher, refreshed from the repository
+COMPAT_URL = ("https://raw.githubusercontent.com/evilcomputer12/xodus-launcher/main/"
+              "data/compat/titles.json")
+COMPAT_MAX_AGE = 24 * 3600
+COMPAT_CACHE = CACHE_DIR / "compat/titles.json"
+COMPAT_USER_DIR = HOME / ".config/xodus-launcher/compat"
+COMPAT_STATUSES = ("untested", "broken", "launches", "menu", "playable", "perfect")
+STATUS_LABELS = {"untested": "Untested", "broken": "Broken", "launches": "Launches",
+                 "menu": "Menu", "playable": "Playable", "perfect": "Perfect"}
+STATUS_COLORS = {"untested": "#6c757d", "broken": "#c0392b", "launches": "#d35400",
+                 "menu": "#b7950b", "playable": "#1e8449", "perfect": "#117a65"}
+REPORT_ISSUES_URL = "https://github.com/evilcomputer12/xodus-launcher/issues/new"
+_SELF = Path(__file__).resolve()
+# next to data/ in a checkout, or next to the script where install.sh / the package copy it
+BUNDLED_COMPAT = next((p for p in (_SELF.parent.parent / "data/compat/titles.json",
+                                   _SELF.parent / "compat/titles.json",
+                                   Path("/usr/share/xodus-launcher/compat/titles.json"))
+                       if p.exists()), None)
 
 DEFAULT_CONFIG = {
     "games_dir": str(HOME / "Games/GamePass"),
@@ -334,13 +355,16 @@ def eac_real_executable(game_dir):
     return exe if exe and (Path(game_dir) / exe.replace("\\", "/")).exists() else None
 
 
-def find_executable(game_dir):
+def find_executable(game_dir, eac_bypass=None):
     """Main PC executable from MicrosoftGame.config (same rules as xodus PR #124),
-    bypassing an EasyAntiCheat bootstrapper when the config names one."""
+    bypassing an EasyAntiCheat bootstrapper when the config names one.
+
+    eac_bypass: None = bypass when the game ships the bootstrapper (auto), False = never,
+    True = the compat entry asks for it (same as auto; it is recorded for the report)."""
     manifest = find_manifest(game_dir)
     if manifest is None:
         return None
-    real = eac_real_executable(game_dir)
+    real = eac_real_executable(game_dir) if eac_bypass is not False else None
     if real:
         return real
     try:
@@ -358,6 +382,334 @@ def find_executable(game_dir):
             return name
         fallback = fallback or name
     return fallback
+
+
+# --------------------------------------------------------------------------
+# per-title compatibility database (data/compat/titles.json)
+# --------------------------------------------------------------------------
+
+COMPAT_DEFAULTS = {
+    "status": "untested",
+    "notes": "",
+    "tested": {},
+    "runtime": {"wine": "wine-gdk", "min_winegdk": ""},
+    "prefix": "shared",
+    "dxvk": True,
+    "vkd3d": True,
+    "env": {},
+    "dll_overrides": {},
+    "launch": {"executable": "", "args": [], "eac_bypass": None, "working_dir": ""},
+    "winetricks": [],
+    "registry": [],
+}
+_compat_db = None
+
+
+def _merge(base, over):
+    """Dicts merge recursively; everything else (lists included) is replaced."""
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _valid_compat_db(db):
+    return isinstance(db, dict) and db.get("schema_version") == 1 and isinstance(db.get("titles"), dict)
+
+
+def load_compat_db(force=False):
+    """The database: the bundled titles.json or the downloaded copy, whichever is newer
+    (by its `updated` date). Never touches the network - see refresh_compat_db()."""
+    global _compat_db
+    if _compat_db is not None and not force:
+        return _compat_db
+    best = None
+    for p in (BUNDLED_COMPAT, COMPAT_CACHE):
+        db = _read_json(p) if p and p.exists() else None
+        if _valid_compat_db(db) and (best is None or
+                                     (db.get("updated") or "") > (best.get("updated") or "")):
+            best = db
+    _compat_db = best or {"schema_version": 1, "defaults": {}, "titles": {}}
+    return _compat_db
+
+
+def refresh_compat_db(force=False):
+    """Download titles.json from the project repository into the cache when the cached copy is
+    older than a day. Returns True when a new copy arrived. Meant for a background thread."""
+    if not force and COMPAT_CACHE.exists() and \
+            time.time() - COMPAT_CACHE.stat().st_mtime < COMPAT_MAX_AGE:
+        return False
+    data = http_get(COMPAT_URL, 30)
+    if not _valid_compat_db(json.loads(data)):
+        raise ValueError("unexpected compatibility database format")
+    COMPAT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    COMPAT_CACHE.write_bytes(data)
+    load_compat_db(force=True)
+    return True
+
+
+def user_compat_override(store_id):
+    """~/.config/xodus-launcher/compat/<STOREID>.json: the user's own tweaks for one title."""
+    if not store_id:
+        return {}
+    return _read_json(COMPAT_USER_DIR / f"{store_id}.json") or {}
+
+
+def compat_entry(store_id, db=None):
+    """defaults ⊕ database defaults ⊕ the title's entry ⊕ the user's override. Always returns
+    an entry; unknown titles get the defaults with status "untested"."""
+    db = db or load_compat_db()
+    title_entry = (db.get("titles") or {}).get(store_id or "") or {}
+    user = user_compat_override(store_id)
+    entry = _merge(_merge(_merge(COMPAT_DEFAULTS, db.get("defaults")), title_entry), user)
+    if entry.get("status") not in COMPAT_STATUSES:
+        entry["status"] = "untested"
+    entry["id"] = store_id or ""
+    entry["_db"] = title_entry  # what the database itself pins for this title
+    entry["_user"] = user       # what the user overrode (beats everything, Settings included)
+    return entry
+
+
+def game_store_id(game_dir):
+    """Store ID of an installed game: the launcher's meta file, else MicrosoftGame.config."""
+    meta = read_meta(game_dir)
+    if meta and meta.get("id"):
+        return meta["id"]
+    manifest = find_manifest(game_dir)
+    if manifest is not None:
+        try:
+            for el in ET.parse(manifest).getroot().iter():
+                if el.tag.split("}")[-1] == "StoreId" and el.text:
+                    return el.text.strip()
+        except ET.ParseError:
+            pass
+    return ""
+
+
+def wine_from_name(name):
+    """"wine-gdk" / "wine-xodus" / another build dir under DATA_DIR, "proton", or a path."""
+    if not name:
+        return ""
+    if name == "proton":
+        return find_proton_wine()
+    p = Path(name).expanduser()
+    if p.is_absolute():
+        return str(p) if p.exists() else ""
+    w = DATA_DIR / name / "bin/wine"
+    return str(w) if w.exists() else ""
+
+
+def resolve_wine(cfg, entry):
+    """Wine for a title: the user's per-title override, then the build the database pins for
+    this title, then the Settings choice, then the database default, then whatever is installed."""
+    user_wine = ((entry.get("_user") or {}).get("runtime") or {}).get("wine")
+    db_wine = ((entry.get("_db") or {}).get("runtime") or {}).get("wine")
+    default_wine = (entry.get("runtime") or {}).get("wine")
+    return (wine_from_name(user_wine) or wine_from_name(db_wine) or cfg.get("wine")
+            or wine_from_name(default_wine) or find_wine())
+
+
+def game_prefix(cfg, game_dir, entry=None):
+    """The prefix a title runs in: the shared one from Settings, or DATA_DIR/prefix-<STOREID>
+    when its entry says "per-game"."""
+    if entry is None:
+        entry = compat_entry(game_store_id(game_dir))
+    if entry.get("prefix") == "per-game" and entry.get("id"):
+        return str(DATA_DIR / f"prefix-{entry['id']}")
+    return cfg["prefix"]
+
+
+def winegdk_release(wine):
+    """Release tag of a prebuilt WineGDK (download_winegdk_release writes it); '' for source builds."""
+    try:
+        return (Path(wine).parent.parent / ".release").read_text().strip()
+    except OSError:
+        return ""
+
+
+def wine_version(wine):
+    try:
+        return subprocess.run([wine, "--version"], capture_output=True, text=True,
+                              timeout=20).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _release_date(tag):
+    m = re.match(r"winegdk-(\d{8})", tag or "")
+    return m.group(1) if m else ""
+
+
+def apply_prefix_tweaks(cfg, wine, prefix, entry, log=print):
+    """Registry entries and winetricks verbs from the entry, each applied once per prefix
+    (tracked in <prefix>/.xodus-compat-applied.json). Returns True when something was applied."""
+    marker = Path(prefix) / ".xodus-compat-applied.json"
+    done = _read_json(marker) or {}
+    done.setdefault("registry", [])
+    done.setdefault("winetricks", [])
+    env = wine_env(cfg, wine, entry, prefix)
+    changed = False
+    for reg in entry.get("registry") or []:
+        if not isinstance(reg, dict) or not reg.get("key"):
+            log(f"compat: ignoring registry entry without a key: {reg}")
+            continue
+        key = json.dumps(reg, sort_keys=True)
+        if key in done["registry"]:
+            continue
+        cmd = [wine, "reg", "add", reg["key"], "/f"]
+        if reg.get("name"):
+            cmd += ["/v", str(reg["name"])]
+        if reg.get("type"):
+            cmd += ["/t", str(reg["type"])]
+        if reg.get("value") is not None:
+            cmd += ["/d", str(reg["value"])]
+        log("$ " + " ".join(cmd))
+        try:
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"compat: registry entry failed: {e}")
+            continue
+        if r.returncode == 0:
+            done["registry"].append(key)
+            changed = True
+        else:
+            log("compat: registry entry failed: " + (r.stdout + r.stderr).strip()[-300:])
+    verbs = [v for v in entry.get("winetricks") or [] if v not in done["winetricks"]]
+    if verbs and not shutil.which("winetricks"):
+        log("WARNING: this title wants winetricks verbs (" + " ".join(verbs) +
+            ") but winetricks is not installed")
+    elif verbs:
+        log("$ winetricks -q " + " ".join(verbs))
+        e = dict(env)
+        e["WINE"] = wine
+        e["WINESERVER"] = str(Path(wine).parent / "wineserver")
+        try:
+            ok = subprocess.run(["winetricks", "-q"] + verbs, env=e, timeout=1800,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        except (OSError, subprocess.SubprocessError) as ex:
+            log(f"compat: winetricks failed: {ex}")
+            ok = False
+        if ok:
+            done["winetricks"] += verbs
+            changed = True
+        else:
+            log("compat: winetricks failed; the verbs are retried at the next launch")
+    if changed:
+        marker.write_text(json.dumps(done, indent=2))
+    return changed
+
+
+# ---------- compatibility reports ----------
+
+CREDENTIAL_WORDS = ("xbl3.0", "signature", "token", "authorization")
+
+
+def scrub_log_lines(lines):
+    """Drop anything that could carry a credential: tokens and signatures never leave the machine."""
+    return ["[line removed: may contain credentials]"
+            if any(w in line.lower() for w in CREDENTIAL_WORDS) else line for line in lines]
+
+
+def system_info():
+    info = {"kernel": os.uname().release, "distro": "", "gpu": "", "vulkan": ""}
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                info["distro"] = line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    probes = (
+        (["lspci"], "gpu", r"VGA|3D controller", ": "),
+        (["vulkaninfo", "--summary"], "vulkan", r"deviceName|driverName|driverInfo", "="),
+    )
+    for cmd, key, pattern, sep in probes:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        found = [line.split(sep, 1)[-1].strip() for line in out.splitlines()
+                 if re.search(pattern, line)]
+        info[key] = "; ".join(dict.fromkeys(found))
+    return info
+
+
+def launcher_commit():
+    repo = _SELF.parent.parent
+    if not (repo / ".git").exists():
+        return ""
+    try:
+        return subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def write_compat_report(cfg, game, entry, status="", notes=""):
+    """Write CACHE_DIR/reports/<STOREID>-<date>.json (for a bug report or a database entry) and
+    return its path. The game log excerpt is scrubbed of anything credential-like."""
+    game_dir = game.get("dir") or ""
+    wine = resolve_wine(cfg, entry)
+    launch = entry.get("launch") or {}
+    tail = []
+    if game_dir:
+        logfile = LOG_DIR / (safe_dirname(Path(game_dir).name) + ".log")
+        if logfile.exists():
+            tail = scrub_log_lines(logfile.read_text(errors="replace").splitlines()[-200:])
+    report = {
+        "schema_version": 1,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "game": {
+            "id": game.get("id") or entry.get("id") or "",
+            "title": game.get("title", ""),
+            "dir": game_dir,
+            "executable": (launch.get("executable") or
+                           find_executable(game_dir, launch.get("eac_bypass"))) if game_dir else None,
+        },
+        "result": {"status": status or entry.get("status", "untested"), "notes": notes},
+        "system": system_info(),
+        "launcher": {"commit": launcher_commit(), "path": str(_SELF)},
+        "wine": {
+            "path": wine,
+            "version": wine_version(wine) if wine else "",
+            "winegdk_release": winegdk_release(wine) if wine else "",
+            "prefix": game_prefix(cfg, game_dir, entry) if game_dir else cfg["prefix"],
+        },
+        "compat_entry": {k: v for k, v in entry.items() if not k.startswith("_")},
+        "user_override": entry.get("_user") or {},
+        "log_tail": tail,
+    }
+    path = CACHE_DIR / "reports" / \
+        f"{report['game']['id'] or 'unknown'}-{time.strftime('%Y-%m-%d-%H%M%S')}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2))
+    return path
+
+
+def report_issue_url(report, path):
+    """A prefilled GitHub issue for a report (kept short: the file has the details)."""
+    g, s, w = report["game"], report["system"], report["wine"]
+    status = report["result"]["status"]
+    body = (f"**Game:** {g['title']} ({g['id']})\n"
+            f"**Result:** {STATUS_LABELS.get(status, status)}\n\n{report['result']['notes']}\n\n"
+            f"**System:** {s['distro']}, kernel {s['kernel']}\n**GPU:** {s['gpu']}\n"
+            f"**Vulkan:** {s['vulkan']}\n**Wine:** {w['version']} {w['winegdk_release']}\n"
+            f"**Launcher:** {report['launcher']['commit'] or 'unknown'}\n\n"
+            f"Report file (please attach it): `{path}`\n")
+    q = urllib.parse.urlencode({"title": f"Compat: {g['title']} ({g['id']})",
+                                "labels": "compat-report", "body": body})
+    return f"{REPORT_ISSUES_URL}?{q}"
 
 
 # --------------------------------------------------------------------------
@@ -504,13 +856,30 @@ def latest_proton_artifact():
     raise RuntimeError("No downloadable xodus Proton build found on GitHub")
 
 
-def wine_env(cfg, wine):
+def dll_overrides(compat=None):
+    """WINEDLLOVERRIDES: DXVK / VKD3D-Proton from the prefix (unless the title's entry turns
+    them off), xgameruntime native, no Mono/Gecko prompt, plus the entry's own overrides."""
+    ov = {}
+    dx = "n,b" if compat is None or compat.get("dxvk", True) else "b"
+    for d in ("d3d8", "d3d9", "d3d10core", "d3d11", "dxgi"):
+        ov[d] = dx
+    d12 = "n,b" if compat is None or compat.get("vkd3d", True) else "b"
+    for d in ("d3d12", "d3d12core"):
+        ov[d] = d12
+    ov.update({"xaudio2_7": "n,b", "x3daudio1_7": "n,b", "xgameruntime": "n,b",
+               "winegstreamer": "d",
+               "mscoree": "", "mshtml": ""})  # never block on the Mono/Gecko install prompt
+    if compat:
+        ov.update({k: str(v) for k, v in (compat.get("dll_overrides") or {}).items()})
+    return ";".join(f"{k}={v}" for k, v in ov.items())
+
+
+def wine_env(cfg, wine, compat=None, prefix=None):
+    """Environment for the Wine build; compat is the title's compatibility entry, if any."""
     env = dict(os.environ)
     env.update({
-        "WINEPREFIX": cfg["prefix"],
-        "WINEDLLOVERRIDES": "d3d8,d3d9,d3d10core,d3d11,dxgi,d3d12,d3d12core=n,b;"
-                            "xaudio2_7=n,b;x3daudio1_7=n,b;xgameruntime=n,b;winegstreamer=d;"
-                            "mscoree,mshtml=",  # never block on the Mono/Gecko install prompt
+        "WINEPREFIX": prefix or cfg["prefix"],
+        "WINEDLLOVERRIDES": dll_overrides(compat),
         "WINEDEBUG": "fixme+gdkc,fixme+xgameruntime,err+all",  # cheap: only our runtime's gaps and errors
         "WINEFSYNC": "1",
         "WINEESYNC": "1",
@@ -520,6 +889,8 @@ def wine_env(cfg, wine):
     bindir = str(Path(wine).parent)
     env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     env.update(cfg.get("extra_env") or {})
+    if compat:  # the title's entry (and the user's override of it) is the most specific layer
+        env.update({k: str(v) for k, v in (compat.get("env") or {}).items()})
     return env
 
 
@@ -593,6 +964,8 @@ def download_winegdk_release(log):
     tpath.unlink()
     if not (DATA_DIR / "wine-gdk/bin/wine").exists():
         raise RuntimeError("the WineGDK tarball did not contain wine-gdk/bin/wine")
+    # remembered for compatibility entries / reports (runtime.min_winegdk)
+    (DATA_DIR / "wine-gdk/.release").write_text(str(rel.get("tag_name", "")) + "\n")
     log("WineGDK installed")
 
 
@@ -632,7 +1005,6 @@ def setup_wine(cfg, log):
         wine = find_proton_wine()
         if not wine:
             raise RuntimeError("Proton archive did not contain files/bin/wine")
-    dist = Path(wine).parent.parent  # Proton dist: source of DXVK / VKD3D-Proton
     if not any(w.exists() for w in BUILT_WINES):
         download_winegdk_release(log)
     wine = find_wine()
@@ -642,23 +1014,34 @@ def setup_wine(cfg, log):
     else:
         log("WARNING: xgameruntime.dll not found in this Wine build - games may not start")
 
-    prefix = Path(cfg["prefix"])
-    env = wine_env(cfg, wine)
-    # create the prefix, or update it after switching Wine builds; mscoree/mshtml disabled so
-    # wineboot never waits on the "install Wine Mono/Gecko" dialog
-    if True:
-        log("Creating / updating Wine prefix (takes a minute) ...")
-        prefix.mkdir(parents=True, exist_ok=True)
-        e = dict(env)
-        e["WINEDLLOVERRIDES"] = "mscoree,mshtml="
-        subprocess.run([wine, "wineboot", "-u"], env=e, timeout=600,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run([str(Path(wine).parent / "wineserver"), "-w"], env=e, timeout=600)
+    prepare_prefix(cfg, wine, cfg["prefix"], log)
+    cfg["wine"] = wine
+    save_config(cfg)
+    log("Wine is ready.")
+    return wine
+
+
+def prepare_prefix(cfg, wine, prefix, log=print):
+    """Create the prefix, or update it after switching Wine builds, and copy DXVK / VKD3D-Proton
+    into it from the xodus Proton dist (setup_wine downloads that). Used for the shared prefix
+    and for the per-game ones the compatibility database asks for."""
+    prefix = Path(prefix)
+    log(f"Creating / updating Wine prefix {prefix} (takes a minute) ...")
+    prefix.mkdir(parents=True, exist_ok=True)
+    # mscoree/mshtml disabled so wineboot never waits on the "install Wine Mono/Gecko" dialog
+    e = wine_env(cfg, wine, prefix=str(prefix))
+    e["WINEDLLOVERRIDES"] = "mscoree,mshtml="
+    subprocess.run([wine, "wineboot", "-u"], env=e, timeout=600,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run([str(Path(wine).parent / "wineserver"), "-w"], env=e, timeout=600)
     copied = 0
+    proton = find_proton_wine()
+    dist = Path(proton).parent.parent if proton else None  # source of DXVK / VKD3D-Proton
     archmap = {"x86_64-windows": "system32", "i386-windows": "syswow64"}
     for comp in ("dxvk", "vkd3d-proton"):
         for arch, sysdir in archmap.items():
-            for dll in glob.glob(str(dist / "lib*" / "wine" / comp / arch / "*.dll")):
+            dlls = glob.glob(str(dist / "lib*" / "wine" / comp / arch / "*.dll")) if dist else []
+            for dll in dlls:
                 target = prefix / "drive_c/windows" / sysdir
                 if target.is_dir():
                     dst = target / Path(dll).name
@@ -666,10 +1049,7 @@ def setup_wine(cfg, log):
                     shutil.copyfile(dll, dst)
                     copied += 1
     log(f"Installed {copied} DXVK/VKD3D-Proton DLLs into the prefix")
-    cfg["wine"] = wine
-    save_config(cfg)
-    log("Wine is ready.")
-    return wine
+    return copied
 
 
 # --------------------------------------------------------------------------
@@ -717,13 +1097,13 @@ def ensure_xodus_service(log=print):
     return False
 
 
-def stop_wine(cfg):
+def stop_wine(cfg, prefix=None):
     """Kill everything in the game's Wine prefix (used to force-stop a running game)."""
     wine = cfg.get("wine") or find_wine()
     if not wine:
         return
     env = dict(os.environ)
-    env["WINEPREFIX"] = cfg["prefix"]
+    env["WINEPREFIX"] = prefix or cfg["prefix"]
     try:
         subprocess.run([str(Path(wine).parent / "wineserver"), "-k"], env=env, timeout=30)
     except (OSError, subprocess.SubprocessError):
@@ -731,17 +1111,41 @@ def stop_wine(cfg):
 
 
 def launch_game(cfg, game_dir, log=print, on_start=None):
-    """Run the game via `xodus-cli run`. Blocks until it exits. Returns (code, tail).
+    """Run the game via `xodus-cli run` with its compatibility entry applied (Wine build,
+    prefix, environment, executable). Blocks until it exits. Returns (code, tail).
 
     on_start(popen) is called once the process is spawned, so a caller can stop it."""
-    wine = cfg.get("wine") or find_wine()
+    entry = compat_entry(game_store_id(game_dir))
+    wine = resolve_wine(cfg, entry)
     if not wine or not Path(wine).exists():
         return 1, "Wine is not set up yet - open Xodus Launcher and use Settings > Set up Wine."
-    exe = find_executable(game_dir)
+    prefix = game_prefix(cfg, game_dir, entry)
+    launch = entry.get("launch") or {}
+    exe = launch.get("executable") or find_executable(game_dir, launch.get("eac_bypass"))
     candidates = exe_candidates(exe) if exe else [None]
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logfile = LOG_DIR / (safe_dirname(Path(game_dir).name) + ".log")
-    env = wine_env(cfg, wine)
+    env = wine_env(cfg, wine, entry, prefix)
+    header = [f"compat: {entry['id'] or 'unknown title'} status={entry['status']} wine={wine} "
+              f"prefix={prefix}" + (" (user override)" if entry.get("_user") else "")]
+    if entry["status"] == "broken":
+        header.append("compat: this title is known not to work yet. " + (entry.get("notes") or ""))
+    need = (entry.get("runtime") or {}).get("min_winegdk") or ""
+    have = winegdk_release(wine)
+    if _release_date(need) and _release_date(have) and _release_date(have) < _release_date(need):
+        header.append(f"compat: WARNING this title was tested with WineGDK {need} or newer; "
+                      f"{have} is installed")
+    if launch.get("args"):
+        header.append("compat: launch.args are recorded but xodus-cli run cannot pass them yet")
+    for line in header:
+        log(line)
+    if prefix != cfg["prefix"] and not (Path(prefix) / "system.reg").exists():
+        prepare_prefix(cfg, wine, prefix, log)
+    if entry.get("registry") or entry.get("winetricks"):
+        apply_prefix_tweaks(cfg, wine, prefix, entry, log)
+    cwd = game_dir
+    if launch.get("working_dir") and (Path(game_dir) / launch["working_dir"]).is_dir():
+        cwd = str(Path(game_dir) / launch["working_dir"])
     if ensure_xodus_service(log):
         threading.Thread(target=prewarm_identity, args=(game_dir, log), daemon=True).start()
     code, tail = 1, ""
@@ -751,11 +1155,11 @@ def launch_game(cfg, game_dir, log=print, on_start=None):
             cmd += ["--exe", cand]
         log("$ " + " ".join(cmd))
         with open(logfile, "w") as lf:
-            lf.write("$ " + " ".join(cmd) + "\n")
+            lf.write("\n".join(header + ["$ " + " ".join(cmd)]) + "\n")
             lf.flush()
             # new session so the whole wine process tree can be signalled as a group
             p = subprocess.Popen(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT,
-                                 cwd=game_dir, start_new_session=True)
+                                 cwd=cwd, start_new_session=True)
             if on_start:
                 on_start(p)
             p.wait()
@@ -885,9 +1289,10 @@ def cli_play(product_id):
 # --------------------------------------------------------------------------
 
 def run_gui(install_id=None):
-    from PySide6.QtCore import (QObject, QSize, QSortFilterProxyModel, Qt, QThread, QUrl,
+    from PySide6.QtCore import (QObject, QRect, QSize, QSortFilterProxyModel, Qt, QThread, QUrl,
                                 Signal, QStandardPaths)
-    from PySide6.QtGui import QDesktopServices, QIcon, QPixmap, QStandardItem, QStandardItemModel
+    from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap,
+                               QStandardItem, QStandardItemModel)
     from PySide6.QtNetwork import QNetworkAccessManager, QNetworkDiskCache, QNetworkRequest
     from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox,
                                    QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -896,6 +1301,28 @@ def run_gui(install_id=None):
                                    QTabWidget, QVBoxLayout, QWidget)
 
     ROLE_GAME = Qt.UserRole + 1
+    ROLE_STATUS = Qt.UserRole + 2  # compatibility status, for the catalog filter
+
+    def badge_icon(pm, status, show):
+        """Poster cropped to the grid cell, with the compatibility status painted on it."""
+        pm = pm.scaled(150, 225, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        pm = pm.copy((pm.width() - 150) // 2, (pm.height() - 225) // 2, 150, 225)
+        if show:
+            label = STATUS_LABELS.get(status, status)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+            font = QFont()
+            font.setPointSize(8)
+            font.setBold(True)
+            p.setFont(font)
+            rect = QRect(6, 225 - 22 - 6, p.fontMetrics().horizontalAdvance(label) + 14, 22)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(STATUS_COLORS.get(status, STATUS_COLORS["untested"])))
+            p.drawRoundedRect(rect, 5, 5)
+            p.setPen(QColor("white"))
+            p.drawText(rect, Qt.AlignCenter, label)
+            p.end()
+        return QIcon(pm)
 
     class Images(QObject):
         """Async image loader with on-disk cache."""
@@ -1009,7 +1436,8 @@ def run_gui(install_id=None):
                     os.killpg(os.getpgid(p.pid), signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
                     pass
-            stop_wine(self.cfg)  # bring down any detached wine processes in the prefix
+            # bring down any detached wine processes in the game's prefix
+            stop_wine(self.cfg, game_prefix(self.cfg, self.game_dir))
             if p and p.poll() is None:
                 try:
                     os.killpg(os.getpgid(p.pid), signal.SIGKILL)
@@ -1019,15 +1447,18 @@ def run_gui(install_id=None):
     class FilterModel(QSortFilterProxyModel):
         def __init__(self):
             super().__init__()
-            self.text, self.genre = "", ""
+            self.text, self.genre, self.status = "", "", ""
 
         def filterAcceptsRow(self, row, parent):
-            g = self.sourceModel().index(row, 0, parent).data(ROLE_GAME)
+            idx = self.sourceModel().index(row, 0, parent)
+            g = idx.data(ROLE_GAME)
             if not g:
                 return False
             if self.text and self.text not in (g["title"] + " " + g.get("publisher", "")).lower():
                 return False
             if self.genre and self.genre not in (g.get("genres") or []):
+                return False
+            if self.status and idx.data(ROLE_STATUS) != self.status:
                 return False
             return True
 
@@ -1112,6 +1543,32 @@ def run_gui(install_id=None):
             })
             save_config(self.cfg)
 
+    class ReportDialog(QDialog):
+        """Asks how far a game got before a compatibility report is written."""
+        def __init__(self, parent, game, entry):
+            super().__init__(parent)
+            self.setWindowTitle(f"Compatibility report: {game.get('title', '')}")
+            form = QFormLayout(self)
+            self.status = QComboBox()
+            for s in COMPAT_STATUSES[1:]:
+                self.status.addItem(STATUS_LABELS[s], s)
+            if entry.get("status") in COMPAT_STATUSES[1:]:
+                self.status.setCurrentIndex(COMPAT_STATUSES[1:].index(entry["status"]))
+            form.addRow("How far does it get?", self.status)
+            self.notes = QPlainTextEdit()
+            self.notes.setPlaceholderText("What works, what breaks, workarounds…")
+            form.addRow("Notes", self.notes)
+            info = QLabel("The report (system and GPU info, the Wine build, this title's "
+                          "compatibility entry and the last 200 lines of its log with anything "
+                          "credential-like removed) is saved locally, and a prefilled GitHub "
+                          "issue opens in your browser so you can attach it.")
+            info.setWordWrap(True)
+            form.addRow(info)
+            bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            bb.accepted.connect(self.accept)
+            bb.rejected.connect(self.reject)
+            form.addRow(bb)
+
     class LogDialog(QDialog):
         def __init__(self, parent, title):
             super().__init__(parent)
@@ -1139,6 +1596,7 @@ def run_gui(install_id=None):
         def __init__(self):
             super().__init__()
             self.cfg = load_config()
+            self.compat = load_compat_db()
             self.images = Images()
             self.images.loaded.connect(self.on_image)
             self.catalog = []
@@ -1191,11 +1649,17 @@ def run_gui(install_id=None):
             self.search.textChanged.connect(self.apply_filter)
             self.genre = QComboBox()
             self.genre.currentTextChanged.connect(self.apply_filter)
+            self.status_filter = QComboBox()
+            self.status_filter.addItem("Any compatibility")
+            for s in COMPAT_STATUSES:
+                self.status_filter.addItem(STATUS_LABELS[s], s)
+            self.status_filter.currentIndexChanged.connect(self.apply_filter)
             refresh = QPushButton("Refresh")
             refresh.clicked.connect(lambda: self.load_catalog(force=True))
             self.count = QLabel()
             bar.addWidget(self.search, 1)
             bar.addWidget(self.genre)
+            bar.addWidget(self.status_filter)
             bar.addWidget(refresh)
             bar.addWidget(self.count)
             cl.addLayout(bar)
@@ -1238,6 +1702,7 @@ def run_gui(install_id=None):
             self.refresh_wine_btn()
             self.refresh_library()
             self.load_catalog()
+            self.refresh_compat()
 
         # ---------- details panel ----------
         def build_details(self):
@@ -1256,18 +1721,23 @@ def run_gui(install_id=None):
             self.d_desc.setAlignment(Qt.AlignTop)
             self.d_status = QLabel()
             self.d_status.setWordWrap(True)
+            self.d_compat = QLabel()
+            self.d_compat.setWordWrap(True)
             btns = QVBoxLayout()
             self.b_install = QPushButton("Install")
             self.b_play = QPushButton("▶  Play")
             self.b_steam = QPushButton("Add to Steam")
             self.b_folder = QPushButton("Open folder")
+            self.b_report = QPushButton("Compatibility report…")
             self.b_remove = QPushButton("Uninstall")
             self.b_install.clicked.connect(self.install_current)
             self.b_play.clicked.connect(self.play_current)
             self.b_steam.clicked.connect(self.steam_current)
             self.b_folder.clicked.connect(self.folder_current)
+            self.b_report.clicked.connect(self.report_current)
             self.b_remove.clicked.connect(self.remove_current)
-            for b in (self.b_play, self.b_install, self.b_steam, self.b_folder, self.b_remove):
+            for b in (self.b_play, self.b_install, self.b_steam, self.b_folder, self.b_report,
+                      self.b_remove):
                 b.setMinimumHeight(34)
                 btns.addWidget(b)
                 b.hide()
@@ -1279,6 +1749,7 @@ def run_gui(install_id=None):
             lay.addWidget(self.d_title)
             lay.addWidget(self.d_info)
             lay.addWidget(self.d_status)
+            lay.addWidget(self.d_compat)
             lay.addLayout(btns)
             lay.addWidget(desc_scroll, 1)
             return w
@@ -1316,7 +1787,9 @@ def run_gui(install_id=None):
             self.b_play.setVisible(status == "installed")
             self.b_steam.setVisible(status == "installed" and bool(g.get("id")))
             self.b_folder.setVisible(bool(inst))
+            self.b_report.setVisible(status == "installed")
             self.b_remove.setVisible(bool(inst) and not busy)
+            self.d_compat.setText(self.compat_text(g, inst))
             if busy:
                 self.d_status.setText("<i>Downloading – see the Downloads tab</i>")
             elif status == "installed":
@@ -1327,6 +1800,68 @@ def run_gui(install_id=None):
             else:
                 self.d_status.setText("")
 
+        def compat_text(self, game, inst):
+            """The compatibility line of the details panel."""
+            store_id = game.get("id") or (game_store_id(inst["dir"]) if inst else "")
+            entry = compat_entry(store_id, self.compat)
+            status = entry["status"]
+            parts = [f"Compatibility: <span style='color:{STATUS_COLORS[status]}'>●</span> "
+                     f"<b>{STATUS_LABELS[status]}</b>"]
+            if entry.get("notes"):
+                parts.append(html.escape(entry["notes"]))
+            t = entry.get("tested") or {}
+            if t.get("date"):
+                parts.append(f"<i>tested {html.escape(str(t['date']))} with WineGDK "
+                             f"{html.escape(str(t.get('winegdk') or '?'))}, launcher "
+                             f"{html.escape(str(t.get('launcher') or '?'))}</i>")
+            if status == "untested":
+                parts.append("<i>Not tested yet - play it and send a compatibility report.</i>")
+            if entry.get("_user"):
+                parts.append(f"<i>user override: {COMPAT_USER_DIR / (store_id + '.json')}</i>")
+            return "<br>".join(parts)
+
+        # ---------- compatibility database ----------
+        def refresh_compat(self):
+            """Fetch a newer titles.json in the background (at most once a day)."""
+            w = Worker(lambda _w: refresh_compat_db())
+            w.done.connect(self.compat_refreshed)
+            self.workers.append(w)
+            w.start()
+
+        def compat_refreshed(self, ok, err, fetched):
+            if ok and fetched:
+                self.compat = load_compat_db()
+                self.restyle_items()
+                self.update_buttons()
+
+        def restyle_items(self):
+            for model in (self.cat_model, self.lib_model):
+                for row in range(model.rowCount()):
+                    self.style_item(model.item(row))
+            self.cat_proxy.invalidateFilter()
+
+        def report_current(self):
+            inst = self.current_installed()
+            if not inst:
+                return
+            game = dict(self.current)
+            game["dir"] = inst["dir"]
+            game["id"] = inst.get("id") or game.get("id") or game_store_id(inst["dir"])
+            entry = compat_entry(game["id"], self.compat)
+            dlg = ReportDialog(self, game, entry)
+            if not dlg.exec():
+                return
+            try:
+                path = write_compat_report(self.cfg, game, entry, dlg.status.currentData(),
+                                           dlg.notes.toPlainText().strip())
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.warning(self, APP_NAME, f"Could not write the report:\n{e}")
+                return
+            QDesktopServices.openUrl(QUrl(report_issue_url(json.loads(path.read_text()), path)))
+            QMessageBox.information(self, APP_NAME,
+                                    f"Report saved to\n{path}\n\nA GitHub issue form opened in "
+                                    "your browser - attach the file there (or send it any other way).")
+
         # ---------- images ----------
         def on_image(self, url, pm):
             for model in (self.cat_model, self.lib_model):
@@ -1334,24 +1869,35 @@ def run_gui(install_id=None):
                     item = model.item(row)
                     g = item.data(ROLE_GAME)
                     if g and g.get("poster") == url:
-                        item.setIcon(QIcon(pm.scaled(150, 225, Qt.KeepAspectRatioByExpanding,
-                                                     Qt.SmoothTransformation)))
+                        self.style_item(item, pm)
             if self.current and url in (self.current.get("hero"), self.current.get("poster_big")):
                 self.set_hero(pm)
 
         def make_item(self, game, suffix=""):
             item = QStandardItem(game["title"] + suffix)
             item.setData(game, ROLE_GAME)
-            item.setToolTip(game["title"])
-            pm = self.images.get(game.get("poster"))
-            if pm:
-                item.setIcon(QIcon(pm.scaled(150, 225, Qt.KeepAspectRatioByExpanding,
-                                             Qt.SmoothTransformation)))
-            else:
-                ph = QPixmap(150, 225)
-                ph.fill(Qt.darkGray)
-                item.setIcon(QIcon(ph))
+            self.style_item(item)
             return item
+
+        def style_item(self, item, pm=None):
+            """Icon (poster plus compatibility badge), tooltip and status role of a grid item.
+            Catalog items only get a badge once the title has a known status; installed ones
+            always (an "Untested" badge is the nudge to send a report)."""
+            game = item.data(ROLE_GAME)
+            entry = compat_entry(game.get("id"), self.compat)
+            item.setData(entry["status"], ROLE_STATUS)
+            known = entry["status"] != "untested" or bool(game.get("dir"))
+            tip = game["title"]
+            if known:
+                tip += f"\nCompatibility: {STATUS_LABELS[entry['status']]}"
+                if entry.get("notes"):
+                    tip += "\n" + entry["notes"]
+            item.setToolTip(tip)
+            pm = pm or self.images.get(game.get("poster"))
+            if not pm:
+                pm = QPixmap(150, 225)
+                pm.fill(Qt.darkGray)
+            item.setIcon(badge_icon(pm, entry["status"], known))
 
         # ---------- catalog ----------
         def load_catalog(self, force=False):
@@ -1395,6 +1941,7 @@ def run_gui(install_id=None):
             self.cat_proxy.text = self.search.text().strip().lower()
             gtext = self.genre.currentText()
             self.cat_proxy.genre = "" if gtext in ("", "All genres") else gtext
+            self.cat_proxy.status = self.status_filter.currentData() or ""
             self.cat_proxy.invalidateFilter()
             self.count.setText(f"{self.cat_proxy.rowCount()} games")
 
