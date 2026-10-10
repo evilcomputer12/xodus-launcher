@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generated": "2026-10-10",
-  "updated": "2026-10-10",
+  "updated": "2026-10-11",
   "defaults": {
     "status": "untested",
     "runtime": {
@@ -79,6 +79,68 @@
       "notes": "No Store package: the Xbox app only installs a stub that hands the game to Ubisoft Connect, so xodus-cli reports 'no PC package'. Install Ubisoft Connect with the Set up Ubisoft Connect button on this title (or Settings > Third-party launchers), sign in, activate PC Game Pass at https://gamepass.ubisoft.com/ with the Microsoft account that holds the subscription, download the game inside Ubisoft Connect, then use Link installed game… (docs/launchers.md).",
       "launcher": "ubisoft-connect",
       "launcher_game_id": null
+    },
+    "9NQ51FFR2JWF": {
+      "title": "Battlefield 1 Revolution",
+      "status": "broken",
+      "notes": "EA Javelin anti-cheat (EAAntiCheat) refuses to start under Wine/Proton ('Wine, Proton, and Steam Deck are not supported', error E111000B), including single-player. Installs and launches from the EA app fine, then exits. Not playable on Linux.",
+      "tested": {
+        "date": "2026-10-11",
+        "launcher": "73b576f",
+        "winegdk": "n/a (EA app on Proton - Experimental)",
+        "gpu": "AMD Radeon RX 7600 XT (RADV, Mesa 26.2)",
+        "distro": "CachyOS"
+      },
+      "launcher": "ea-app",
+      "anticheat": {
+        "kind": "javelin",
+        "linux_module": false,
+        "bypass": null,
+        "online": "unsupported"
+      }
+    },
+    "BPL68T0XK96W": {
+      "title": "Battlefield 1 Revolution",
+      "status": "broken",
+      "notes": "EA Javelin anti-cheat (EAAntiCheat) refuses to start under Wine/Proton ('Wine, Proton, and Steam Deck are not supported', error E111000B), including single-player. Installs and launches from the EA app fine, then exits. Not playable on Linux.",
+      "tested": {
+        "date": "2026-10-11",
+        "launcher": "73b576f",
+        "winegdk": "n/a (EA app on Proton - Experimental)",
+        "gpu": "AMD Radeon RX 7600 XT (RADV, Mesa 26.2)",
+        "distro": "CachyOS"
+      },
+      "launcher": "ea-app",
+      "anticheat": {
+        "kind": "javelin",
+        "linux_module": false,
+        "bypass": null,
+        "online": "unsupported"
+      }
+    },
+    "9N8C8L9MVQ89": {
+      "title": "Battlefield 2042",
+      "status": "broken",
+      "launcher": "ea-app",
+      "notes": "Ships EA Javelin anti-cheat, which blocks Wine/Proton (same as Battlefield 1); not tested here.",
+      "anticheat": {
+        "kind": "javelin",
+        "linux_module": false,
+        "bypass": null,
+        "online": "unsupported"
+      }
+    },
+    "9PDH3TB5548T": {
+      "title": "Battlefield V",
+      "status": "broken",
+      "launcher": "ea-app",
+      "notes": "Ships EA Javelin anti-cheat, which blocks Wine/Proton (same as Battlefield 1); not tested here.",
+      "anticheat": {
+        "kind": "javelin",
+        "linux_module": false,
+        "bypass": null,
+        "online": "unsupported"
+      }
     }
   }
 }

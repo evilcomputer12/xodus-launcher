@@ -64,9 +64,10 @@ STEAM_INSTALL_URLS = {"eac": "steam://install/1826330", "battleye": "steam://ins
 ANTICHEAT_RUNTIME_DIRS = {"eac": "Proton EasyAntiCheat Runtime", "battleye": "Proton BattlEye Runtime"}
 ANTICHEAT_RUNTIME_MARKER = {"eac": "v2", "battleye": "v1"}  # the directory Proton's Wine looks into
 ANTICHEAT_ENV = {"eac": "PROTON_EAC_RUNTIME", "battleye": "PROTON_BATTLEYE_RUNTIME"}
-ANTICHEAT_KINDS = ("eac", "battleye", "ricochet", "vanguard", "none", "unknown")
+ANTICHEAT_KINDS = ("eac", "battleye", "javelin", "ricochet", "vanguard", "none", "unknown")
 ANTICHEAT_LABELS = {"eac": "Easy Anti-Cheat", "battleye": "BattlEye", "ricochet": "Ricochet (kernel driver)",
-                    "vanguard": "Riot Vanguard (kernel driver)", "none": "none", "unknown": "unknown"}
+                    "vanguard": "Riot Vanguard (kernel driver)", "javelin": "EA Javelin (EAAntiCheat)",
+                    "none": "none", "unknown": "unknown"}
 ONLINE_STATES = ("supported", "unsupported", "unknown")
 EAC_FILES = {"easyanticheat_x64.dll", "easyanticheat_x86.dll", "easyanticheat_launcher.exe",
              "easyanticheat_setup.exe", "easyanticheat_eos_setup.exe"}
@@ -2119,7 +2120,8 @@ def scan_anticheat_files(game_dir, max_depth=5):
     """What the game folder ships: EAC files, the EAC Linux module (easyanticheat_x64.so),
     BattlEye files, the EOS bootstrapper (start_protected_game.exe) and EasyAntiCheat/Settings.json."""
     root = Path(game_dir)
-    found = {"eac": False, "eac_linux": False, "battleye": False, "bootstrapper": None, "eac_settings": None}
+    found = {"eac": False, "eac_linux": False, "battleye": False, "javelin": False, "bootstrapper": None,
+             "eac_settings": None}
     if not root.is_dir():
         return found
     base = str(root)
@@ -2136,6 +2138,8 @@ def scan_anticheat_files(game_dir, max_depth=5):
                 found["eac_settings"] = Path(dirpath) / lower["settings.json"]
         if dname == "battleye":
             found["battleye"] = True
+        if "eaanticheat.gameservicelauncher.exe" in lower or "eaanticheat.cfg" in lower:
+            found["javelin"] = True  # EA Javelin: refuses Wine/Proton outright
         for lf, f in lower.items():
             if lf in EAC_FILES:
                 found["eac"] = True
@@ -2219,7 +2223,8 @@ def anticheat_for_game(game_dir, compat_entry=None, wine=None):
     scan = scan_anticheat_files(game_dir)
     kind = ac.get("kind") if ac.get("kind") in ANTICHEAT_KINDS else None
     if kind is None:
-        kind = "eac" if scan["eac"] else "battleye" if scan["battleye"] else "none"
+        kind = "eac" if scan["eac"] else "battleye" if scan["battleye"] else \
+            "javelin" if scan.get("javelin") else "none"
     db_online = ac.get("online") if ac.get("online") in ONLINE_STATES else None
     db_module = ac.get("linux_module") if isinstance(ac.get("linux_module"), bool) else None
     runtimes = anticheat_runtimes() if kind in ANTICHEAT_RUNTIME_DIRS else {}
@@ -2262,6 +2267,11 @@ def anticheat_for_game(game_dir, compat_entry=None, wine=None):
         if info["online"] != "supported":
             info["message"] += (f" Single-player starts {bypass} instead of the EAC bootstrapper." if bypass
                                 else " No single-player bypass is known.")
+    elif kind == "javelin":
+        info["online"] = "unsupported"
+        info["message"] = (f"{label} refuses to run under Wine/Proton (\"Wine, Proton, and Steam Deck are not "
+                           "supported\", error E111000B) and protects single-player too: this title cannot be played "
+                           "on Linux.")
     elif kind == "battleye":
         info["linux_module"] = bool(db_module)
         if db_module and usable:
