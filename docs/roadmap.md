@@ -9,11 +9,13 @@ open source end to end. We get there in milestones that each ship something usab
 - [x] Catalog, sign-in, download, library, Play, Steam shortcuts (PySide6 GUI)
 - [x] WineGDK build with all 24 GDK runtime classes present (15 still stubs)
 - [x] First confirmed title: Balatro
-- [ ] Real Xbox Live sign-in for games (`XUserGetTokenAndSignatureAsync` via xodus-service):
-      achievements, cloud saves, multiplayer
+- [x] Real Xbox Live sign-in for games (`XUserGetTokenAndSignatureAsync` via xodus-service):
+      real identity and signed tokens (verified with Balatro's achievements call)
+- [ ] Cloud save sync (XGameSave containers stay local for now)
 - [ ] `XStore` licence answers and `XPackage` package info so licence-checking games start
 - [ ] Per-game compatibility reports; a tested list of titles
-- [ ] One-click setup: build/download WineGDK from the launcher, no terminal needed
+- [x] One-click setup: the launcher downloads the prebuilt WineGDK release (source build optional)
+- [ ] Alt+F4 / close handling verified on KDE Wayland (force-close watchdog + Stop button shipped)
 - [ ] Packages: AUR, then Flatpak
 - [ ] Send the WineGDK and xodus changes upstream
 
