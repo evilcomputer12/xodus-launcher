@@ -778,9 +778,11 @@ def run_download(cfg, product_id, dest, on_progress, on_log, cancel_event):
     proc = PtyProcess(cmd, env=env)
     watcher = threading.Thread(target=lambda: (cancel_event.wait(), proc.kill()), daemon=True)
     watcher.start()
-    buf, errors, answered = "", [], False
+    buf, errors = "", []
+    recent, tried, awaiting = "", [], None  # the interactive sub-product prompt, see below
     for chunk in proc.chunks():
         buf += chunk
+        recent = (recent + strip_ansi(chunk))[-4000:]
         parts = re.split(r"[\r\n]", buf)
         buf = parts.pop()
         for raw in parts:
@@ -801,12 +803,32 @@ def run_download(cfg, product_id, dest, on_progress, on_log, cancel_event):
             if "error" in low or "panicked" in low or "not found" in low or "not enough" in low \
                     or "could not" in low or "failed" in low or "unexpected" in low:
                 errors.append(line)
-        # interactive "pick a sub-product" prompt: take the first entry
-        if not answered and "Select files to download" in strip_ansi(buf + chunk):
-            answered = True
-            on_log("(xodus asked to pick a sub-product - choosing the first one)")
-            proc.write("\r")
+        # xodus-cli asks "Select files to download" when the product has no PC package itself and
+        # lists the products that license it. Those are usually the Game Pass subscriptions (no
+        # package either) and the product itself (an endless loop), so try each other entry once
+        # by typing it into the filter, and give up with a clear message when none is left.
+        if awaiting and f"> Select files to download {awaiting}" in recent:
+            awaiting, recent = None, ""
+        if not awaiting and "Select files to download" in recent and "to filter]" in recent:
+            options = re.findall(r"(?m)^[>\s]*([0-9A-Z]{12})\s*$", recent)
+            choice = next((o for o in options if o != product_id and o not in tried), None)
+            if choice is None or len(tried) >= 4:
+                errors.append("This title has no PC package in the Store (it is probably delivered "
+                              "through a third-party launcher such as Ubisoft Connect), so xodus "
+                              "cannot download it.")
+                on_log(errors[-1])
+                proc.kill()
+                break
+            tried.append(choice)
+            awaiting = choice
+            on_log(f"(xodus asked to pick a sub-product - trying {choice})")
+            proc.write(choice + "\r")
     code = proc.wait()
+    if tried and any("displaycatalog" in e for e in errors):
+        # the entries xodus offered were subscriptions, not packages: say what that means
+        errors.insert(0, "This title has no PC package in the Store (it is probably delivered through "
+                         "a third-party launcher such as Ubisoft Connect), so xodus cannot download it.")
+        on_log(errors[0])
     cancelled = cancel_event.is_set()
     cancel_event.set()  # release the watcher thread
     if cancelled:
