@@ -1,0 +1,337 @@
+From 6a660221c859229b88107edd86658d0bcbaec5cb Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 07:53:34 +0200
+Subject: [PATCH 16/19] xgameruntime: Parse the game identity, visuals, StoreId
+ and install directory from MicrosoftGame.config.
+
+ObtainMsaAppId() now also keeps Identity@Name/@Publisher/@Version,
+ShellVisuals@DefaultDisplayName/@PublisherDisplayName and <StoreId>, and
+records the directory of the config it found as a Windows path (no trailing
+backslash) and as a unix path. They are exposed to the C and C++ sources as
+the gdk_* globals in private.h; a missing value leaves "" rather than NULL.
+
+gdk_package_identifier is the Windows package full name
+"<Name>_<Version>_x64__<publisher id>", the publisher id being the Crockford
+base32 form of the first 8 bytes of SHA-256 over the UTF-16LE Publisher
+string, as in package family names (a small embedded SHA-256 keeps bcrypt
+out of the import list). Balatro gives PlayStack.Balatro_1.0.5.0_x64__3wcqaesafpzfy.
+
+The options != NULL branch of ObtainMsaAppId always failed with
+E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT (broken if/else-if chain); it now parses
+the inline or file config and falls through like the search path.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/InitInternalGDKC.cpp         | 214 +++++++++++++++++-
+ dlls/xgameruntime/private.h                   |  25 ++
+ 2 files changed, 232 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
+index 90b095e..81199b9 100644
+--- a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
++++ b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
+@@ -28,6 +28,7 @@
+ #include <ntstatus.h>
+ #include <shlwapi.h>
+ 
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+@@ -42,6 +43,18 @@ LPCSTR msaAppId;
+ UINT32 titleId;
+ BOOLEAN fullTrust;
+ 
++/* MicrosoftGame.config values (see private.h); "" until ObtainMsaAppId() has parsed them. */
++static const WCHAR empty_w[] = { 0 };
++const char *gdk_identity_name = "";
++const char *gdk_identity_publisher = "";
++const char *gdk_identity_version = "";
++const char *gdk_display_name = "";
++const char *gdk_publisher_display_name = "";
++const char *gdk_store_id = "";
++const char *gdk_package_identifier = "";
++const WCHAR *gdk_install_dir_w = empty_w;
++const char *gdk_install_dir = "";
++
+ static std::mutex g_service_lock;
+ static bool g_service_attempted = false;
+ static HRESULT g_service_status = HRESULT_FROM_WIN32( ERROR_NOT_CONNECTED );
+@@ -137,6 +150,167 @@ InitializeXodusService()
+ }
+ #endif
+ 
++/*
++ * SHA-256 (FIPS 180-4) for the publisher id of the package identifier. Small enough to embed, which keeps
++ * bcrypt out of the import list.
++ */
++static const UINT32 sha256_k[64] =
++{
++    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++};
++
++#define SHA256_ROTR( x, n ) ( ( (x) >> (n) ) | ( (x) << ( 32 - (n) ) ) )
++
++static void
++Sha256Transform( UINT32 state[8], const UINT8 block[64] )
++{
++    UINT32 w[64], a, b, c, d, e, f, g, h, t1, t2;
++    int i;
++
++    for ( i = 0; i < 16; i++ )
++        w[i] = ( (UINT32)block[4 * i] << 24 ) | ( (UINT32)block[4 * i + 1] << 16 ) | ( (UINT32)block[4 * i + 2] << 8 ) | block[4 * i + 3];
++    for ( ; i < 64; i++ )
++    {
++        UINT32 s0 = SHA256_ROTR( w[i - 15], 7 ) ^ SHA256_ROTR( w[i - 15], 18 ) ^ ( w[i - 15] >> 3 );
++        UINT32 s1 = SHA256_ROTR( w[i - 2], 17 ) ^ SHA256_ROTR( w[i - 2], 19 ) ^ ( w[i - 2] >> 10 );
++        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++    }
++
++    a = state[0]; b = state[1]; c = state[2]; d = state[3];
++    e = state[4]; f = state[5]; g = state[6]; h = state[7];
++
++    for ( i = 0; i < 64; i++ )
++    {
++        t1 = h + ( SHA256_ROTR( e, 6 ) ^ SHA256_ROTR( e, 11 ) ^ SHA256_ROTR( e, 25 ) ) + ( ( e & f ) ^ ( ~e & g ) ) + sha256_k[i] + w[i];
++        t2 = ( SHA256_ROTR( a, 2 ) ^ SHA256_ROTR( a, 13 ) ^ SHA256_ROTR( a, 22 ) ) + ( ( a & b ) ^ ( a & c ) ^ ( b & c ) );
++        h = g; g = f; f = e; e = d + t1;
++        d = c; c = b; b = a; a = t1 + t2;
++    }
++
++    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
++    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
++}
++
++static void
++Sha256( const UINT8 *data, SIZE_T len, UINT8 digest[32] )
++{
++    UINT32 state[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
++    UINT64 bits = (UINT64)len * 8;
++    UINT8 block[64];
++    SIZE_T done, rem;
++    int i;
++
++    for ( done = 0; done + 64 <= len; done += 64 ) Sha256Transform( state, data + done );
++    rem = len - done;
++    memcpy( block, data + done, rem );
++    block[rem++] = 0x80;
++    if ( rem > 56 )
++    {
++        memset( block + rem, 0, 64 - rem );
++        Sha256Transform( state, block );
++        rem = 0;
++    }
++    memset( block + rem, 0, 56 - rem );
++    for ( i = 0; i < 8; i++ ) block[56 + i] = (UINT8)( bits >> ( 56 - 8 * i ) );
++    Sha256Transform( state, block );
++
++    for ( i = 0; i < 8; i++ )
++    {
++        digest[4 * i] = (UINT8)( state[i] >> 24 );
++        digest[4 * i + 1] = (UINT8)( state[i] >> 16 );
++        digest[4 * i + 2] = (UINT8)( state[i] >> 8 );
++        digest[4 * i + 3] = (UINT8)state[i];
++    }
++}
++
++/*
++ * Publisher id of a Windows package family name: the first 8 bytes of SHA-256 over the UTF-16LE Publisher
++ * string (no BOM, no terminator), read big-endian, padded with one zero bit and written as 13 Crockford
++ * base32 digits (lowercase, no i/l/o/u). "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond,
++ * S=Washington, C=US" gives the well-known 8wekyb3d8bbwe.
++ */
++static BOOL
++ComputePublisherId( const char *publisher, char out[14] )
++{
++    static const char alphabet[] = "0123456789abcdefghjkmnpqrstvwxyz";
++    UINT8 digest[32];
++    UINT64 v = 0;
++    WCHAR *w;
++    int i, n;
++
++    n = MultiByteToWideChar( CP_UTF8, 0, publisher, -1, NULL, 0 ); /* counts the terminator */
++    if ( n <= 1 || !( w = (WCHAR *)malloc( n * sizeof(WCHAR) ) ) ) return FALSE;
++    MultiByteToWideChar( CP_UTF8, 0, publisher, -1, w, n );
++    Sha256( (const UINT8 *)w, ( n - 1 ) * sizeof(WCHAR), digest );
++    free( w );
++
++    for ( i = 0; i < 8; i++ ) v = ( v << 8 ) | digest[i];
++    for ( i = 0; i < 12; i++ ) out[i] = alphabet[( v >> ( 59 - 5 * i ) ) & 31];
++    out[12] = alphabet[( v & 15 ) << 1];
++    out[13] = 0;
++    return TRUE;
++}
++
++/* gdk_package_identifier = "<Name>_<Version>_x64__<publisher id>", the Windows package full name (x64 is the only PC GDK architecture). */
++static void
++ComputePackageIdentifier()
++{
++    char publisherId[14], *identifier;
++    size_t size;
++
++    if ( !*gdk_identity_name || !*gdk_identity_version || !*gdk_identity_publisher )
++    {
++        WARN( "incomplete <Identity> element, the package identifier stays empty.\n" );
++        return;
++    }
++    if ( !ComputePublisherId( gdk_identity_publisher, publisherId ) ) return;
++
++    size = strlen( gdk_identity_name ) + strlen( gdk_identity_version ) + strlen( publisherId ) + sizeof("__x64__");
++    if ( !( identifier = (char *)malloc( size ) ) ) return;
++    snprintf( identifier, size, "%s_%s_x64__%s", gdk_identity_name, gdk_identity_version, publisherId );
++    gdk_package_identifier = identifier;
++}
++
++/*
++ * The install directory is the directory of the game config, kept as a Windows path without trailing
++ * backslash (a bare drive root keeps it) and as a unix path. Both strings live for the rest of the process.
++ */
++static void
++SetInstallDirectory( const char *configPath )
++{
++    CHAR dir[MAX_PATH], *last;
++    WCHAR *dirW;
++    char *unixPath;
++    int len;
++
++    lstrcpynA( dir, configPath, MAX_PATH );
++    if ( !( last = strrchr( dir, '\\' ) ) ) return;
++    if ( last == dir + 2 && dir[1] == ':' ) last++;
++    *last = 0;
++
++    len = MultiByteToWideChar( CP_ACP, 0, dir, -1, NULL, 0 );
++    if ( len <= 0 || !( dirW = (WCHAR *)malloc( len * sizeof(WCHAR) ) ) ) return;
++    MultiByteToWideChar( CP_ACP, 0, dir, -1, dirW, len );
++    gdk_install_dir_w = dirW;
++
++    if ( ( unixPath = wine_get_unix_file_name( dirW ) ) ) gdk_install_dir = unixPath;
++    else WARN( "no unix path for %s.\n", debugstr_w( dirW ) );
++}
++
++/* Keeps a libxml2 string for the rest of the process (like msaAppId); a missing attribute leaves the default "". */
++static void
++KeepConfigString( const char **target, xmlChar *value )
++{
++    if ( value ) *target = (const char *)value;
++}
++
+ static HRESULT WINAPI
+ ObtainMsaAppId( INITIALIZE_OPTIONS *options )
+ {
+@@ -151,15 +325,20 @@ ObtainMsaAppId( INITIALIZE_OPTIONS *options )
+ 
+     if ( options )
+     {
+-        if ( options->isInlineConfig && !( config = xmlReadMemory( options->gameConfig, strlen( options->gameConfig ), NULL, NULL, 0 ) ) )
+-            return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
+-        else if ( !( config = xmlReadFile( options->gameConfig, NULL, 0 ) ) )
+-            return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT; 
+-        else 
++        if ( !options->gameConfig ) return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
++        if ( options->isInlineConfig )
++        {
++            config = xmlReadMemory( options->gameConfig, strlen( options->gameConfig ), NULL, NULL, 0 );
++            /* An inline config has no directory of its own: the EXE directory stands in for the install directory. */
++            if ( GetModuleFileNameA( NULL, filename, MAX_PATH ) ) SetInstallDirectory( filename );
++        }
++        else
+         {
+-            hr = E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
+-            goto _CLEANUP;
++            DWORD len = GetFullPathNameA( options->gameConfig, MAX_PATH, filename, NULL );
++            config = xmlReadFile( options->gameConfig, NULL, 0 );
++            if ( len && len < MAX_PATH ) SetInstallDirectory( filename );
+         }
++        if ( !config ) return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
+     } 
+     else 
+     {
+@@ -175,6 +354,7 @@ ObtainMsaAppId( INITIALIZE_OPTIONS *options )
+             if (!strrchr( filename, '\\' )) return E_GAME_MISSING_GAME_CONFIG;
+         }
+         if ( !( config = xmlReadFile( filename, NULL, 0 ) ) ) return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
++        SetInstallDirectory( filename );
+     }
+ 
+     if ( !( root = xmlDocGetRootElement( config ) ) ) 
+@@ -202,7 +382,22 @@ ObtainMsaAppId( INITIALIZE_OPTIONS *options )
+                     fullTrust = !strcmp( value, "true" );
+                     free( value );
+                 }
++                else if ( !strcmp( (LPSTR)child->name, "Identity" ) )
++                {
++                    KeepConfigString( &gdk_identity_name, xmlGetProp( child, BAD_CAST "Name" ) );
++                    KeepConfigString( &gdk_identity_publisher, xmlGetProp( child, BAD_CAST "Publisher" ) );
++                    KeepConfigString( &gdk_identity_version, xmlGetProp( child, BAD_CAST "Version" ) );
++                }
++                else if ( !strcmp( (LPSTR)child->name, "ShellVisuals" ) )
++                {
++                    KeepConfigString( &gdk_display_name, xmlGetProp( child, BAD_CAST "DefaultDisplayName" ) );
++                    KeepConfigString( &gdk_publisher_display_name, xmlGetProp( child, BAD_CAST "PublisherDisplayName" ) );
++                }
++                else if ( !strcmp( (LPSTR)child->name, "StoreId" ) )
++                    KeepConfigString( &gdk_store_id, xmlNodeGetContent( child ) );
+             }
++
++        ComputePackageIdentifier();
+     }
+ 
+ _CLEANUP:
+@@ -227,6 +422,11 @@ InitializeGDKComponent( INITIALIZE_OPTIONS *options )
+     hr = ObtainMsaAppId( options );
+     if ( FAILED( hr ) ) return hr;
+     TRACE("got msaAppId %s\n", debugstr_a(msaAppId));
++    TRACE( "identity %s %s %s, display name %s, publisher %s, store id %s.\n", debugstr_a( gdk_identity_name ),
++           debugstr_a( gdk_identity_version ), debugstr_a( gdk_identity_publisher ), debugstr_a( gdk_display_name ),
++           debugstr_a( gdk_publisher_display_name ), debugstr_a( gdk_store_id ) );
++    TRACE( "package identifier %s, install directory %s (%s).\n", debugstr_a( gdk_package_identifier ),
++           debugstr_w( gdk_install_dir_w ), debugstr_a( gdk_install_dir ) );
+ 
+     return hr;
+ }
+diff --git a/dlls/xgameruntime/private.h b/dlls/xgameruntime/private.h
+index ee71eae..904d072 100644
+--- a/dlls/xgameruntime/private.h
++++ b/dlls/xgameruntime/private.h
+@@ -192,6 +192,31 @@ extern LPCSTR msaAppId;
+ extern UINT32 titleId;
+ extern BOOLEAN fullTrust;
+ 
++/*
++ * MicrosoftGame.config values, parsed once by InitializeGDKComponent() (GDKComponent/InitInternalGDKC.cpp).
++ * UTF-8 strings with process lifetime, never NULL: a missing element or attribute leaves "".
++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern const char *gdk_identity_name;           /* Identity@Name,      e.g. "PlayStack.Balatro" */
++extern const char *gdk_identity_publisher;      /* Identity@Publisher, e.g. "CN=8463DB6A-2934-499D-BE26-74ACA510B66F" */
++extern const char *gdk_identity_version;        /* Identity@Version,   e.g. "1.0.5.0" */
++extern const char *gdk_display_name;            /* ShellVisuals@DefaultDisplayName */
++extern const char *gdk_publisher_display_name;  /* ShellVisuals@PublisherDisplayName */
++extern const char *gdk_store_id;                /* <StoreId>, e.g. "9PK087LNGJC5" */
++/*
++ * Windows package full name "<Name>_<Version>_x64__<publisher id>", e.g. "PlayStack.Balatro_1.0.5.0_x64__3wcqaesafpzfy".
++ * The publisher id is the 13-character Crockford base32 form of the first 8 bytes of SHA-256(UTF-16LE Publisher),
++ * as in Windows package family names. "" when the <Identity> element is incomplete.
++ */
++extern const char *gdk_package_identifier;
++extern const WCHAR *gdk_install_dir_w;          /* directory of MicrosoftGame.config as a Windows path, no trailing backslash */
++extern const char *gdk_install_dir;             /* the same directory as a unix path, "" when it could not be resolved */
++#ifdef __cplusplus
++}
++#endif
++
+ typedef HRESULT (WINAPI *async_operation_callback)( IUnknown *invoker, PVOID param, PROPVARIANT *result );
+ 
+ // Deference is for other modules to communicate with eachother through the same binary.
+-- 
+2.56.0
+

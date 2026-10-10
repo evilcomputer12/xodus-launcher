@@ -1,7 +1,7 @@
 From b354f355ba53967ef759056505a050746e23e070 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 02:33:42 +0200
-Subject: [PATCH 10/12] xgameruntime: Discard the late reply of a timed-out
+Subject: [PATCH 10/19] xgameruntime: Discard the late reply of a timed-out
  xodus request.
 
 The service answers strictly in order and replies carry no correlation

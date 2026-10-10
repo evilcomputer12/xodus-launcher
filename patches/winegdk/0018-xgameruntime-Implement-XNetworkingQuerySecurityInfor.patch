@@ -1,0 +1,262 @@
+From 71e8d7b95f65d002d309739895832d71e95aa6cd Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 07:53:34 +0200
+Subject: [PATCH 18/19] xgameruntime: Implement
+ XNetworkingQuerySecurityInformationForUrl[Utf16]Async.
+
+Both variants complete from a worker thread (the AsyncJob pattern of
+XUser.cpp, each with its own identity) with an XNetworkingSecurityInformation
+that asks for nothing extra: TLS 1.2 and 1.3 as the WinHTTP secure-protocol
+flags and no certificate thumbprints. ResultSize reports sizeof the struct,
+Result writes it into the caller's buffer and points *securityInformation at
+it. URLs are traced without their query string.
+
+Space Marine 2 issued 14 of these queries from its HTTP workers and never got
+to ResultSize/Result because the stubs returned E_NOTIMPL.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/System/XNetworking.cpp       | 190 ++++++++++++++++--
+ 1 file changed, 177 insertions(+), 13 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/System/XNetworking.cpp b/dlls/xgameruntime/GDKComponent/System/XNetworking.cpp
+index 30d159c..b5ae182 100644
+--- a/dlls/xgameruntime/GDKComponent/System/XNetworking.cpp
++++ b/dlls/xgameruntime/GDKComponent/System/XNetworking.cpp
+@@ -21,11 +21,167 @@
+ 
+ #include "../../private.h"
+ 
++#include <winhttp.h>
++
+ #include <cstring>
+ #include <atomic>
++#include <functional>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
++/*
++ * Async helper (same pattern as XUser.cpp and XGameSave.cpp): work runs on its own thread and completes the
++ * XAsyncBlock afterwards; the result is packed into the caller's buffer from XAsyncOp::GetResult. Completing
++ * from inside Begin would call the game's completion routine before XNetworking*Async returned.
++ */
++struct NetAsyncJob
++{
++    std::function<HRESULT(NetAsyncJob *)> work;   /* worker thread; on success sets resultSize */
++    std::function<void(void *buffer)> fill;       /* caller's thread, inside GetResult */
++    SIZE_T resultSize = 0;
++    XAsyncBlock *async = nullptr;                 /* engine-side block from Begin */
++};
++
++static DWORD WINAPI NetAsyncJobThread( void *param )
++{
++    NetAsyncJob *job = (NetAsyncJob *)param;
++    IXThreadingImpl *xthreading;
++    HRESULT hr = job->work ? job->work( job ) : S_OK;
++    XAsyncBlock *async = job->async;
++    SIZE_T size = SUCCEEDED( hr ) ? job->resultSize : 0;
++
++    if ( SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) )
++    {
++        xthreading->XAsyncComplete( async, hr, size ); /* may run Cleanup and delete job */
++        xthreading->Release();
++    }
++    return 0;
++}
++
++static HRESULT WINAPI NetAsyncJobProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    NetAsyncJob *job = (NetAsyncJob *)data->context;
++
++    switch (op)
++    {
++        case XAsyncOp::Begin:
++        {
++            job->async = data->async;
++            HANDLE thread = CreateThread( nullptr, 0, NetAsyncJobThread, job, 0, nullptr );
++            if ( !thread ) return HRESULT_FROM_WIN32( GetLastError() );
++            CloseHandle( thread );
++            return S_OK;
++        }
++        case XAsyncOp::GetResult:
++            if ( job->fill ) job->fill( data->buffer );
++            return S_OK;
++        case XAsyncOp::Cleanup:
++            delete job;
++            return S_OK;
++        default:
++            return S_OK;
++    }
++}
++
++static HRESULT BeginNetAsyncJob( XAsyncBlock *async, const void *identity, const char *name, NetAsyncJob *job )
++{
++    IXThreadingImpl *xthreading;
++    HRESULT hr;
++
++    if ( !async ) { delete job; return E_POINTER; }
++    if ( FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) ) { delete job; return hr; }
++    hr = xthreading->XAsyncBegin( async, job, identity, name, NetAsyncJobProvider );
++    xthreading->Release();
++    if ( FAILED( hr ) ) delete job; /* only then did the provider never see the job */
++    return hr;
++}
++
++static HRESULT GetNetAsyncJobResultSize( XAsyncBlock *async, SIZE_T *size )
++{
++    IXThreadingImpl *xthreading;
++    HRESULT hr;
++
++    if ( !async || !size ) return E_POINTER;
++    if ( FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) ) return hr;
++    hr = xthreading->XAsyncGetResultSize( async, size );
++    xthreading->Release();
++    return hr;
++}
++
++static HRESULT GetNetAsyncJobResult( XAsyncBlock *async, const void *identity, SIZE_T size, void *buffer, SIZE_T *used )
++{
++    IXThreadingImpl *xthreading;
++    HRESULT hr;
++
++    if ( !async ) return E_POINTER;
++    if ( FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&xthreading ) ) ) return hr;
++    hr = xthreading->XAsyncGetResult( async, identity, size, buffer, used );
++    xthreading->Release();
++    return hr;
++}
++
++/*
++ * XNetworkingQuerySecurityInformationForUrl[Utf16]Async: the security requirements for talking to a URL.
++ * Nothing extra is required here: no pinned certificate thumbprints, and the TLS versions a current server
++ * accepts (the flags are the WINHTTP_OPTION_SECURE_PROTOCOLS bitmask the game hands on to WinHTTP). The
++ * result is the bare XNetworkingSecurityInformation; thumbprints would follow it inside the caller's buffer,
++ * with thumbprints/thumbprintBuffer pointing into that buffer.
++ *
++ * The UTF-8 and UTF-16 variants each have their own identity: XAsyncGetResult compares the pointer with the
++ * one given to XAsyncBegin, and a game may run both kinds on different blocks at the same time.
++ */
++static const char SecurityInfoIdentity[] = "XNetworkingQuerySecurityInformationForUrlAsync";
++static const char SecurityInfoUtf16Identity[] = "XNetworkingQuerySecurityInformationForUrlUtf16Async";
++
++static HRESULT QuerySecurityInformation( XAsyncBlock *asyncBlock, const void *identity, const char *name )
++{
++    NetAsyncJob *job = new NetAsyncJob;
++
++    job->work = []( NetAsyncJob *j ) -> HRESULT
++    {
++        j->resultSize = sizeof(XNetworkingSecurityInformation);
++        return S_OK;
++    };
++    job->fill = []( void *buffer )
++    {
++        XNetworkingSecurityInformation *info = static_cast<XNetworkingSecurityInformation *>( buffer );
++        info->enabledHttpSecurityProtocolFlags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
++        info->thumbprintCount = 0;
++        info->thumbprints = nullptr;
++    };
++    return BeginNetAsyncJob( asyncBlock, identity, name, job );
++}
++
++static HRESULT GetSecurityInformationResult( XAsyncBlock *asyncBlock, const void *identity, SIZE_T byteCount, SIZE_T *byteCountUsed,
++                                             UINT8 *buffer, XNetworkingSecurityInformation **securityInformation )
++{
++    HRESULT hr;
++
++    if ( !buffer || !securityInformation ) return E_POINTER;
++    hr = GetNetAsyncJobResult( asyncBlock, identity, byteCount, buffer, byteCountUsed );
++    *securityInformation = SUCCEEDED( hr ) ? reinterpret_cast<XNetworkingSecurityInformation *>( buffer ) : nullptr;
++    return hr;
++}
++
++/* Query strings may carry credentials (SAS signatures and the like): only the part before '?' is logged. */
++static const char *debugstr_url( const char *url )
++{
++    const char *query;
++
++    if ( !url ) return debugstr_a( url );
++    query = strchr( url, '?' );
++    return debugstr_an( url, query ? (int)( query - url ) : -1 );
++}
++
++static const char *debugstr_url( const WCHAR *url )
++{
++    const WCHAR *query;
++
++    if ( !url ) return debugstr_w( url );
++    query = wcschr( url, '?' );
++    return debugstr_wn( url, query ? (int)( query - url ) : -1 );
++}
++
+ class XNetworkingImpl : 
+     public IXNetworkingImpl
+ {
+@@ -108,38 +264,46 @@ public:
+ 
+     HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlAsync( LPCSTR url, XAsyncBlock *asyncBlock ) override
+     {
+-        FIXME( "url %p, asyncBlock %p stub!\n", url, asyncBlock );
+-        return E_NOTIMPL;
++        TRACE( "url %s, asyncBlock %p.\n", debugstr_url( url ), asyncBlock );
++
++        if ( !url || !asyncBlock ) return E_POINTER;
++        return QuerySecurityInformation( asyncBlock, SecurityInfoIdentity, "XNetworkingQuerySecurityInformationForUrlAsync" );
+     }
+ 
+     HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlAsyncResultSize( XAsyncBlock *asyncBlock, SIZE_T *securityInformationBufferByteCount ) override
+     {
+-        FIXME( "asyncBlock %p, securityInformationBufferByteCount %p stub!\n", asyncBlock, securityInformationBufferByteCount );
+-        return E_NOTIMPL;
++        TRACE( "asyncBlock %p, securityInformationBufferByteCount %p.\n", asyncBlock, securityInformationBufferByteCount );
++        return GetNetAsyncJobResultSize( asyncBlock, securityInformationBufferByteCount );
+     }
+ 
+     HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlAsyncResult( XAsyncBlock *asyncBlock, SIZE_T securityInformationBufferByteCount, SIZE_T *securityInformationBufferByteCountUsed, UINT8 *securityInformationBuffer, XNetworkingSecurityInformation **securityInformation ) override
+     {
+-        FIXME( "asyncBlock %p, securityInformationBufferByteCount %lld, securityInformationBufferByteCountUsed %p, securityInformationBuffer %p, securityInformation %p stub!\n", asyncBlock, securityInformationBufferByteCount, securityInformationBufferByteCountUsed, securityInformationBuffer, securityInformation );
+-        return E_NOTIMPL;
++        TRACE( "asyncBlock %p, securityInformationBufferByteCount %Iu, securityInformationBufferByteCountUsed %p, securityInformationBuffer %p, securityInformation %p.\n",
++               asyncBlock, securityInformationBufferByteCount, securityInformationBufferByteCountUsed, securityInformationBuffer, securityInformation );
++        return GetSecurityInformationResult( asyncBlock, SecurityInfoIdentity, securityInformationBufferByteCount, securityInformationBufferByteCountUsed,
++                                             securityInformationBuffer, securityInformation );
+     }
+ 
+     HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlUtf16Async( LPCWSTR url, XAsyncBlock *asyncBlock ) override
+     {
+-        FIXME( "url %p, asyncBlock %p stub!\n", url, asyncBlock );
+-        return E_NOTIMPL;
++        TRACE( "url %s, asyncBlock %p.\n", debugstr_url( url ), asyncBlock );
++
++        if ( !url || !asyncBlock ) return E_POINTER;
++        return QuerySecurityInformation( asyncBlock, SecurityInfoUtf16Identity, "XNetworkingQuerySecurityInformationForUrlUtf16Async" );
+     }
+ 
+     HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize( XAsyncBlock *asyncBlock, SIZE_T *securityInformationBufferByteCount ) override
+     {
+-        FIXME( "asyncBlock %p, securityInformationBufferByteCount %p stub!\n", asyncBlock, securityInformationBufferByteCount );
+-        return E_NOTIMPL;
++        TRACE( "asyncBlock %p, securityInformationBufferByteCount %p.\n", asyncBlock, securityInformationBufferByteCount );
++        return GetNetAsyncJobResultSize( asyncBlock, securityInformationBufferByteCount );
+     }
+ 
+     HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult( XAsyncBlock *asyncBlock, SIZE_T securityInformationBufferByteCount, SIZE_T *securityInformationBufferByteCountUsed, UINT8 *securityInformationBuffer, XNetworkingSecurityInformation **securityInformation ) override
+     {
+-        TRACE( "asyncBlock %p, securityInformationBufferByteCount %lld, securityInformationBufferByteCountUsed %p, securityInformationBuffer %p, securityInformation %p stub!\n", asyncBlock, securityInformationBufferByteCount, securityInformationBufferByteCountUsed, securityInformationBuffer, securityInformation );
+-        return E_NOTIMPL;
++        TRACE( "asyncBlock %p, securityInformationBufferByteCount %Iu, securityInformationBufferByteCountUsed %p, securityInformationBuffer %p, securityInformation %p.\n",
++               asyncBlock, securityInformationBufferByteCount, securityInformationBufferByteCountUsed, securityInformationBuffer, securityInformation );
++        return GetSecurityInformationResult( asyncBlock, SecurityInfoUtf16Identity, securityInformationBufferByteCount, securityInformationBufferByteCountUsed,
++                                             securityInformationBuffer, securityInformation );
+     }
+ 
+     HRESULT WINAPI XNetworkingVerifyServerCertificate( PVOID requestHandle, const XNetworkingSecurityInformation *securityInformation ) override
+@@ -188,4 +352,4 @@ private:
+ 
+ static XNetworkingImpl g_x_networking;
+ 
+-IXNetworkingImpl *x_networking = static_cast<IXNetworkingImpl*>(&g_x_networking);
+\ No newline at end of file
++IXNetworkingImpl *x_networking = static_cast<IXNetworkingImpl*>(&g_x_networking);
+-- 
+2.56.0
+

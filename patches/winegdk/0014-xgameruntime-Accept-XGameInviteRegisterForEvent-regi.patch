@@ -1,0 +1,53 @@
+From bfaf6c2a9ba86a2ff76e083f3ebf80838d2d0cc8 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 07:45:43 +0200
+Subject: [PATCH 14/19] xgameruntime: Accept XGameInviteRegisterForEvent
+ registrations.
+
+Return S_OK with a non-zero token instead of E_NOTIMPL. Game invites never
+reach this runtime, so the callback is never invoked; the registration
+only has to succeed. Space Marine 2 registers at start-up and unregisters
+at shutdown with wait = 0, which keeps returning TRUE.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/Ported/xgameinvite.c           | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/Ported/xgameinvite.c b/dlls/xgameruntime/GDKComponent/Ported/xgameinvite.c
+index 0d26642..76b1482 100644
+--- a/dlls/xgameruntime/GDKComponent/Ported/xgameinvite.c
++++ b/dlls/xgameruntime/GDKComponent/Ported/xgameinvite.c
+@@ -70,15 +70,26 @@ static ULONG WINAPI x_game_invite_Release( IXGameInviteImpl2 *iface )
+     return ref;
+ }
+ 
++/* Registration tokens handed out by XGameInviteRegisterForEvent; never zero. */
++static LONG x_game_invite_next_token;
++
+ static HRESULT WINAPI x_game_invite_XGameInviteRegisterForEvent( IXGameInviteImpl2 *iface, XTaskQueueHandle queue, void *context, XGameInviteEventCallback *callback, XTaskQueueRegistrationToken *token )
+ {
+-    FIXME( "iface %p, queue %p, context %p, callback %p, token %p stub!\n", iface, queue, context, callback, token );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
++
++    if (!callback) return E_INVALIDARG;
++    if (!token) return E_POINTER;
++
++    /* Game invites never reach this runtime (no Xbox Live multiplayer), so the callback is never invoked;
++     * the registration only has to succeed so that titles continue their start-up. */
++    token->token = InterlockedIncrement( &x_game_invite_next_token );
++    return S_OK;
+ }
+ 
+ static BOOLEAN WINAPI x_game_invite_XGameInviteUnregisterForEvent( IXGameInviteImpl2 *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
+ {
+-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
++    /* Nothing was ever queued for the token (unknown tokens included), so there is nothing to wait for. */
++    TRACE( "iface %p, token %I64u, wait %d.\n", iface, token.token, wait );
+     return TRUE;
+ }
+ 
+-- 
+2.56.0
+

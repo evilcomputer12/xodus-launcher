@@ -1,0 +1,163 @@
+From 2da199ed880a267a6b9352506ca6cb1f2bb9e18a Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 08:19:33 +0200
+Subject: [PATCH 19/19] xgameruntime: Hand games a package identifier that fits
+ XPACKAGE_IDENTIFIER_MAX_LENGTH.
+
+The GDK caps package identifiers at XPACKAGE_IDENTIFIER_MAX_LENGTH (33 bytes
+with the terminator) and documents them as opaque: titles size their buffers
+with that constant, and XStorePackageUpdate stores one in a char[33]. The
+Windows package full name published as gdk_package_identifier was 44 bytes
+for Balatro and 57 for Space Marine 2, so the documented
+XPackageGetCurrentProcessPackageIdentifier call pattern always failed with
+E_NOT_SUFFICIENT_BUFFER while XPackageIsPackagedProcess reported TRUE, and
+copying XPackageDetails.packageIdentifier into a contract-sized buffer
+overflowed it.
+
+The full name stays in the new gdk_package_full_name; gdk_package_identifier
+is now the first 16 bytes of SHA-256 over it as 32 lowercase hex digits, the
+longest string the contract allows and stable across runs for log matching
+(Balatro: 0c148f8272f0ade90980d9c5a990a1a6). All XPackage paths read the one
+global, so XPackageGetCurrentProcessPackageIdentifier, the enumeration
+callback and the XPackageMountWithUiAsync comparison follow. xpackage.idl
+gains the XPACKAGE_IDENTIFIER_MAX_LENGTH constant and a static_assert keeps
+the identifier within it.
+
+This deviates from the "<Name>_<Version>_x64__<publisherId>" wording of the
+implementation brief, which the GDK documentation contradicts.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../GDKComponent/InitInternalGDKC.cpp         | 40 ++++++++++++++++---
+ .../GDKComponent/Ported/xpackage.c            |  5 ++-
+ dlls/xgameruntime/private.h                   |  7 ++++
+ include/xpackage.idl                          |  3 ++
+ 4 files changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
+index 81199b9..5be47b1 100644
+--- a/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
++++ b/dlls/xgameruntime/GDKComponent/InitInternalGDKC.cpp
+@@ -51,6 +51,7 @@ const char *gdk_identity_version = "";
+ const char *gdk_display_name = "";
+ const char *gdk_publisher_display_name = "";
+ const char *gdk_store_id = "";
++const char *gdk_package_full_name = "";
+ const char *gdk_package_identifier = "";
+ const WCHAR *gdk_install_dir_w = empty_w;
+ const char *gdk_install_dir = "";
+@@ -258,12 +259,29 @@ ComputePublisherId( const char *publisher, char out[14] )
+     return TRUE;
+ }
+ 
+-/* gdk_package_identifier = "<Name>_<Version>_x64__<publisher id>", the Windows package full name (x64 is the only PC GDK architecture). */
++/*
++ * gdk_package_full_name = "<Name>_<Version>_x64__<publisher id>", the Windows package full name (x64 is the only
++ * PC GDK architecture).
++ *
++ * gdk_package_identifier is what XPackageGetCurrentProcessPackageIdentifier and XPackageDetails hand to the
++ * game. The GDK documents package identifiers as opaque strings and caps them at XPACKAGE_IDENTIFIER_MAX_LENGTH
++ * bytes including the terminator: titles size their buffers with that constant, and XStorePackageUpdate stores
++ * one in a char[33]. The full name is longer than that (44 bytes for Balatro), so the identifier is the first
++ * 16 bytes of SHA-256 over the full name as 32 lowercase hex digits: the longest string the contract allows,
++ * and stable across runs so logs can be matched up.
++ */
++#define PACKAGE_IDENTIFIER_DIGEST_BYTES 16
++static_assert( 2 * PACKAGE_IDENTIFIER_DIGEST_BYTES + 1 <= XPACKAGE_IDENTIFIER_MAX_LENGTH,
++               "gdk_package_identifier must fit an XPACKAGE_IDENTIFIER_MAX_LENGTH buffer" );
++
+ static void
+ ComputePackageIdentifier()
+ {
+-    char publisherId[14], *identifier;
++    static const char hex[] = "0123456789abcdef";
++    char publisherId[14], *fullName, *identifier;
++    UINT8 digest[32];
+     size_t size;
++    int i;
+ 
+     if ( !*gdk_identity_name || !*gdk_identity_version || !*gdk_identity_publisher )
+     {
+@@ -273,8 +291,18 @@ ComputePackageIdentifier()
+     if ( !ComputePublisherId( gdk_identity_publisher, publisherId ) ) return;
+ 
+     size = strlen( gdk_identity_name ) + strlen( gdk_identity_version ) + strlen( publisherId ) + sizeof("__x64__");
+-    if ( !( identifier = (char *)malloc( size ) ) ) return;
+-    snprintf( identifier, size, "%s_%s_x64__%s", gdk_identity_name, gdk_identity_version, publisherId );
++    if ( !( fullName = (char *)malloc( size ) ) ) return;
++    snprintf( fullName, size, "%s_%s_x64__%s", gdk_identity_name, gdk_identity_version, publisherId );
++    gdk_package_full_name = fullName;
++
++    if ( !( identifier = (char *)malloc( 2 * PACKAGE_IDENTIFIER_DIGEST_BYTES + 1 ) ) ) return;
++    Sha256( (const UINT8 *)fullName, strlen( fullName ), digest );
++    for ( i = 0; i < PACKAGE_IDENTIFIER_DIGEST_BYTES; i++ )
++    {
++        identifier[2 * i] = hex[digest[i] >> 4];
++        identifier[2 * i + 1] = hex[digest[i] & 15];
++    }
++    identifier[2 * PACKAGE_IDENTIFIER_DIGEST_BYTES] = 0;
+     gdk_package_identifier = identifier;
+ }
+ 
+@@ -425,8 +453,8 @@ InitializeGDKComponent( INITIALIZE_OPTIONS *options )
+     TRACE( "identity %s %s %s, display name %s, publisher %s, store id %s.\n", debugstr_a( gdk_identity_name ),
+            debugstr_a( gdk_identity_version ), debugstr_a( gdk_identity_publisher ), debugstr_a( gdk_display_name ),
+            debugstr_a( gdk_publisher_display_name ), debugstr_a( gdk_store_id ) );
+-    TRACE( "package identifier %s, install directory %s (%s).\n", debugstr_a( gdk_package_identifier ),
+-           debugstr_w( gdk_install_dir_w ), debugstr_a( gdk_install_dir ) );
++    TRACE( "package %s, identifier %s, install directory %s (%s).\n", debugstr_a( gdk_package_full_name ),
++           debugstr_a( gdk_package_identifier ), debugstr_w( gdk_install_dir_w ), debugstr_a( gdk_install_dir ) );
+ 
+     return hr;
+ }
+diff --git a/dlls/xgameruntime/GDKComponent/Ported/xpackage.c b/dlls/xgameruntime/GDKComponent/Ported/xpackage.c
+index 05e4d5b..58d6853 100644
+--- a/dlls/xgameruntime/GDKComponent/Ported/xpackage.c
++++ b/dlls/xgameruntime/GDKComponent/Ported/xpackage.c
+@@ -27,8 +27,9 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
+ /*
+- * The only package the runtime knows is the running game: its identifier is the Windows package full name
+- * computed from MicrosoftGame.config (gdk_package_identifier) and its mount point is the install directory.
++ * The only package the runtime knows is the running game: its identifier is the opaque gdk_package_identifier
++ * derived from MicrosoftGame.config (32 characters, so it fits the XPACKAGE_IDENTIFIER_MAX_LENGTH buffers
++ * titles use for it) and its mount point is the install directory.
+  */
+ 
+ struct XPackageMountInstance
+diff --git a/dlls/xgameruntime/private.h b/dlls/xgameruntime/private.h
+index 904d072..56feb61 100644
+--- a/dlls/xgameruntime/private.h
++++ b/dlls/xgameruntime/private.h
+@@ -210,6 +210,13 @@ extern const char *gdk_store_id;                /* <StoreId>, e.g. "9PK087LNGJC5
+  * The publisher id is the 13-character Crockford base32 form of the first 8 bytes of SHA-256(UTF-16LE Publisher),
+  * as in Windows package family names. "" when the <Identity> element is incomplete.
+  */
++extern const char *gdk_package_full_name;
++/*
++ * The package identifier the XPackage API hands to the game: 32 lowercase hex digits (the first 16 bytes of
++ * SHA-256 over gdk_package_full_name), which fills the XPACKAGE_IDENTIFIER_MAX_LENGTH buffers titles use for
++ * it. The GDK documents identifiers as opaque and caps them at that size, so the full name itself (44 bytes
++ * for Balatro) cannot be one. "" when gdk_package_full_name is.
++ */
+ extern const char *gdk_package_identifier;
+ extern const WCHAR *gdk_install_dir_w;          /* directory of MicrosoftGame.config as a Windows path, no trailing backslash */
+ extern const char *gdk_install_dir;             /* the same directory as a unix path, "" when it could not be resolved */
+diff --git a/include/xpackage.idl b/include/xpackage.idl
+index 0a69c55..0da407f 100644
+--- a/include/xpackage.idl
++++ b/include/xpackage.idl
+@@ -20,6 +20,9 @@ import "unknwn.idl";
+ import "xasync.h";
+ import "xgameruntimetypes.h";
+ 
++/* Size of a buffer for a package identifier, terminator included: 32 characters is the longest the GDK returns. */
++cpp_quote("#define XPACKAGE_IDENTIFIER_MAX_LENGTH 33")
++
+ cpp_quote("#ifdef __cplusplus")
+ 
+ cpp_quote("enum class XPackageChunkAvailability : UINT32")
+-- 
+2.56.0
+

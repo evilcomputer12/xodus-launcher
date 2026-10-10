@@ -1,7 +1,7 @@
 From dcecaf6aff03cbd41b754c6584e48a87df6e41b2 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 02:02:03 +0200
-Subject: [PATCH 09/12] xgameruntime: Real Xbox Live identity and
+Subject: [PATCH 09/19] xgameruntime: Real Xbox Live identity and
  XUserGetTokenAndSignature in XUser.
 
 Identity: the first XUserAddAsync asks xodus-service who is signed in

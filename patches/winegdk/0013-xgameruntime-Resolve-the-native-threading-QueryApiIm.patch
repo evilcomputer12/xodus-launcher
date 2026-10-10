@@ -1,0 +1,95 @@
+From 47f93d568500c4eed2f7cf8550f871dfdbfa24b4 Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 07:45:43 +0200
+Subject: [PATCH 13/19] xgameruntime: Resolve the native threading QueryApiImpl
+ once at load time.
+
+QueryApiImpl looked the export up on every call, with a NULL module handle
+whenever xgameruntime.dll.threading is absent. GetProcAddress( NULL, ... )
+then searches the game EXE, which logged one
+'warn:module:LdrGetProcedureAddress "QueryApiImpl" not found' line per
+async operation (49,615 lines in a single Space Marine 2 session, since
+every in-tree async helper queries CLSID_XThreadingImpl). Resolve it in
+DllMain right after the optional DLL is loaded; the redirection to the
+native implementation is unchanged when the DLL is present.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ dlls/xgameruntime/main.c | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/xgameruntime/main.c b/dlls/xgameruntime/main.c
+index 10e9967..30feabc 100644
+--- a/dlls/xgameruntime/main.c
++++ b/dlls/xgameruntime/main.c
+@@ -26,8 +26,16 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xgameruntime);
+ 
++typedef HRESULT (WINAPI *QueryApiImpl_ext)( const GUID *runtimeClassId, REFIID interfaceId, void **out );
++
+ static HMODULE xgameruntime;
+ static HMODULE xgameruntime_threading;
++/*
++ * QueryApiImpl of the optional native xgameruntime.dll.threading, resolved once when that DLL is
++ * loaded. Looking it up on every QueryApiImpl call with a NULL module handle made ntdll search the
++ * game EXE's export table instead, one LdrGetProcedureAddress warning per async operation.
++ */
++static QueryApiImpl_ext xgameruntime_threading_query;
+ 
+ unixlib_module_t unixlib;
+ unixlib_handle_t unixhandle;
+@@ -137,12 +145,15 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
+             DisableThreadLibraryCalls(hinst);
+             xgameruntime = hinst;
+             xgameruntime_threading = LoadLibraryA("xgameruntime.dll.threading");
++            if (xgameruntime_threading)
++                xgameruntime_threading_query = (QueryApiImpl_ext)GetProcAddress( xgameruntime_threading, "QueryApiImpl" );
+             break;
+         }
+         case DLL_PROCESS_DETACH:
+             if (reserved) break;
+             if (xgameruntime) FreeLibrary(xgameruntime);
+             if (xgameruntime_threading) FreeLibrary(xgameruntime_threading);
++            xgameruntime_threading_query = NULL;
+             if (unixlib) __wine_unload_unix_lib( unixlib );
+         break;
+     }
+@@ -189,8 +200,6 @@ HRESULT WINAPI InitializeApiImpl( ULONG gdkVer, ULONG gsVer )
+     return InitializeApiImplEx2( gdkVer, gsVer, 0, NULL );
+ }
+ 
+-typedef HRESULT (WINAPI *QueryApiImpl_ext)( const GUID *runtimeClassId, REFIID interfaceId, void **out );
+-
+ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, void **out )
+ {
+     // Interfaces returned are COM interfaces and inherit IUnknown*
+@@ -216,7 +225,6 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
+     //  IXSystemImpl_XSystemAllowFullDownloadBandwidth  (offset 64)
+     //
+ 
+-    QueryApiImpl_ext func = (QueryApiImpl_ext)GetProcAddress( xgameruntime_threading, "QueryApiImpl" );
+     DWORD asked;
+ 
+     TRACE("runtimeClassId %s, interfaceId %s, out %p\n", debugstr_guid(runtimeClassId), debugstr_guid(interfaceId), out);
+@@ -318,7 +326,7 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
+         /**
+          * For IXThreading, It's much better to use the native library instead.
+          */
+-        if ( !func )
++        if ( !xgameruntime_threading_query )
+         {
+             LoadOtherRuntime( &asked );
+             if ( !asked )
+@@ -327,7 +335,7 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
+             }
+             return IXThreadingImpl_QueryInterface( x_threading_impl, interfaceId, out );
+         }
+-        return func( runtimeClassId, interfaceId, out );
++        return xgameruntime_threading_query( runtimeClassId, interfaceId, out );
+     }
+     
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( runtimeClassId ) );
+-- 
+2.56.0
+
