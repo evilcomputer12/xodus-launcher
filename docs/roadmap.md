@@ -15,7 +15,8 @@ open source end to end. We get there in milestones that each ship something usab
 - [ ] `XStore` licence answers and `XPackage` package info so licence-checking games start
 - [ ] Per-game compatibility reports; a tested list of titles
 - [x] One-click setup: the launcher downloads the prebuilt WineGDK release (source build optional)
-- [ ] Alt+F4 / close handling verified on KDE Wayland (force-close watchdog + Stop button shipped)
+- [x] Alt+F4 / close handling verified on KDE Wayland: a KWin close reaches the game as
+      SC_CLOSE, the force-close watchdog arms, Balatro exits (tools/kwin/close-game.js)
 - [ ] Packages: AUR, then Flatpak
 - [ ] Send the WineGDK and xodus changes upstream
 
