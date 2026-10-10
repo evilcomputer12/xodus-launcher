@@ -15,7 +15,7 @@ classes. This table tracks what the open-source WineGDK build used by Xodus Laun
 | XGameImpl | no | added (title id from MicrosoftGame.config) | |
 | XGameSaveImpl | no | added, local files under `AppData\Local\XodusGames\<titleid>\GameSave` | no cloud sync |
 | XPersistentLocalStorageImpl | no | added | |
-| XStoreImpl | no | contexts + game licence (active, not trial, StoreId); licence token / add-ons still stubs | needed by Space Marine 2 at "Press button" |
+| XStoreImpl | no | contexts + game licence (active, not trial, StoreId); add-on licence acquisitions return a handle that is never valid (= not owned); licence token / catalog still stubs | needed by Space Marine 2 at "Press button", Brotato at boot (DLC licence) |
 | XPackageImpl | no | packaged-process identity, enumeration of the game's own package, mount of the install dir, locale | identity parsed from MicrosoftGame.config |
 | XNetworkingImpl security info | partial | XNetworkingQuerySecurityInformationForUrl[Utf16] answered (no pinning) | |
 | XGameInviteImpl | no | event registration accepted | |

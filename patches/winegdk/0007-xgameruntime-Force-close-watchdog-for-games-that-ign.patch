@@ -1,7 +1,7 @@
 From 3e2d4f53348fc47a5f2d6fc6820af44b0a27982c Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 00:17:32 +0200
-Subject: [PATCH 07/20] xgameruntime: Force-close watchdog for games that
+Subject: [PATCH 07/21] xgameruntime: Force-close watchdog for games that
  ignore WM_CLOSE
 
 GDK titles often treat a window close request as suspend-to-background and
@@ -190,6 +190,3 @@ index afb930a..4081dec 100644
  extern IXGameRuntimeFeatureImpl *x_game_runtime_feature;
  extern IXSystemImpl *x_system;
  extern IXGameImpl3 *x_game;
--- 
-2.56.0
-

@@ -1,7 +1,7 @@
 From 283602e35a4f308a5bb6e1ed39038928768d3723 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 08:49:25 +0200
-Subject: [PATCH 20/20] xgameruntime: Complete every XStore async request
+Subject: [PATCH 20/21] xgameruntime: Complete every XStore async request
  instead of leaving it pending
 
 The store back end (catalog, purchases, package updates, license tokens,
@@ -850,6 +850,3 @@ index 30feabc..1f0a57e 100644
  #ifdef XODUS_INTEROP
      if ( !unixlib )
      {
--- 
-2.56.0
-

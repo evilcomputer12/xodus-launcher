@@ -1,0 +1,159 @@
+From 50361597b4f8c4feed8926220d9804b63531e1aa Mon Sep 17 00:00:00 2001
+From: evilcomputer12 <martinrobotika@gmail.com>
+Date: Sat, 10 Oct 2026 11:52:33 +0200
+Subject: [PATCH 21/21] xgameruntime: Return licence handles for add-on
+ acquisitions
+
+XStoreAcquireLicenseForDurablesAsync and XStoreAcquireLicenseForPackageAsync
+completed with E_GAMESTORE_NETWORK_ERROR like the other unimplemented store
+requests. Brotato acquires the licence of its DLC (9NLGSVFW9C0S) at boot and
+treats that failure as a fatal store error: it shows its error dialog before
+the translations are loaded ("__NoText" buttons) and never reaches the menu.
+
+The GDK pattern (see Microsoft's InGameStore sample) is a successful
+acquisition followed by XStoreIsLicenseValid, with an invalid licence meaning
+"not owned". Complete both calls with a licence handle that is never valid,
+make XStoreIsLicenseValid report it and XStoreCloseLicenseHandle free it.
+Add-on ownership is still unknown to the runtime; wiring it to the account's
+entitlements through xodus-service is a follow-up.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../xgameruntime/GDKComponent/Ported/xstore.c | 74 ++++++++++++++++---
+ 1 file changed, 65 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/Ported/xstore.c b/dlls/xgameruntime/GDKComponent/Ported/xstore.c
+index 24b8196..e4cd80f 100644
+--- a/dlls/xgameruntime/GDKComponent/Ported/xstore.c
++++ b/dlls/xgameruntime/GDKComponent/Ported/xstore.c
+@@ -51,8 +51,19 @@ static LONG x_store_next_token;
+  * reasons noted in System/XUser.cpp. The job is owned by the provider from the moment XAsyncBegin
+  * succeeds and is freed in its Cleanup op.
+  */
++/* Handle returned by XStoreAcquireLicenseForDurables / XStoreAcquireLicenseForPackage. Add-on
++ * ownership is not known to this runtime, so the licence is never valid: games follow the GDK
++ * sample pattern (a successful acquisition, then XStoreIsLicenseValid) and treat an invalid licence
++ * as "not owned" instead of a store error. */
++struct x_store_license
++{
++    char store_id[64];
++    BOOL valid;
++};
++
+ struct x_store_job
+ {
++    char store_id[64];                                       /* product the job is about, for licences */
+     XAsyncBlock *async;                                      /* engine-side block from Begin */
+     HRESULT (*work)( struct x_store_job *job );              /* worker thread; sets result_size on success */
+     void (*fill)( struct x_store_job *job, void *buffer );   /* caller's thread, inside GetResult */
+@@ -62,6 +73,7 @@ struct x_store_job
+         XStoreGameLicense license;
+         UINT32 count;                                        /* empty item lists */
+         XStoreProductQueryHandle query;                      /* empty product queries */
++        struct x_store_license *license_handle;              /* add-on licence acquisitions */
+     } result;
+ };
+ 
+@@ -201,6 +213,48 @@ static HRESULT x_store_begin_unavailable( const void *handle, XAsyncBlock *async
+     return x_store_begin_job( async, identity, name, job );
+ }
+ 
++static HRESULT x_store_addon_license_work( struct x_store_job *job )
++{
++    struct x_store_license *license;
++
++    if (!(license = calloc( 1, sizeof(*license) ))) return E_OUTOFMEMORY;
++    lstrcpynA( license->store_id, job->store_id, sizeof(license->store_id) );
++    license->valid = FALSE;
++    job->result.license_handle = license;
++    job->result_size = sizeof(job->result.license_handle);
++    return S_OK;
++}
++
++static void x_store_addon_license_fill( struct x_store_job *job, void *buffer )
++{
++    memcpy( buffer, &job->result.license_handle, sizeof(job->result.license_handle) );
++    job->result.license_handle = NULL; /* owned by the game until XStoreCloseLicenseHandle */
++}
++
++static HRESULT x_store_begin_addon_license( const void *handle, const char *store_id, XAsyncBlock *async, const void *identity, const char *name )
++{
++    struct x_store_job *job;
++
++    if (!handle) return E_GAMERUNTIME_INVALID_HANDLE;
++    if (!async) return E_POINTER;
++    if (!(job = calloc( 1, sizeof(*job) ))) return E_OUTOFMEMORY;
++    job->work = x_store_addon_license_work;
++    job->fill = x_store_addon_license_fill;
++    if (store_id) lstrcpynA( job->store_id, store_id, sizeof(job->store_id) );
++    return x_store_begin_job( async, identity, name, job );
++}
++
++static HRESULT x_store_get_license_handle( XAsyncBlock *async, const void *identity, XStoreLicenseHandle *storeLicenseHandle )
++{
++    struct x_store_license *license = NULL;
++    HRESULT hr;
++
++    if (!storeLicenseHandle) return E_POINTER;
++    hr = x_store_get_job_result( async, identity, sizeof(license), &license, NULL );
++    *storeLicenseHandle = SUCCEEDED( hr ) ? license : NULL;
++    return hr;
++}
++
+ static HRESULT x_store_get_job_result_size( XAsyncBlock *async, SIZE_T *size )
+ {
+     IXThreadingImpl *xthreading;
+@@ -440,26 +494,29 @@ static HRESULT WINAPI x_store_XStoreAcquireLicenseForPackageAsync( IXStoreImpl6
+ {
+     TRACE( "iface %p, productQueryHandle %p, packageIdentifier %s, async %p\n", iface, productQueryHandle, debugstr_a( packageIdentifier ), async );
+ 
+-    return x_store_begin_unavailable( productQueryHandle, async, x_store_id_XStoreAcquireLicenseForPackage, "XStoreAcquireLicenseForPackageAsync" );
++    return x_store_begin_addon_license( productQueryHandle, packageIdentifier, async, x_store_id_XStoreAcquireLicenseForPackage, "XStoreAcquireLicenseForPackageAsync" );
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreAcquireLicenseForPackageResult( IXStoreImpl6 *iface, XAsyncBlock *async, XStoreLicenseHandle *storeLicenseHandle )
+ {
+     TRACE( "iface %p, async %p, storeLicenseHandle %p\n", iface, async, storeLicenseHandle );
+ 
+-    if (storeLicenseHandle) *storeLicenseHandle = NULL;
+-    return x_store_get_job_result( async, x_store_id_XStoreAcquireLicenseForPackage, 0, NULL, NULL );
++    return x_store_get_license_handle( async, x_store_id_XStoreAcquireLicenseForPackage, storeLicenseHandle );
+ }
+ 
+ static BOOLEAN WINAPI x_store_XStoreIsLicenseValid( IXStoreImpl6 *iface, const XStoreLicenseHandle storeLicenseHandle )
+ {
+-    FIXME( "iface %p, storeLicenseHandle %p stub!\n", iface, storeLicenseHandle );
+-    return FALSE;
++    const struct x_store_license *license = storeLicenseHandle;
++
++    TRACE( "iface %p, storeLicenseHandle %p (%s): %s.\n", iface, storeLicenseHandle,
++           license ? debugstr_a( license->store_id ) : "null", license && license->valid ? "valid" : "not valid" );
++    return license && license->valid;
+ }
+ 
+ static void WINAPI x_store_XStoreCloseLicenseHandle( IXStoreImpl6 *iface, XStoreLicenseHandle storeLicenseHandle )
+ {
+-    FIXME( "iface %p, storeLicenseHandle %p stub!\n", iface, storeLicenseHandle );
++    TRACE( "iface %p, storeLicenseHandle %p.\n", iface, storeLicenseHandle );
++    free( storeLicenseHandle );
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreCanAcquireLicenseForStoreIdAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char *storeProductId, XAsyncBlock *async )
+@@ -841,15 +898,14 @@ static HRESULT WINAPI x_store_XStoreAcquireLicenseForDurablesAsync( IXStoreImpl6
+ {
+     TRACE( "iface %p, storeContextHandle %p, storeId %s, async %p\n", iface, storeContextHandle, debugstr_a( storeId ), async );
+ 
+-    return x_store_begin_unavailable( storeContextHandle, async, x_store_id_XStoreAcquireLicenseForDurables, "XStoreAcquireLicenseForDurablesAsync" );
++    return x_store_begin_addon_license( storeContextHandle, storeId, async, x_store_id_XStoreAcquireLicenseForDurables, "XStoreAcquireLicenseForDurablesAsync" );
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreAcquireLicenseForDurablesResult( IXStoreImpl6 *iface, XAsyncBlock *async, XStoreLicenseHandle *storeLicenseHandle )
+ {
+     TRACE( "iface %p, async %p, storeLicenseHandle %p\n", iface, async, storeLicenseHandle );
+ 
+-    if (storeLicenseHandle) *storeLicenseHandle = NULL;
+-    return x_store_get_job_result( async, x_store_id_XStoreAcquireLicenseForDurables, 0, NULL, NULL );
++    return x_store_get_license_handle( async, x_store_id_XStoreAcquireLicenseForDurables, storeLicenseHandle );
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreShowAssociatedProductsUIAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char *storeId, XStoreProductKind productKinds, XAsyncBlock *async )

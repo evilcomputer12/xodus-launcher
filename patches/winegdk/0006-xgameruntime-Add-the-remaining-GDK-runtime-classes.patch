@@ -1,7 +1,7 @@
 From cff6c99bd82bcc5febae17a672b6843cfb7a5303 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:36:43 +0200
-Subject: [PATCH 06/20] xgameruntime: Add the remaining GDK runtime classes.
+Subject: [PATCH 06/21] xgameruntime: Add the remaining GDK runtime classes.
 
 New implementations: XGame (title id), XGameSave (containers/blobs stored as
 files under %LOCALAPPDATA%\XodusGames\<titleid>\GameSave, no cloud sync),
@@ -7078,6 +7078,3 @@ index 0000000..d7fe90f
 +}
 +
 +cpp_quote("#endif")
--- 
-2.56.0
-

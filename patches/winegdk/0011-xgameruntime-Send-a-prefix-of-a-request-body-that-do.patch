@@ -1,7 +1,7 @@
 From 9f2dd8ead3015b23fb314ca040bd8496c8025ae0 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 02:33:42 +0200
-Subject: [PATCH 11/20] xgameruntime: Send a prefix of a request body that does
+Subject: [PATCH 11/21] xgameruntime: Send a prefix of a request body that does
  not fit the token frame.
 
 The whole body of an XUserGetTokenAndSignatureAsync request was base64
@@ -106,6 +106,3 @@ index 2291abd..41cbdce 100644
          HRESULT TokenAndSignatureRequest( [in] LPCSTR clientId, [in] UINT32 titleId, [in] LPCSTR method, [in] LPCSTR url, [in] UINT32 headerCount, [in] LPCSTR *headerNames, [in] LPCSTR *headerValues, [in] UINT32 bodySize, [in] const BYTE *body, [in] boolean forceRefresh, [in] UINT32 timeoutMs, [out, retval] Windows.Foundation.IAsyncOperation<Xodus.ITokenAndSignatureResponse *> **operation );
          // Message type 7 -> 8. Same error convention as TokenAndSignatureRequest.
          HRESULT UserInfoRequest( [in] LPCSTR clientId, [in] UINT32 titleId, [in] boolean forceRefresh, [in] UINT32 timeoutMs, [out, retval] Windows.Foundation.IAsyncOperation<Xodus.IUserInfoResponse *> **operation );
--- 
-2.56.0
-

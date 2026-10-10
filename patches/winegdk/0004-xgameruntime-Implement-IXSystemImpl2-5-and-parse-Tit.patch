@@ -1,7 +1,7 @@
 From e8f8237c6e8437cb4b11d734077461f7b04ec35a Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Fri, 9 Oct 2026 23:36:43 +0200
-Subject: [PATCH 04/20] xgameruntime: Implement IXSystemImpl2-5 and parse
+Subject: [PATCH 04/21] xgameruntime: Implement IXSystemImpl2-5 and parse
  TitleId as hex.
 
 Games query XSystemImpl for IXSystemImpl4 (XSystemHandleTrack,
@@ -101,6 +101,3 @@ index 293da4a..ce6208f 100644
 \ No newline at end of file
 +IXSystemImpl *x_system = static_cast<IXSystemImpl*>(static_cast<IXSystemImpl5*>(&g_x_system));
 \ No newline at end of file
--- 
-2.56.0
-

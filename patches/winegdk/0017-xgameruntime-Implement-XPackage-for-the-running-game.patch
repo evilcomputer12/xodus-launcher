@@ -1,7 +1,7 @@
 From 2e78f8325d02467700d66c6f241c28c116792559 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 07:53:34 +0200
-Subject: [PATCH 17/20] xgameruntime: Implement XPackage for the running game.
+Subject: [PATCH 17/21] xgameruntime: Implement XPackage for the running game.
 
 XPackageIsPackagedProcess reports TRUE once the config identity is known and
 XPackageGetCurrentProcessPackageIdentifier returns gdk_package_identifier
@@ -390,6 +390,3 @@ index 0830125..05e4d5b 100644
  }
  
  static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled3( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
--- 
-2.56.0
-
