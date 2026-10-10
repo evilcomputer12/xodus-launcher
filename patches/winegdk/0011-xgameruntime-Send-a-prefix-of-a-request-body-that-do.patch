@@ -1,7 +1,7 @@
 From 9f2dd8ead3015b23fb314ca040bd8496c8025ae0 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 02:33:42 +0200
-Subject: [PATCH 11/19] xgameruntime: Send a prefix of a request body that does
+Subject: [PATCH 11/20] xgameruntime: Send a prefix of a request body that does
  not fit the token frame.
 
 The whole body of an XUserGetTokenAndSignatureAsync request was base64

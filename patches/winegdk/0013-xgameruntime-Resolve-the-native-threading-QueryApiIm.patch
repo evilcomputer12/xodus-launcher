@@ -1,7 +1,7 @@
 From 47f93d568500c4eed2f7cf8550f871dfdbfa24b4 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 07:45:43 +0200
-Subject: [PATCH 13/19] xgameruntime: Resolve the native threading QueryApiImpl
+Subject: [PATCH 13/20] xgameruntime: Resolve the native threading QueryApiImpl
  once at load time.
 
 QueryApiImpl looked the export up on every call, with a NULL module handle

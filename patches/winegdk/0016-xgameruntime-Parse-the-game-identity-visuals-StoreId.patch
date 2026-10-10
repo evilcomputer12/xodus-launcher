@@ -1,7 +1,7 @@
 From 6a660221c859229b88107edd86658d0bcbaec5cb Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 07:53:34 +0200
-Subject: [PATCH 16/19] xgameruntime: Parse the game identity, visuals, StoreId
+Subject: [PATCH 16/20] xgameruntime: Parse the game identity, visuals, StoreId
  and install directory from MicrosoftGame.config.
 
 ObtainMsaAppId() now also keeps Identity@Name/@Publisher/@Version,

@@ -1,7 +1,7 @@
 From 4afaf0ae618885622d39add34feda0d11dd41094 Mon Sep 17 00:00:00 2001
 From: evilcomputer12 <martinrobotika@gmail.com>
 Date: Sat, 10 Oct 2026 03:07:34 +0200
-Subject: [PATCH 12/19] xgameruntime: Allow 60 s for the first identity lookup
+Subject: [PATCH 12/20] xgameruntime: Allow 60 s for the first identity lookup
 
 A cold UserInfoRequest runs the full Xbox Live sign-in flow in xodus-service
 (measured 35 s); 15 s made every first launch fall back to the offline user.
