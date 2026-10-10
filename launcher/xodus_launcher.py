@@ -836,7 +836,7 @@ def run_download(cfg, product_id, dest, on_progress, on_log, cancel_event):
     if code == 0 and (Path(dest) / ".xodus-streaming.msixvc").exists() and not errors:
         return True, "Installed"
     if errors:
-        return False, errors[-1]
+        return False, errors[0] if tried else errors[-1]  # the "no PC package" explanation first
     return False, f"xodus-cli exited with code {code}"
 
 
