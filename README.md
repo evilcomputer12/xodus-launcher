@@ -58,6 +58,17 @@ and **Compatibility report…** writes a report (never containing tokens) and op
 issue so an entry can be added. Local overrides go in `~/.config/xodus-launcher/compat/<STOREID>.json`.
 See [docs/compat.md](docs/compat.md) and [data/compat/README.md](data/compat/README.md).
 
+## Third-party launchers (Ubisoft Connect, EA app, Battle.net, Rockstar, Riot)
+
+Some Game Pass titles have no Store package: the Xbox app hands them to the publisher's own
+launcher. `launcher/thirdparty.py` installs those launchers from the publisher's official
+installer into a Wine prefix of their own, run by a checksum-verified GE-Proton build it
+downloads from GitHub, signs you in in the launcher's own window and shows where to link the
+Xbox account that holds the subscription on the publisher's site, lists the games it installed
+and starts them. Recipes live in `data/compat/launchers.json`; anti-cheat needs (Steam's Proton
+EasyAntiCheat / BattlEye runtimes, single-player bypasses) are described per title. See
+[docs/launchers.md](docs/launchers.md).
+
 ## Patches carried here (to be sent upstream)
 
 - `patches/xodus/`: a git series on xodus main: the streaming-download crash fix, and

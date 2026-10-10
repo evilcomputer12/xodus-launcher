@@ -7,7 +7,9 @@ arch=('any')
 url="https://github.com/evilcomputer12/xodus-launcher"
 license=('GPL-3.0-or-later')
 depends=('python' 'pyside6' 'xodus-git' 'libsecret' 'desktop-file-utils' 'hicolor-icon-theme')
-optdepends=('steam: add games as Steam shortcuts'
+optdepends=('steam: add games as Steam shortcuts and provide the Proton EasyAntiCheat / BattlEye runtimes'
+            'winetricks: prefix tweaks for third-party launchers (GE-Proton bundles a copy)'
+            'lib32-libpulse: audio in the 32-bit third-party launcher clients (Ubisoft Connect, Battle.net) and the games they run'
             'konsole: terminal for the sign-in helper entries'
             'mingw-w64-gcc: build WineGDK with scripts/build-winegdk.sh')
 makedepends=('git')
@@ -24,15 +26,17 @@ pkgver() {
 package() {
 	cd "$srcdir/xodus-launcher"
 	install -Dm755 launcher/xodus_launcher.py "$pkgdir/usr/share/xodus-launcher/xodus_launcher.py"
+	install -Dm644 launcher/thirdparty.py "$pkgdir/usr/share/xodus-launcher/thirdparty.py"
 	install -Dm755 /dev/stdin "$pkgdir/usr/bin/xodus-launcher" <<'SH'
 #!/bin/sh
 exec python3 /usr/share/xodus-launcher/xodus_launcher.py "$@"
 SH
 	install -Dm644 data/compat/titles.json "$pkgdir/usr/share/xodus-launcher/compat/titles.json"
+	install -Dm644 data/compat/launchers.json "$pkgdir/usr/share/xodus-launcher/compat/launchers.json"
 	install -Dm644 data/xodus-launcher.desktop "$pkgdir/usr/share/applications/xodus-launcher.desktop"
 	sed -i 's|^Exec=.*|Exec=xodus-launcher|' "$pkgdir/usr/share/applications/xodus-launcher.desktop"
 	install -Dm644 data/xodus.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/xodus.png"
 	install -Dm755 scripts/build-winegdk.sh "$pkgdir/usr/share/xodus-launcher/scripts/build-winegdk.sh"
 	install -Dm644 patches/winegdk/* -t "$pkgdir/usr/share/xodus-launcher/patches/winegdk/"
-	install -Dm644 README.md LICENSE docs/compat.md -t "$pkgdir/usr/share/doc/xodus-launcher/"
+	install -Dm644 README.md LICENSE docs/compat.md docs/launchers.md -t "$pkgdir/usr/share/doc/xodus-launcher/"
 }

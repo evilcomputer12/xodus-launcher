@@ -53,6 +53,12 @@
       "launch": {
         "executable": "client_pc\\root\\bin\\pc\\Warhammer 40000 Space Marine 2 - Retail.exe",
         "eac_bypass": true
+      },
+      "anticheat": {
+        "kind": "eac",
+        "linux_module": false,
+        "bypass": "client_pc\\root\\bin\\pc\\Warhammer 40000 Space Marine 2 - Retail.exe",
+        "online": "unsupported"
       }
     },
     "9P9VNSQK1W3K": {
@@ -66,6 +72,13 @@
         "gpu": "AMD Radeon RX 7600 XT (RADV, Mesa 26.2)",
         "distro": "CachyOS"
       }
+    },
+    "9NQ4M2DG11L0": {
+      "title": "RAYMAN LEGENDS",
+      "status": "untested",
+      "notes": "No Store package: the Xbox app only installs a stub that hands the game to Ubisoft Connect, so xodus-cli reports 'no PC package'. Install Ubisoft Connect with the Set up Ubisoft Connect button on this title (or Settings > Third-party launchers), sign in, activate PC Game Pass at https://gamepass.ubisoft.com/ with the Microsoft account that holds the subscription, download the game inside Ubisoft Connect, then use Link installed game… (docs/launchers.md).",
+      "launcher": "ubisoft-connect",
+      "launcher_game_id": null
     }
   }
 }

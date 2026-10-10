@@ -33,7 +33,17 @@ Titles without an entry run with `defaults` and show as *Untested*.
       "dll_overrides": {"xinput1_3": "n,b"},
       "launch": {"executable": "client_pc\\root\\bin\\pc\\Game.exe", "args": [], "eac_bypass": true, "working_dir": ""},
       "winetricks": ["vcrun2022"],
-      "registry": [{"key": "HKCU\\Software\\Wine\\Direct3D", "name": "renderer", "type": "REG_SZ", "value": "vulkan"}]
+      "registry": [{"key": "HKCU\\Software\\Wine\\Direct3D", "name": "renderer", "type": "REG_SZ", "value": "vulkan"}],
+      "anticheat": {"kind": "eac", "linux_module": false,
+                    "bypass": "client_pc\\root\\bin\\pc\\Warhammer 40000 Space Marine 2 - Retail.exe",
+                    "online": "unsupported"}
+    },
+    "9NQ4M2DG11L0": {
+      "title": "RAYMAN LEGENDS",
+      "status": "untested",
+      "notes": "No Store package: delivered through Ubisoft Connect (Set up Ubisoft Connect on the title).",
+      "launcher": "ubisoft-connect",
+      "launcher_game_id": null
     }
   }
 }
@@ -56,6 +66,25 @@ Titles without an entry run with `defaults` and show as *Untested*.
 | `launch.args`, `launch.working_dir` | Recorded; `args` cannot be passed yet (`xodus-cli run` has no argument option), `working_dir` sets the launcher's working directory. |
 | `winetricks` | Verbs installed with `winetricks -q` into the prefix once (skipped with a warning when winetricks is missing). |
 | `registry` | `wine reg add` entries (`key`, optional `name`, `type`, `value`) applied once per prefix. |
+| `launcher` | Id of a third-party launcher from `launchers.json` (`ubisoft-connect`, `ea-app`, `battle-net`, `rockstar`, `riot`) when the title has no Store package and is delivered through that launcher. The launcher shows the launcher's install / sign-in flow instead of a download. Titles without an entry get the same treatment when their catalog publisher matches a recipe's `publisher_match` (Ubisoft, EA, Blizzard, Riot). |
+| `launcher_game_id` | The id that launcher starts the title with (`uplay://launch/<id>`, EA `offerIds`, Battle.net `--exec=launch <code>`, Riot product name, Rockstar install folder), or `null` when unknown; `ThirdPartyLauncher.installed_games()` reveals it once the game is installed inside the launcher. A link the user made (Link installed game…) wins over this value. |
+| `anticheat` | What the title's anti-cheat means on Linux: `kind` (`eac`, `battleye`, `ricochet`, `vanguard`, `none`, `unknown`), `linux_module` (`true` when the game ships EAC's `easyanticheat_x64.so` / the publisher enabled BattlEye's Proton support, so Steam's "Proton EasyAntiCheat Runtime" / "Proton BattlEye Runtime" can make online modes work), `bypass` (relative exe started instead of the EAC bootstrapper for single-player, or `null`), `online` (`supported`, `unsupported`, `unknown`). `anticheat_for_game()` in `launcher/thirdparty.py` fills the gaps from the game files; the entry wins where it says something. Only `online: "supported"` (a verified title) run by a Proton-derived build with the runtime installed starts the protected bootstrapper; everything else keeps the single-player bypass, and under WineGDK (no EAC/BattlEye hooks) the runtime is never used. |
+
+### Library meta file of a launcher title
+
+`Link installed game…` records a title that lives inside a third-party launcher as a folder
+named like the title under `games_dir` holding only `.xodus-launcher.json` with `status:
+"launcher"`, `launcher` (recipe id), `launcher_game_id` (what the launcher starts it with),
+`launcher_game_name` and `launcher_game_dir` (the game's folder inside the launcher prefix),
+next to the usual catalog fields (`id`, `title`, `publisher`, `poster`, ...). "Remove from
+library" deletes that file; the game stays installed in the launcher.
+
+### Config keys (`~/.config/xodus-launcher/config.json`)
+
+| Key | Meaning |
+|---|---|
+| `anticheat_warned` | Store IDs whose one-time "online modes are unavailable" notice was already shown before Play. |
+| `thirdparty_runner` (`umu` default, or `wine`), `ge_proton_reuse_existing` | `true` (default): a GE-Proton that Steam or umu already installed is linked into `~/.local/share/xodus-launcher/ge-proton/` instead of downloading one. |
 
 Merge order: launcher built-ins ⊕ `defaults` ⊕ the title entry ⊕ the user's override file. Objects
 merge key by key; lists and scalars replace. For the Wine build the precedence is: user override
@@ -63,3 +92,73 @@ merge key by key; lists and scalars replace. For the Wine build the precedence i
 
 Applied tweaks are remembered per prefix in `<prefix>/.xodus-compat-applied.json`; delete it to
 re-apply them.
+
+## `launchers.json` (third-party launchers)
+
+`launchers.json` holds one recipe per launcher that Game Pass hands titles to (Ubisoft
+Connect, EA app, Battle.net, Rockstar Games Launcher, Riot Client), read by
+`launcher/thirdparty.py` (docs: [docs/launchers.md](../docs/launchers.md)). It is installed next
+to `titles.json`, refreshed from `main` the same way, and overridable per launcher in
+`~/.config/xodus-launcher/launchers/<id>.json` (same merge rules as title overrides).
+
+```json
+{
+  "schema_version": 1,
+  "generated": "2026-10-10",
+  "updated": "2026-10-10",
+  "launchers": {
+    "ubisoft-connect": {
+      "name": "Ubisoft Connect",
+      "publisher": "Ubisoft",
+      "publisher_match": ["ubisoft"],
+      "installer": {"url": "https://.../UbisoftConnectInstaller.exe", "filename": "UbisoftConnectInstaller.exe",
+                    "silent_args": ["/S"], "sha256": null, "wait": "exit", "success_codes": [0],
+                    "timeout_seconds": 1800, "settle_seconds": 10, "interactive": false,
+                    "interactive_note": "", "alternatives": [], "notes": "..."},
+      "runtime": {"kind": "ge-proton", "min_version": "GE-Proton10-18"},
+      "prefix": {"winetricks": ["d3dcompiler_43", "corefonts"], "dll_overrides": {}, "registry": [],
+                 "env": {"WINE_SIMULATE_WRITECOPY": "1"}, "arch": "win64",
+                 "files": [{"path": "drive_c/users/{user}/AppData/Local/Ubisoft Game Launcher/settings.yaml",
+                            "content": "overlay:\n  enabled: false\n", "notes": "..."}]},
+      "exe": "drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/UbisoftConnect.exe",
+      "exe_glob": [],
+      "launch": {"open_args": [], "game_url": "uplay://launch/{game_id}/0", "game_args": ["uplay://launch/{game_id}/0"],
+                 "install_args": ["uplay://install/{game_id}"]},
+      "installed_games": {"method": "registry", "scanner": "ubisoft",
+                          "registry_key": "HKLM\\Software\\Wow6432Node\\Ubisoft\\Launcher\\Installs",
+                          "directory": "drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games", "notes": "..."},
+      "signin": {"summary": "...", "game_pass_library": true, "steps": ["..."], "xbox_link": "...", "notes": ["..."]},
+      "anticheat": {"notes": "..."},
+      "known_issues": ["..."],
+      "sources": ["..."],
+      "confidence": "high"
+    }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `publisher_match` | Lower-case prefixes of catalog publisher names whose titles are delivered through this launcher (`["ubisoft"]`); such titles show the "via" tag and the Set up / Open button instead of a doomed Install, even without a `titles.json` entry. Empty for Rockstar, whose Game Pass titles are Store packages. |
+| `installer.url`, `filename` | The publisher's official installer (https only, redirects to http are refused; downloaded at install time into `~/.cache/xodus-launcher/installers/<id>/`, never shipped). |
+| `installer.silent_args` | Arguments for an unattended install. |
+| `installer.sha256` | Pinned hash or `null` when the URL is unversioned and changes with every release (the computed hash is always logged). Pin only a versioned, immutable URL (Battle.net: the `installer/win/<version>/` file its rolling link redirects to); a mismatch deletes the download and stops the install until the recipe is updated. |
+| `installer.wait` | `exit` (default): wait for the installer to exit and check `success_codes` (default `[0]`); `exe`: the installer never exits, so wait for `exe` to appear, wait `settle_seconds`, then stop the prefix. `timeout_seconds` bounds both. |
+| `installer.interactive`, `interactive_note` | The installer shows a window the user must click through; the note is shown as the install stage text. |
+| `installer.alternatives` | Other official bootstrappers (same client) with their own `url` / `filename`, for user overrides. |
+| `installer.notes` | What was verified about the installer and when. |
+| `runtime` | `kind` is always `ge-proton`; `min_version` the oldest GE-Proton tag the client is known to work with (`null` = any). `ensure_ge_proton()` downloads the latest release when nothing suitable is installed. `prefer_tools`: optional list of directory-name prefixes (`Proton-CachyOS`, `GE-Proton`, ...) tried first among the Proton builds Steam/umu already have installed, for clients that a current GE-Proton cannot run yet. |
+| `prefix.winetricks`, `registry`, `dll_overrides`, `env` | Same meaning as in a title entry, applied to the launcher's own prefix `~/.local/share/xodus-launcher/prefix-<id>` (tracked in `<prefix>/.xodus-compat-applied.json`). `env` is applied to every process run in the prefix. |
+| `prefix.files` | Files written into the prefix before the installer runs and whenever they are missing (`{user}` = the Wine user directory name): client settings that must exist before the first start. |
+| `prefix.arch` | `win64` (all current recipes). |
+| `exe`, `exe_glob` | The launcher executable relative to the prefix; `exe_glob` patterns are tried when a self-update moved it (EA app's versioned folder). |
+| `launch.open_args` | Arguments for opening the launcher UI (sign-in). |
+| `launch.game_args`, `game_url` | Arguments that start one game: `{game_id}` is the title's `launcher_game_id`, `{install_dir}` the game's Windows folder (Rockstar). `game_url` is the same thing as a URL for documentation / shortcuts; `null` when the launcher has no URL scheme for that. |
+| `launch.install_args` | Arguments used instead of `game_args` when the game is not among `installed_games()` yet, so Play asks the launcher to install it (`uplay://install/<id>`, EA `&autoDownload=1`, `--exec=install <code>`); empty when the launcher has no such command (Play then just opens it). |
+| `installed_games.method`, `scanner` | How installed games are found: `registry` (keys parsed from `system.reg` / `user.reg` in Python) or `directory` (data files); `scanner` names the parser in `thirdparty.py` (`ubisoft`, `ea`, `battlenet`, `rockstar`, `riot`, `generic`). `registry_key` / `directory` document (and for `generic` drive) the lookup. |
+| `signin.steps` | User-facing instructions, in order, shown numbered in the sign-in guide: sign in, link the Xbox account on the publisher's site, where the Game Pass titles then appear. `signin.summary` is the one-paragraph version shown under the steps; `game_pass_library` says whether the launcher lists the Game Pass titles in its own library once linked (then the guide adds the "Link installed game…" hint); `notes` keeps the research behind the steps (never shown); `xbox_link` explains how the entitlement reaches that launcher. |
+| `anticheat.notes` | Anti-cheat reality for that publisher's titles (which runtime, which titles are denied). |
+| `known_issues`, `sources`, `confidence` | Research notes: what breaks and how it was fixed, where the facts come from, and `low` / `medium` / `high`. Keep them when editing a recipe. |
+
+`scripts/compat-seed.py --check` validates both files (title `launcher` ids must exist in
+`launchers.json`).

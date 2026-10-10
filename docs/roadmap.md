@@ -17,6 +17,12 @@ open source end to end. We get there in milestones that each ship something usab
       build / prefix / overrides per Store ID, applied at launch, refreshed daily) with
       badges, a catalog filter and one-click compatibility reports (docs/compat.md)
 - [ ] Grow the tested list: entries for every title people report
+- [x] Third-party launchers as data-driven recipes (`data/compat/launchers.json`,
+      `launcher/thirdparty.py`): Ubisoft Connect, EA app, Battle.net, Rockstar Games
+      Launcher and Riot Client in GE-Proton prefixes with guided sign-in, installed-game
+      scans and anti-cheat runtime detection (docs/launchers.md)
+- [ ] Verify each launcher end to end (install, sign-in, a Game Pass title downloading
+      and starting inside it); Rockstar's Game Pass hand-off needs the GDK runtime
 - [x] One-click setup: the launcher downloads the prebuilt WineGDK release (source build optional)
 - [x] Alt+F4 / close handling verified on KDE Wayland: a KWin close reaches the game as
       SC_CLOSE, the force-close watchdog arms, Balatro exits (tools/kwin/close-game.js)

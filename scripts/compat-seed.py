@@ -5,7 +5,8 @@
                                       every title) from the launcher's catalog cache, fetching the
                                       catalog the way the launcher does when the cache is stale
     scripts/compat-seed.py --offline  use the cache whatever its age (no network)
-    scripts/compat-seed.py --check    validate data/compat/titles.json (schema, statuses, ids)
+    scripts/compat-seed.py --check    validate data/compat/titles.json (schema, statuses, ids,
+                                      launcher / anticheat fields) and data/compat/launchers.json
 
 Both modes print how much of the catalog titles.json covers, by status.
 """
@@ -21,16 +22,26 @@ COMPAT = ROOT / "data/compat"
 STORE_ID = re.compile(r"^9[A-Z0-9]{11}$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ENTRY_KEYS = {"title", "status", "notes", "tested", "runtime", "prefix", "dxvk", "vkd3d", "env",
-              "dll_overrides", "launch", "winetricks", "registry"}
+              "dll_overrides", "launch", "winetricks", "registry", "launcher", "launcher_game_id",
+              "anticheat"}
 TESTED_KEYS = {"date", "launcher", "winegdk", "gpu", "distro"}
 LAUNCH_KEYS = {"executable", "args", "eac_bypass", "working_dir"}
+ANTICHEAT_KEYS = {"kind", "linux_module", "bypass", "online"}
 
 
-def launcher():
-    spec = importlib.util.spec_from_file_location("xodus_launcher", ROOT / "launcher/xodus_launcher.py")
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def launcher():
+    return _load("xodus_launcher", ROOT / "launcher/xodus_launcher.py")
+
+
+def thirdparty():
+    return _load("thirdparty", ROOT / "launcher/thirdparty.py")
 
 
 def catalog(offline):
@@ -50,7 +61,7 @@ def write_index(games):
     return index
 
 
-def check_entry(sid, e, errors):
+def check_entry(sid, e, errors, launcher_ids, tp):
     where = f"titles[{sid}]"
     if not STORE_ID.match(sid):
         errors.append(f"{where}: not a Store ID")
@@ -84,24 +95,52 @@ def check_entry(sid, e, errors):
     rt = e.get("runtime") or {}
     if not isinstance(rt.get("wine", ""), str) or not isinstance(rt.get("min_winegdk", ""), str):
         errors.append(f"{where}.runtime: wine and min_winegdk are strings")
+    if "launcher" in e:
+        if not isinstance(e["launcher"], str) or e["launcher"] not in launcher_ids:
+            errors.append(f"{where}.launcher: must be a launcher id from launchers.json "
+                          f"({', '.join(launcher_ids) or 'none'})")
+    if "launcher_game_id" in e:
+        if e["launcher_game_id"] is not None and not isinstance(e["launcher_game_id"], str):
+            errors.append(f"{where}.launcher_game_id: a string or null")
+        if "launcher" not in e:
+            errors.append(f"{where}.launcher_game_id: needs a launcher")
+    ac = e.get("anticheat")
+    if ac is not None:
+        if not isinstance(ac, dict):
+            errors.append(f"{where}.anticheat: must be an object")
+        else:
+            for k in set(ac) - ANTICHEAT_KEYS:
+                errors.append(f"{where}.anticheat: unknown field {k!r}")
+            if ac.get("kind") not in tp.ANTICHEAT_KINDS:
+                errors.append(f"{where}.anticheat.kind: one of {', '.join(tp.ANTICHEAT_KINDS)}")
+            if "linux_module" in ac and not isinstance(ac["linux_module"], bool):
+                errors.append(f"{where}.anticheat.linux_module: true or false")
+            if ac.get("bypass") is not None and not isinstance(ac["bypass"], str):
+                errors.append(f"{where}.anticheat.bypass: a relative exe path or null")
+            if "online" in ac and ac["online"] not in tp.ONLINE_STATES:
+                errors.append(f"{where}.anticheat.online: one of {', '.join(tp.ONLINE_STATES)}")
 
 
-def check(db, index):
+def check(db, index, launchers):
     errors = []
+    tp = thirdparty()
     if db.get("schema_version") != 1:
         errors.append("schema_version must be 1")
     for k in ("generated", "updated"):
         if not DATE.match(str(db.get(k, ""))):
             errors.append(f"{k}: use YYYY-MM-DD")
-    for k in set(db.get("defaults") or {}) - (ENTRY_KEYS - {"title", "notes", "tested"}):
+    for k in set(db.get("defaults") or {}) - (ENTRY_KEYS - {"title", "notes", "tested", "launcher",
+                                                            "launcher_game_id", "anticheat"}):
         errors.append(f"defaults: unknown field {k!r}")
+    launcher_ids = sorted((launchers or {}).get("launchers") or {})
     for sid, e in (db.get("titles") or {}).items():
-        check_entry(sid, e, errors)
+        check_entry(sid, e, errors, launcher_ids, tp)
         if index and sid not in index:
             print(f"warning: {sid} ({e.get('title')}) is not in catalog-index.json")
     newest = max((str((e.get("tested") or {}).get("date", "")) for e in db["titles"].values()), default="")
     if newest > str(db.get("updated", "")):
         errors.append(f"updated ({db.get('updated')}) is older than the newest tested.date ({newest})")
+    errors += tp.validate_launchers_db(launchers)
     return errors
 
 
@@ -113,6 +152,9 @@ def coverage(db, index):
     total = len(index) if index else "?"
     print(f"{covered} of {total} catalog titles have an entry: " +
           ", ".join(f"{k} {v}" for k, v in sorted(by_status.items())))
+    via = sum(1 for e in db["titles"].values() if e.get("launcher"))
+    if via:
+        print(f"{via} of them run through a third-party launcher")
 
 
 def main(argv):
@@ -120,10 +162,13 @@ def main(argv):
     index_file = COMPAT / "catalog-index.json"
     if "--check" in argv:
         index = json.loads(index_file.read_text()) if index_file.exists() else {}
-        errors = check(db, index)
+        launchers = json.loads((COMPAT / "launchers.json").read_text())
+        errors = check(db, index, launchers)
         for e in errors:
             print("error:", e)
         coverage(db, index)
+        print(f"launchers.json: {len(launchers.get('launchers') or {})} recipes "
+              + ("OK" if not errors else "checked"))
         return 1 if errors else 0
     index = write_index(catalog("--offline" in argv))
     print(f"\nwrote {index_file} ({len(index)} titles)", file=sys.stderr)

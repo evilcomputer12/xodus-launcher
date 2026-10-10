@@ -1,0 +1,790 @@
+{
+  "schema_version": 1,
+  "generated": "2026-10-10",
+  "updated": "2026-10-10",
+  "launchers": {
+    "ubisoft-connect": {
+      "name": "Ubisoft Connect",
+      "publisher": "Ubisoft",
+      "installer": {
+        "url": "https://static3.cdn.ubi.com/orbit/launcher_installer/UbisoftConnectInstaller.exe",
+        "filename": "UbisoftConnectInstaller.exe",
+        "silent_args": [
+          "/S"
+        ],
+        "sha256": null,
+        "wait": "exit",
+        "success_codes": [
+          0
+        ],
+        "timeout_seconds": 1800,
+        "notes": "Official link: the ubisoftconnect.com download page points to https://ubi.li/4vxt9, which 302-redirects to this static3.cdn.ubi.com URL (Heroic and Bottles use the same URL). The Lutris script and winetricks' 'ubisoftconnect' verb use the legacy mirror https://ubistatic3-a.akamaihd.net/orbit/launcher_installer/UbisoftConnectInstaller.exe, which served an OLDER build on 2026-10-10 (259,083,384 bytes, Last-Modified 2025-09-10) than static3 (264,197,496 bytes, Last-Modified 2026-10-06). The URL is unversioned and the content changes with every client release, so sha256 is deliberately null; the 2026-10-06 build hashed 3cba64c512523f58579f83c10c30d55004ef59a7f926a67903fe1fa5ddf2539a (informational only, do not pin). `file` identifies it as a Nullsoft (NSIS) self-extracting installer, so '/S' is the silent switch (used by Lutris, Heroic, Bottles and winetricks; NSIS also accepts '/D=<dir>' as the last argument). It installs to drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/ (UbisoftConnect.exe, legacy upc.exe, UplayWebCore.exe). Prefix setup per the Lutris 'ubisoft-connect-latest' script (id 5228, updated 2026-03-30): create a win64 prefix, winetricks d3dcompiler_43 then corefonts, write the overlay/close-behaviour file drive_c/users/<user>/AppData/Local/Ubisoft Game Launcher/settings.yaml with exactly: 'overlay:\\n  enabled: false\\n  forceunhookgame: false\\n  fps_enabled: false\\n  warning_enabled: false\\nuser:\\n  closebehavior: CloseBehavior_Close', then run the installer with /S. Older recipes (Bottles, old protonfixes, Lutris Rocksmith variants) wrote the same keys to 'Local Settings/Application Data/Ubisoft Game Launcher/settings.yml'; in current Wine that directory is a symlink to AppData/Local, but the filename differs (.yaml vs .yml) - write settings.yaml and verify after the first client run which file the client created. protonfixes/GE notes: the client rewrites the file on launch but keeps these keys, and on the very first launch of a new prefix it wipes pre-existing config, so re-apply/check the file after the first run. Bottles' Gold-rated recipe additionally installs d3dx9, riched20, allfonts and vcredist2022 (optional). The client self-updates on first start ('Checking for patches') and needs network access."
+      },
+      "runtime": {
+        "kind": "ge-proton",
+        "min_version": "GE-Proton10-18",
+        "prefer_tools": [
+          "Proton-CachyOS",
+          "proton-xodus",
+          "Proton - Experimental",
+          "GE-Proton"
+        ]
+      },
+      "prefix": {
+        "winetricks": [
+          "d3dcompiler_43",
+          "corefonts"
+        ],
+        "dll_overrides": {},
+        "registry": [],
+        "env": {
+          "PROTON_USE_WRITECOPY": "1",
+          "WINE_SIMULATE_WRITECOPY": "1"
+        },
+        "arch": "win64",
+        "files": [
+          {
+            "path": "drive_c/users/{user}/AppData/Local/Ubisoft Game Launcher/settings.yaml",
+            "content": "overlay:\n  enabled: false\n  forceunhookgame: false\n  fps_enabled: false\n  warning_enabled: false\nuser:\n  closebehavior: CloseBehavior_Close\n",
+            "notes": "Overlay off (crashes Vulkan-native titles) and close = quit instead of minimise to tray (Lutris ubisoft-connect-latest). Written before the installer runs and re-written whenever it is missing, because the client wipes pre-existing config on the first launch of a new prefix."
+          }
+        ]
+      },
+      "exe": "drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/UbisoftConnect.exe",
+      "launch": {
+        "open_args": [],
+        "game_url": "uplay://launch/{game_id}/0",
+        "game_args": [
+          "uplay://launch/{game_id}/0"
+        ],
+        "install_args": [
+          "uplay://install/{game_id}"
+        ]
+      },
+      "installed_games": {
+        "method": "registry",
+        "scanner": "ubisoft",
+        "registry_key": "HKLM\\Software\\Wow6432Node\\Ubisoft\\Launcher\\Installs",
+        "directory": "drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games",
+        "notes": "Each subkey under Installs is the numeric Ubisoft install id, which is the {game_id} for uplay://launch (Ubisoft's own shortcuts use e.g. uplay://launch/4932/0 for The Division 2, uplay://launch/11903/0 for Ghost Recon Breakpoint). Values: InstallDir (REG_SZ, forward slashes and a trailing slash, e.g. 'C:/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Far Cry 5/'; the 'games' directory is only the default - users can change it, so always trust the registry) and Language. In a Wine prefix the key is stored in <prefix>/system.reg under [Software\\\\Wow6432Node\\\\Ubisoft\\\\Launcher\\\\Installs\\\\<id>] (Lutris' convert_ubisoft_key maps Ubisoft's 'HKEY_LOCAL_MACHINE\\SOFTWARE\\Ubisoft\\Launcher\\Installs\\<id>\\InstallDir' to Software/Wow6432Node/...). A download is complete when <InstallDir>/uplay_install.state exists and its first byte is 0x0A (Lutris lutris/util/ubisoft/helpers.py). Display name: HKLM\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Uplay Install <id> -> DisplayName (also InstallLocation, DisplayIcon) as used by BoilR and game-scanner; fallback: basename of InstallDir (Playnite). Richer metadata (name, thumb image, relative exe path, launch id vs install id, space id, owned-but-uninstalled titles): parse the binary cache 'drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/cache/configuration/configurations' (or drive_c/users/<user>/AppData/Local/Ubisoft Game Launcher/cache/configuration/configurations) - records with a small binary header (install id, launch id) followed by a YAML blob: root.name (or root.installer.game_identifier, resolved through localizations.default), root.thumb_image, root.space_id, root.start_game.online.executables[0].path.relative and .working_directory.register (= the Installs\\<id>\\InstallDir key); cache/ownership/<uid> lists owned ids (Lutris lutris/util/ubisoft/parser.py). The launcher's own install dir: HKLM\\Software\\Wow6432Node\\Ubisoft\\Launcher -> InstallDir, and an Uninstall entry with DisplayName 'Ubisoft Connect'. URL scheme: uplay://launch/<id>/<n> where the trailing number selects the launch configuration (0 = default; e.g. 11903/0 = DirectX, 11903/1 = Vulkan for Breakpoint); Lutris and Playnite omit the suffix (uplay://launch/<id>), legendary appends '?'-query parameters (offline mode). Also uplay://install/<id>, uplay://open/game/<id>/0, uplay://uninstall/<id>. The URL is passed as the single argument to UbisoftConnect.exe (Lutris: exe UbisoftConnect.exe + args 'uplay://launch/<id>'; game-scanner: 'upc.exe uplay://launch/GAME_ID/0'). Game Pass Ubisoft titles have no Store package (xodus-cli fails with 'no PC package'); the download happens inside Ubisoft Connect, so the Installs key is populated only after the client has installed the game."
+      },
+      "signin": {
+        "summary": "Ubisoft Connect lists the whole Game Pass Ubisoft catalogue once your Ubisoft account is linked to the Microsoft account that holds the subscription. The link is made on Ubisoft's website, not in the client.",
+        "game_pass_library": true,
+        "steps": [
+          "Click Open Ubisoft Connect and sign in with your Ubisoft account (or create one). The first start downloads client updates ('Checking for patches') - give it a minute.",
+          "In your web browser open https://gamepass.ubisoft.com/ and click 'Sign in with your Microsoft account'. Use the Microsoft account that holds the PC Game Pass or Game Pass Ultimate subscription.",
+          "Allow Ubisoft to access that account, sign in with the same Ubisoft account as in step 1 and click 'Confirm and activate'. This links the two accounts permanently: a Ubisoft account can only ever be linked to one Xbox account, so make sure both are the right ones.",
+          "Quit Ubisoft Connect and open it again: the Game Pass titles appear in its Games tab (it can take a few hours to show up). Install the game there - the download runs inside Ubisoft Connect.",
+          "If the subscription lapses and is renewed later, repeat step 2 to reclaim the games."
+        ],
+        "xbox_link": "The entitlement is attached to the Ubisoft account by linking the Microsoft/Xbox account that holds the PC Game Pass (or Game Pass Ultimate) subscription: either the web flow at https://gamepass.ubisoft.com/ (Ubisoft Connect web login with the 'xbox-external' provider, then 'Confirm and activate'; works from any browser, so it is the path for Linux users) or the Xbox app's 'Install' hand-off on Windows. Ubisoft Connect then lists the whole current Game Pass Ubisoft catalogue in its library for as long as the subscription is active, downloads the games itself, and runs them without the Xbox app or Gaming Services.",
+        "notes": [
+          "Start UbisoftConnect.exe in the launcher prefix and sign in with the Ubisoft account in the client's own login window (email + password, two-factor code if enabled). The first start downloads client updates ('Checking for patches') and needs network access.",
+          "Activate PC Game Pass access on the web, no Xbox app needed: open https://gamepass.ubisoft.com/ -> 'Sign in with your Microsoft account' (the Microsoft account that holds the PC Game Pass or Game Pass Ultimate subscription) -> grant Ubisoft access -> sign in to (or create) the Ubisoft account -> 'Confirm and activate your access to Ubisoft games in these accounts:' -> 'Confirm and activate'. Success text: 'You have activated your access to {gamename} on your Ubisoft account ({userName}) and with PC Game Pass membership ({xboxUserName}).' If the Microsoft account has no subscription the page says 'The Microsoft account {xboxUserName} has no PC Game Pass membership.' The page also offers 'Download Ubisoft Connect' / 'Launch Ubisoft Connect' buttons (the Windows deep link is not needed on Linux).",
+          "Windows-only alternative (Ubisoft help 000100611): in the Xbox app select the Game Pass Ubisoft title -> Install -> Ubisoft Connect pop-up -> log in to the Ubisoft account, then to the Xbox account if prompted -> confirm the accounts -> tick 'I understand this action can't be reversed' -> Confirm. 'Once you claim a game, you will automatically claim the catalogue of available Ubisoft games.'",
+          "The activation links the Xbox account to the Ubisoft account permanently: a Ubisoft account that was ever linked to an Xbox account can only be re-linked to that same Xbox account; pairing a different one requires Ubisoft Support (help 000075524). Linking errors: 'This profile is already linked to another user' = the Xbox account is linked to a different Ubisoft account (000100784); 'Something went wrong with the activation' = claim limit reached for that pairing (000100615); 'You're not able to link your accounts' is the generic case (000101377). Manual check: account.ubisoft.com -> Account information -> 'Linked accounts' -> Xbox -> Link.",
+          "Back in Ubisoft Connect (quit and relaunch, or sign out and in), the claimed Game Pass catalogue appears in the library ('Games' tab) alongside owned games; select a tile to download inside Ubisoft Connect and launch it from 'Games' - the Xbox app and Gaming Services are not involved afterwards (DualShockers: 'install and play ... through Ubisoft Connect, with no need to launch Xbox App'). Ubisoft says titles can take a few hours to appear and that the client must be up to date; whether the client marks them with a Game Pass badge was not verified.",
+          "Access lasts while the subscription is active ('Access to Ubisoft games and discounts will be available as long as your subscription is active'); after cancelling and resubscribing 'you may need to reclaim the Ubisoft games' - repeat the web activation."
+        ]
+      },
+      "anticheat": {
+        "notes": "Ubisoft Connect itself has no anti-cheat. Of the 60 Ubisoft titles in the local Game Pass catalog index most are single-player (Assassin's Creed series, Far Cry 3/4/5/6/New Dawn/Primal, Watch Dogs 2, Immortals, Prince of Persia, Rayman, Child of Light, Star Wars Outlaws, Avatar, South Park, Trials...). Titles with anti-cheat, with AreWeAntiCheatYet status measured on the STEAM builds: Easy Anti-Cheat - For Honor (Supported), The Division 2 (Supported; Ubisoft enabled EAC's Proton support in Jan 2023, confirmed for Steam only; DX12 mode crashes), Far Cry 5 (Supported), Ghost Recon Wildlands (Broken), Brawlhalla (Supported); BattlEye - Rainbow Six Siege (Denied by Ubisoft: online play unavailable), Ghost Recon Breakpoint (Supported), Watch Dogs: Legion (Supported; BattlEye only guards Online mode), Riders Republic (Supported with tweaks), Skull and Bones (Running), The Crew Motorfest (Supported), The Crew 2 (Broken); FairFight (server-side) - The Division; Denuvo Anti-Cheat - Rainbow Six Extraction (Running); PunkBuster on old titles (AC III/IV/Brotherhood/Revelations, Far Cry 2/3) is inert. Mechanism: Proton's Wine (ValveSoftware/wine dlls/ntdll/unix/loader.c set_dll_path) appends $PROTON_BATTLEYE_RUNTIME/v1/lib/wine and /v1/lib64/wine plus $PROTON_EAC_RUNTIME/v2/lib32 and /v2/lib64 to the builtin DLL search path, so the game's EAC/BattlEye Windows modules are replaced by Valve's Linux builds; the runtimes are Steam apps 1826330 'Proton EasyAntiCheat Runtime' (steamapps/common/Proton EasyAntiCheat Runtime) and 1161040 'Proton BattlEye Runtime' (steamapps/common/Proton BattlEye Runtime). Steam exports the two env vars itself; outside Steam, Lutris sets PROTON_EAC_RUNTIME=<runtime_dir>/eac_runtime and PROTON_BATTLEYE_RUNTIME=<runtime_dir>/battleye_runtime (lutris/runners/wine.py) and Heroic does the same, both fetching the runtimes from https://lutris.net/api/runtimes (eac_runtime-20240114.tar.xz and battleeye_runtime.tar.xz on github.com/lutris/buildbot releases) - a third-party redistribution of Valve's runtime, so prefer reusing an existing Steam install and make the Lutris mirror an explicit opt-in. EAC additionally needs the game to ship its Linux module (EasyAntiCheat/easyanticheat_x64.so) and the publisher to enable Proton support on the EAC/BattlEye backend; those switches are per game, but it is unverified whether the Ubisoft Connect (Game Pass) builds ship the same modules as the Steam builds. Single-player bypass: no Ubisoft title is known to use the start_protected_game.exe bootstrapper pattern (EAC/BattlEye are loaded in-process), so the Space Marine 2 bypass does not apply; for titles whose anti-cheat only gates online modes (e.g. Watch Dogs: Legion Online) label online as unavailable unless the matching runtime is configured and the title is listed Supported."
+      },
+      "known_issues": [
+        "2026-10-10: with the client version built 2026-10-01 (174.1.13380) the UI thread of upc.exe overflows its stack under GE-Proton11-7 (fixme:ui:uisettings2_get_TextScaleFactor) and no window ever appears; Proton-CachyOS 11.0-20261005 and Proton Experimental show the login window. runtime.prefer_tools therefore prefers those builds when Steam has them installed.",
+        "Ubisoft Connect auto-updates itself and has repeatedly broken under Wine/Proton: 2023-02-01 ('Game starter version mismatch' / unrecoverable error; fixed the same day in Proton Experimental and by GE-Proton7-49), 2023-08-01 (needed WINE_SIMULATE_WRITECOPY=1 for UplayWebCore.exe; Proton Experimental 'Fixed Ubisoft Connect not working after its recent update', GE-Proton8-10 'fixes Ubisoft Connect'), 2025-09 ('Ubisoft connect has detected an unsolvable error and needs to be restarted'; fixed by moving to GE-Proton10-10 or newer, one report also needed a wiped, reinstalled prefix). Keep GE-Proton current and expect breakage right after client updates.",
+        "ntsync: GE-Proton10-18 (2025-10-12) 'imported ntsync ubisoft connect fix'; on kernels with ntsync (CachyOS) use GE-Proton10-18 or newer, or set PROTON_NO_NTSYNC=1 as a fallback. Historically (6.21-GE-1) fsync made the client hang at 'Looking for patches' on a fresh prefix while esync worked.",
+        "GE-Proton11-6 (2026-08-28) 'Removed a redundant packed-code split lock that delayed Ubisoft Connect startup by minutes' - earlier GE-Proton 11 builds start the client very slowly; prefer GE-Proton11-6 or newer.",
+        "Writecopy: GE-Proton10-18 'enabled wine writecopy option for ea/ubisoft/battlenet launchers'; the proton script only adds it when umu's STORE=ubisoft is set, so outside umu pass PROTON_USE_WRITECOPY=1 (proton script) or WINE_SIMULATE_WRITECOPY=1 (wine binary) - both are in prefix.env.",
+        "Overlay: the in-game overlay crashed Vulkan-native titles (Rainbow Six Siege) and is disabled by every community recipe via settings.yaml; GE-Proton10-28 (2026-01-01) notes 'removed disabling of uplay overlay on previous existing protonfixes (it works now)', but keeping it disabled remains the safe default. The client rewrites the settings file at launch (keeps the keys) and wipes pre-existing config on the first launch of a new prefix, so verify/re-apply after the first run.",
+        "The client keeps running after a game exits ('uplay likes to hang out after the game has closed' - 6.21-GE-1 notes); 'closebehavior: CloseBehavior_Close' makes closing the window quit instead of minimizing to the tray; stop the prefix's wineserver at the end of a session.",
+        "Black/blank UI boxes on some GPU/driver combinations, login failures and stalled downloads were reported on the Lutris forum (2023-2025); fixes were newer runners (lutris-GE-Proton7.39, GE-Proton10-10) and 'net.ipv4.tcp_mtu_probing=1' for network stalls.",
+        "Games that bundle an old Uplay installer need the current client (umu-protonfixes runs winetricks 'ubisoftconnect' for AC2, AC Syndicate, Anno 1800, Rainbow Six Siege, Ghost Recon Breakpoint); Far Cry 3 / 4 / Primal choke on more than 24 / 24 / 31 CPU cores (set_cpu_topology_limit); Far Cry 4 needs d3dcompiler_43 and d3dcompiler_47; AC Syndicate disables nvapi; Siege sets vk_x11_override_min_image_count=2.",
+        "Game Pass entitlement only lasts while the subscription is active; Ubisoft says games 'may need to be reclaimed' after a lapse; the client must be up to date for entitled games to appear and it can take hours after activation.",
+        "Game Pass Ubisoft titles cannot be downloaded from the Store side (xodus-cli reports 'no PC package' because the Xbox app only installs a stub that hands off to Ubisoft Connect); the download must be done inside Ubisoft Connect in the launcher prefix.",
+        "The installer URL is unversioned and changes with every client release (the 2026-10-06 build is 264,197,496 bytes; the akamaihd mirror lags behind), so a pinned sha256 would break on every update - check the NSIS signature/`file` type and show the computed hash instead.",
+        "Lutris' Rocksmith+ variants add arial, d3dcompiler_47, d3dx9, dotnet48, dotnetcore3, vcrun2019, vcrun6/vcrun6sp6 and disable nvapi/nvapi64 - game-specific, not needed for the client itself."
+      ],
+      "sources": [
+        "https://lutris.net/api/installers/ubisoft-connect",
+        "https://lutris.net/games/ubisoft-connect/",
+        "https://www.ubisoft.com/en-us/ubisoft-connect/download",
+        "https://ubi.li/4vxt9",
+        "https://static3.cdn.ubi.com/orbit/launcher_installer/UbisoftConnectInstaller.exe",
+        "https://ubistatic3-a.akamaihd.net/orbit/launcher_installer/UbisoftConnectInstaller.exe",
+        "https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks",
+        "https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/blob/main/src/backend/storeManagers/legendary/games.ts",
+        "https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/blob/main/src/backend/storeManagers/legendary/setup.ts",
+        "https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/blob/main/src/backend/launcher.ts",
+        "https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/blob/main/src/backend/wine/runtimes/runtimes.ts",
+        "https://github.com/bottlesdevs/programs/blob/main/Games/ubisoftconnect.yml",
+        "https://github.com/lutris/lutris/blob/master/lutris/services/ubisoft.py",
+        "https://github.com/lutris/lutris/blob/master/lutris/util/ubisoft/helpers.py",
+        "https://github.com/lutris/lutris/blob/master/lutris/util/ubisoft/consts.py",
+        "https://github.com/lutris/lutris/blob/master/lutris/util/ubisoft/parser.py",
+        "https://github.com/lutris/lutris/blob/master/lutris/runners/wine.py",
+        "https://lutris.net/api/runtimes",
+        "https://github.com/JosefNemec/PlayniteExtensions/blob/master/source/Libraries/UplayLibrary/UplayLibrary.cs",
+        "https://github.com/JosefNemec/PlayniteExtensions/blob/master/source/Libraries/UplayLibrary/Uplay.cs",
+        "https://github.com/PhilipK/BoilR/blob/master/src/platforms/uplay/platform.rs",
+        "https://github.com/CataclysmGame/game-scanner/blob/master/docs/ubisoft.md",
+        "https://github.com/PadTrick/Linux_Misc_Files/blob/main/Docs/Proton_Wine_Games_Commands.txt",
+        "https://github.com/derrod/legendary/blob/master/legendary/core.py",
+        "https://github.com/Open-Wine-Components/umu-database/blob/main/umu-database.csv",
+        "https://github.com/Open-Wine-Components/umu-protonfixes/tree/master/gamefixes-ubisoft",
+        "https://github.com/Open-Wine-Components/umu-protonfixes/blob/master/gamefixes-steam/916440.py",
+        "https://github.com/Open-Wine-Components/umu-protonfixes/blob/master/gamefixes-steam/368500.py",
+        "https://github.com/Open-Wine-Components/umu-protonfixes/blob/master/gamefixes-steam/359550.py",
+        "https://github.com/Open-Wine-Components/umu-protonfixes/blob/master/gamefixes-steam/2231380.py",
+        "https://github.com/Open-Wine-Components/umu-protonfixes/blob/master/gamefixes-steam/298110.py",
+        "https://github.com/Open-Wine-Components/umu-protonfixes/blob/master/gamefixes-steam/371660.py",
+        "https://github.com/simons-public/protonfixes/blob/master/protonfixes/util.py",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton10-18",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton10-28",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton11-6",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton8-10",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton7-49",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/6.21-GE-1",
+        "https://raw.githubusercontent.com/GloriousEggroll/proton-ge-custom/master/proton",
+        "https://github.com/ValveSoftware/wine/blob/proton_9.0/dlls/ntdll/unix/loader.c",
+        "https://github.com/DavidoTek/ProtonUp-Qt/blob/main/pupgui2/constants.py",
+        "https://raw.githubusercontent.com/AreWeAntiCheatYet/AreWeAntiCheatYet/HEAD/games.json",
+        "https://forums.lutris.net/t/ubisoft-connect-doesnt-start-after-update/23905",
+        "https://forums.lutris.net/t/ubisoft-connect-not-working-solved/17438",
+        "https://www.gamingonlinux.com/2023/02/ubisoft-broke-their-games-on-linux-desktop-and-steam-deck/",
+        "https://www.gamingonlinux.com/2023/08/ubisoft-connect-broke-again-but-valve-fixed-it-in-proton-experimental/",
+        "https://www.gamingonlinux.com/2023/01/ubisoft-fixed-the-division-2-on-steam-deck-and-linux-desktop/",
+        "https://gamepass.ubisoft.com/",
+        "https://static-webservicesops.akamaized.net/gamepass/prod/static/js/main.0a47b631.chunk.js",
+        "https://www.ubisoft.com/en-us/help/article/000100611",
+        "https://www.ubisoft.com/en-us/help/connectivity-and-performance/article/accessing-ubisoft-games-on-pc-game-pass/000100613",
+        "https://www.ubisoft.com/en-us/help/article/000100615",
+        "https://www.ubisoft.com/en-us/help/article/000100784",
+        "https://www.ubisoft.com/en-us/help/purchases-and-rewards/article/error-message-youre-not-able-to-link-your-accounts-for-ubisoft-games-on-pc-game-pass/000101377",
+        "https://www.ubisoft.com/en-us/help/article/000075524",
+        "https://www.ubisoft.com/en-us/help/purchases-and-rewards/article/accessing-ubisoft-games-on-multiple-platforms/000064740",
+        "https://support.xbox.com/en-US/help/subscriptions-billing/manage-subscriptions/ubisoft-with-xbox-game-pass-FAQ",
+        "https://www.dualshockers.com/how-to-play-rainbow-six-extraction-siege-on-pc-game-pass/",
+        "https://www.xbox.com/en-US/games/ubisoft-plus"
+      ],
+      "confidence": "high",
+      "publisher_match": [
+        "ubisoft"
+      ]
+    },
+    "ea-app": {
+      "name": "EA app",
+      "publisher": "Electronic Arts",
+      "installer": {
+        "url": "https://origin-a.akamaihd.net/EA-Desktop-Client-Download/installer-releases/EAappInstaller.exe",
+        "filename": "EAappInstaller.exe",
+        "silent_args": [
+          "/quiet",
+          "EAX_LAUNCH_CLIENT=0"
+        ],
+        "sha256": null,
+        "wait": "exit",
+        "success_codes": [
+          0,
+          768
+        ],
+        "timeout_seconds": 3600,
+        "notes": "Official bootstrapper linked from https://www.ea.com/ea-app#downloads (same URL used by the Lutris ea-app, battlefield-1 and titanfall-2 scripts, NonSteamLaunchers and the Chocolatey ea-app package). It is a WiX Burn bootstrapper (~2.1 MB) that downloads the full client (~2.5 GB in the prefix) at install time, so the file at this URL is replaced with every client release (HTTP HEAD on 2026-10-10: Content-Length 2141104, Last-Modified 2026-10-09, ETag af751a66...); a pinned sha256 is therefore stale within days (Chocolatey pins one per package version, 13.805.2.6319 on 2026-10-07) -> null, verify TLS only. Silent switches: WiX Burn accepts /quiet (NonSteamLaunchers), /silent (older Lutris battlefield-1/titanfall-2 scripts), /S (Chocolatey); the Burn variable EAX_LAUNCH_CLIENT=0 stops the client from starting right after install (the current Lutris ea-app script passes only that and shows the UI; the unifideck test ran it with no flags, unattended). Lutris marks exit code 768 as the expected/successful return code of the installer (battlefield-1 + ea-app scripts); treat 0 and 768 as success. The MSI inside requires a filesystem with ACL/WRITE_OWNER support: on ntfs-3g it rolls back with 0x8007065b/0x80070643 (lutris/lutris#6904). It installs per-machine under C:\\Program Files\\Electronic Arts\\EA Desktop\\ and registers the origin2:// and link2ea:// URL handlers (origin2 -> EALauncher.exe \"%1\")."
+      },
+      "runtime": {
+        "kind": "ge-proton",
+        "min_version": "GE-Proton11-1"
+      },
+      "prefix": {
+        "winetricks": [
+          "corefonts",
+          "win10"
+        ],
+        "dll_overrides": {},
+        "registry": [],
+        "env": {},
+        "arch": "win64"
+      },
+      "exe": "drive_c/Program Files/Electronic Arts/EA Desktop/EA Desktop/EALauncher.exe",
+      "exe_glob": [
+        "drive_c/Program Files/Electronic Arts/EA Desktop/*/EA Desktop/EALauncher.exe"
+      ],
+      "launch": {
+        "open_args": [],
+        "game_url": "origin2://game/launch?offerIds={game_id}",
+        "game_args": [
+          "origin2://game/launch?offerIds={game_id}"
+        ],
+        "install_args": [
+          "origin2://game/launch?offerIds={game_id}&autoDownload=1"
+        ]
+      },
+      "installed_games": {
+        "method": "directory",
+        "scanner": "ea",
+        "registry_key": "HKLM\\Software\\Wow6432Node\\Origin Games",
+        "directory": "drive_c/Program Files/EA Games",
+        "notes": "Primary (what Lutris' EAAppGames, Steam ROM Manager and NonSteamLaunchersDecky do): scan <prefix>/drive_c/Program Files/EA Games/*/__Installer/installerdata.xml (also look in drive_c/Program Files (x86)/EA Games and drive_c/Program Files (x86)/Origin Games for older installs). In that file (root <DiPManifest>): game id = first <contentIDs>/<contentID> (the numeric content/offer id, e.g. 1014457; later entries are DLC/expansion ids), name = <gameTitles>/<gameTitle locale=\"en_US\"> (fallback: first gameTitle, then the folder name), install dir = the folder containing __Installer, executable = <runtime>/<launcher>/<filePath> which may embed a registry placeholder like [HKEY_LOCAL_MACHINE\\SOFTWARE\\<Publisher>\\<Game>\\Install Dir]Game.exe (resolve the key in system.reg or just use the install dir) and <parameters>, <requires64BitOS>, <trial>. The file can be UTF-8 or UTF-16LE (Steam ROM Manager handles both). Pass that contentID as offerIds in the launch URL. Fallback for games installed outside the default folder: the EA app writes HKLM\\Software\\Wow6432Node\\Origin Games\\<contentId> with DisplayName (parse <prefix>/system.reg; NSLDecky and lutris/lutris#5160/#6035 use it), but that key also lists DLCs and keeps entries after uninstall, so it only maps id->name; per-game Install Dir values live under HKLM\\SOFTWARE\\Wow6432Node\\EA Games\\<Title> or ...\\Electronic Arts\\<Title> (PCGamingWiki, not present for every title). The user-chosen download folder is user.downloadinplacedir in drive_c/users/<user>/AppData/Local/Electronic Arts/EA Desktop/user_<id>.ini. The authoritative install state is drive_c/ProgramData/EA Desktop/530c11479fe252fc5aabc24935b9776d4900eb3ba58fdc271e0d6229413ad40e/IS, a JSON list (installInfos[] with softwareId, baseSlug, baseInstallPath) encrypted with AES-256-CBC, key = SHA3-256('allUsersGenericId' + 'IS' + SHA1(hardware string: baseboard manufacturer;baseboard serial;BIOS manufacturer;BIOS serial;volume serial;video controller PNPDeviceID;CPU manufacturer;CPU id;CPU name)), IV = first 16 bytes of SHA3-256('allUsersGenericId' + 'IS') (erri120/GameFinder); nobody has shipped that decryption for Wine prefixes (GameFinder issue #71 open) and it needs AES outside the stdlib, so it is not the recommended method."
+      },
+      "signin": {
+        "summary": "The EA app shows the EA Play catalogue that PC Game Pass includes once your EA Account is linked to the Microsoft account that holds the subscription (on ea.com, or when the app offers to link them).",
+        "game_pass_library": true,
+        "steps": [
+          "Click Open EA app and sign in with your EA Account (complete the e-mail or app verification code if it asks). The app may update itself first.",
+          "In your web browser open https://www.ea.com/myaccount and, under Connections, link the Xbox account: sign in with the Microsoft account that holds the PC Game Pass or Game Pass Ultimate subscription. If EA Play was ever used on an Xbox console the accounts are usually linked already; the EA app may also offer to link them itself.",
+          "Quit the EA app and open it again: the EA Play titles that Game Pass includes become installable from the app (EA Play section / library). A title that still shows a price has not received the entitlement: wrong account, not linked yet, or EA Play Pro-only.",
+          "Install the game in the EA app. The EA app must stay running while a game runs; turn its in-game overlay off (Settings > Application) - it breaks some titles under Wine."
+        ],
+        "xbox_link": "EA Play on PC Game Pass / Game Pass Ultimate is an EA Play membership granted to the EA Account that is linked to the Xbox account (xbox.com: 'Ultimate and PC Game Pass members will first need to link their Xbox and EA accounts and make sure they have the EA app installed on their PC ... browse the EA Play catalogue and download games through the Xbox app on Windows PC via the EA app'). On Windows the Xbox app walks through the one-time link and then hands the download/launch to the EA app; the entitlement itself lives on the EA side, so once the accounts are linked the EA app shows the EA Play catalogue and installs/launches those titles without the Xbox app (which does not run on Linux). Kernel-anti-cheat titles are the exception (see anticheat). EA Play Pro content is not included in Game Pass.",
+        "notes": [
+          "Start EALauncher.exe in the launcher's prefix; it updates itself if needed and opens the 'Sign in to your EA Account' window (EA Account email/password, with Google/Facebook/Apple/Steam buttons). Sign in with the EA Account that is (or will be) linked to the user's Xbox/Microsoft account; complete EA Login Verification (2FA code by email/app) if it is enabled.",
+          "Link the Xbox account: on Windows the Xbox app triggers the link the first time an EA Play title is installed ('sign in to your EA account ... link accounts -> Your account is linked'); without the Xbox app, link it on the EA Account web page (ea.com/myaccount -> Connections, 'Link to an EA Account' in EA Help) using the same Microsoft account that holds the PC Game Pass / Game Pass Ultimate subscription. If EA Play was ever used on an Xbox console the accounts are usually linked already.",
+          "Restart the EA app after linking so the EA Play membership that Game Pass grants is picked up (EA Play badge / 'EA Play' section). EA Play titles can then be browsed and installed from the EA app itself (library/EA Play catalogue) and downloads happen inside the EA app; a title that still shows a price has not received the entitlement (account not linked, wrong account, or an EA Play Pro-only item).",
+          "If the Game Pass title was started from Xodus, the launcher opens EALauncher.exe with origin2://game/launch?offerIds=<contentId>&autoDownload=1 the first time (EA app downloads it) and origin2://game/launch?offerIds=<contentId> afterwards; the EA app must stay running while the game runs (its own DRM check, offline play still requires the client)."
+        ]
+      },
+      "anticheat": {
+        "notes": "The EA app client itself has no anti-cheat; only games do. (1) EA anticheat / 'EA Javelin' (kernel driver, Windows only): Battlefield 6/REDSEC/2042, Battlefield 1 and V (FairFight + EA anticheat), EA SPORTS FC 24-26, Madden 24-26, WRC 24, skate., PvZ Battle for Neighborville / Garden Warfare 2, FIFA 23 -> AreWeAntiCheatYet 'Denied': no Linux module exists, there is no single-player bypass, so label online modes unavailable and expect these not to start at all. EA has only posted a job listing (March 2026) about future Linux/Proton support for Javelin. (2) Easy Anti-Cheat with a Linux module: STAR WARS: Squadrons and Madden NFL 23 are 'Supported' with Steam's 'Proton EasyAntiCheat Runtime' (Steam app 1826330; BattlEye runtime is app 1161040). Mechanism: Proton's Wine (ValveSoftware/wine dlls/ntdll/unix/loader.c set_dll_path) reads the PROTON_EAC_RUNTIME env var and adds <dir>/v2/lib32 and <dir>/v2/lib64 to the DLL search path (PROTON_BATTLEYE_RUNTIME likewise), so when Xodus runs GE-Proton's files/bin/wine directly it only has to export PROTON_EAC_RUNTIME=<path of app 1826330> in wine_env (under Steam the lsteamclient shim sets it from the installed app; Lutris points it at its own runtime/eac_runtime copy). Whether the EA-app builds of those titles ship the easyanticheat_x64.so Linux module like the Steam builds is unverified. Apex Legends dropped Linux support (EAC + Hyperion, Denied). (3) FairFight/PunkBuster only (server-side or user-mode): Titanfall, Titanfall 2, STAR WARS Battlefront (2015) / II (2017), Battlefield 4, Battlefield: Hardline run (Supported/Running). Mark EA Play/Game Pass titles with an EA anticheat entry as 'online unavailable / not launchable' in the compat DB; leave the rest as normal."
+      },
+      "known_issues": [
+        "Self-update layout: the installer/updater may place the client in a versioned folder, drive_c/Program Files/Electronic Arts/EA Desktop/<version>/EA Desktop/EALauncher.exe (unifideck saw 13.735.2.6250/ in July 2026), instead of EA Desktop/EA Desktop/. Lutris' ea-app script runs a verifyea.sh after install and after every exit that moves <version>/EA Desktop up to EA Desktop/EA Desktop; alternatively resolve EALauncher.exe with a glob (NonSteamLaunchers does find -iname EALauncher.exe). Symptom when the path goes stale: 'Connecting to the EA app' splash then exit code 0 (lutris/lutris#6843, Aug-Oct 2026).",
+        "EA app updates regularly break the Wine install: Jan 2026 an EA Desktop update left the launcher half-updated (RPC_S_SERVER_UNAVAILABLE 0x6ba, CreateSymbolicLinkW stubs) and games stopped launching until Proton Experimental (2026-01-29) / Proton 11.0-1-beta1 (2026-04-16) 'Fixed many EA games being unplayable after a recent EA Desktop update'; GE-Proton10-30 (2026-02-10) imported those upstream changes. Proton 11.0-1-beta2 (Xalia 0.4.9) fixed lockups when interacting with the EA App. Keep GE-Proton >= 11-1 (unifideck: unattended install + rendered login window on GE-Proton11-1, 2026-07-03); Lutris itself runs the client on dwproton-11.0-14 (Proton Experimental bleeding-edge 11.0, 2026-09-29). NonSteamLaunchers keeps a 'repaireaapp' path (re-run the installer /quiet into the same prefix) for when the client breaks itself.",
+        "Login/UI window: the EA app UI is Qt + QtWebEngine (Chromium). Blank login window after an EA update was fixed in Proton 8.0-4 (2023); text/fonts rendered as placeholder boxes (WineHQ bug 54899, Cyrillic locale) was fixed in Wine 10.9 - corefonts from the Lutris recipe is still installed for the web views. Older community advice ('use a Wine runner, not Proton, keep D3D Extras') predates these fixes.",
+        "Window sometimes never appears / restart loop: under wine-wayland (PROTON_ENABLE_WAYLAND=1) the EA App window may not map at all (proton-ge-custom#188, closed as 'sometimes the EA app just doesn't open, kill and relaunch'); run it on X11/XWayland (the default when the GE-Proton files/bin/wine binary is run directly, as Xodus does) and give the user a 'force stop + relaunch' action. Proton 11.0-2e (2026-10-09) fixed the login window not getting focus under gamescope.",
+        "Background processes keep the prefix alive after the window closes: EADesktop.exe, EABackgroundService.exe (installed as a service), EALocalHostSvc.exe, EALauncher.exe/EALaunchHelper.exe and QtWebEngineProcess.exe (Lutris excludes exactly these from its process watch); stop_wine must kill them (wineserver -k) or the next launch hangs on 'Connecting to the EA app'.",
+        "Installer under Proton/Steam has been reported to hang right after DXVK initialises (ValveSoftware/Proton#8090, Oct 2025 and Sep 2026 reports; plain Wine 10.17 installs fine). Lutris (dw-proton) and the unifideck test (GE-Proton11-1 via umu) completed; if it hangs, retry with the Proton DXVK DLL overrides disabled for the installer run.",
+        "Prefix must be on a native Linux filesystem: on ntfs-3g the MSI fails with 0x8007065b / 0x80070643 (INST-14-1627) because WRITE_OWNER/ACLs are missing (lutris/lutris#6904). INST-21-25005/INST-14-1627 at the end of the installer were also seen on Steam Deck in March 2026 and went away with the then-current Proton Experimental.",
+        "Lutris' EA App *integration* (not the client) cannot list EA Play titles that are not purchased: the entitlement query only returns owned games, so EA Play/Game Pass titles show up only through the installed-games scan (lutris/lutris#5529). Xodus should treat the installerdata.xml scan as the source of truth for EA Play titles.",
+        "origin2://game/download is not implemented in the EA app; use origin2://game/launch?offerIds=<id>&autoDownload=1 to trigger an install (Lutris get_launch_arguments). The offerIds value is the numeric contentId from installerdata.xml / the Origin Games registry key, not the 'Origin.OFR.50.x' offer string. Steam/Epic-bought EA titles use link2ea://launchgame/<id>?platform=steam|epic&... instead; no 'ealink://' scheme was found in any source.",
+        "Disable the EA app in-game overlay (Settings -> Application) : it breaks some titles under Wine (Titanfall 2 fails to launch with it enabled, lutris/docs titanfall-2.md).",
+        "Offline play still requires the EA app client to be running and previously signed in; the client enforces its own licence/DRM (ProgramData\\Electronic Arts\\EA Services\\License\\*.dlf).",
+        "The winetricks 'physx' verb is in the Lutris recipe for EA games that bundle PhysX, not for the client; it is a large download and can be deferred to game install time. 'win10' is kept from the Lutris recipe because the installer refuses anything older than 64-bit Windows 10 (ea.com: 'running Windows 10, and 11')."
+      ],
+      "sources": [
+        "https://lutris.net/api/installers/ea-app",
+        "https://lutris.net/games/ea-app/",
+        "https://lutris.net/api/installers/battlefield-1",
+        "https://lutris.net/api/installers/titanfall-2",
+        "https://lutris.net/api/runners/wine",
+        "https://raw.githubusercontent.com/lutris/lutris/master/lutris/services/ea_app.py",
+        "https://raw.githubusercontent.com/lutris/lutris/master/docs/installers.rst",
+        "https://github.com/lutris/lutris/issues/6843",
+        "https://github.com/lutris/lutris/issues/6904",
+        "https://github.com/lutris/lutris/issues/5529",
+        "https://github.com/lutris/lutris/issues/5160",
+        "https://github.com/lutris/lutris/issues/6035#issuecomment-2831930147",
+        "https://github.com/lutris/docs/blob/master/titanfall-2.md",
+        "https://www.ea.com/ea-app",
+        "https://www.pcgamingwiki.com/wiki/Store:EA_app",
+        "https://github.com/dawn-winery/dwproton-mirror/releases/tag/dwproton-11.0-14",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton11-7",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton11-1",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton10-30",
+        "https://github.com/GloriousEggroll/proton-ge-custom/issues/188",
+        "https://github.com/ValveSoftware/Proton/releases (proton-8.0-4, 9.0-3, 9.0-4, 11.0-1-beta1, 11.0-1-beta2, 11.0-1, 11.0-2e notes)",
+        "https://github.com/ValveSoftware/Proton/issues/8090",
+        "https://github.com/ValveSoftware/Proton/issues/3997",
+        "https://www.gamingonlinux.com/2026/01/proton-experimental-updated-to-fix-the-ea-app-again-on-steamos-linux/",
+        "https://raw.githubusercontent.com/moraroy/NonSteamLaunchers-On-Steam-Deck/main/NonSteamLaunchers.sh",
+        "https://raw.githubusercontent.com/moraroy/NonSteamLaunchersDecky/main/py_modules/lib/scanners/ea_scanner.py",
+        "https://raw.githubusercontent.com/SteamGridDB/steam-rom-manager/master/src/lib/parsers/ea-desktop.parser.ts",
+        "https://raw.githubusercontent.com/mubaraknumann/unifideck/main/docs/feasibility/ea.md",
+        "https://github.com/erri120/GameFinder (src/GameFinder.StoreHandlers.EADesktop/EADesktopHandler.cs, Crypto/Decryption.cs, Crypto/HardwareInformation.cs)",
+        "https://github.com/erfan2255/TS2E/blob/2a3fcc459a8ebb6ae7589b710d96b3d7af81506b/__Installer/installerdata.xml",
+        "https://raw.githubusercontent.com/legendary-gl/legendary/master/legendary/core.py",
+        "https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/issues/352",
+        "https://community.chocolatey.org/packages/ea-app",
+        "https://bugs.winehq.org/show_bug.cgi?id=54899",
+        "https://forums.lutris.net/t/unable-to-install-ea-app-on-ubuntu-22-04/17807",
+        "https://forums.lutris.net/t/solved-sha256-error-with-times32-exe-trying-to-install-ea-app/19005",
+        "https://raw.githubusercontent.com/AreWeAntiCheatYet/AreWeAntiCheatYet/HEAD/games.json",
+        "https://www.gamingonlinux.com/2026/03/ea-javelin-anticheat-job-listing-mentions-future-support-for-linux-and-proton",
+        "https://www.gamingonlinux.com/2025/08/battlefield-6-will-be-a-unplayable-on-linux-systems-due-to-the-anti-cheat",
+        "https://raw.githubusercontent.com/dragoonDorise/EmuDeck/main/tools/proton-launch.sh",
+        "https://www.inverse.com/gaming/ea-desktop-app-xbox-game-pass-pc-how-to",
+        "https://www.mcvuk.com/business-news/ea-play-for-xbox-game-pass-on-pc-requires-ea-app-and-linked-ea-account",
+        "https://xbox.com/en-ie/xbox-game-pass/pc-game-pass (EA Play FAQ)",
+        "https://help.ea.com/help/ea-play/ea-play-and-xbox-game-pass/ (official article; page is JS-only, content taken from the search excerpt)",
+        "https://help.ea.com/en/help/ea-play/ea-play-xbox-game-pass-pc/ (official article; could not be fetched)"
+      ],
+      "confidence": "medium",
+      "publisher_match": [
+        "electronic arts",
+        "ea "
+      ]
+    },
+    "battle-net": {
+      "name": "Battle.net",
+      "publisher": "Blizzard Entertainment (Activision Blizzard / Microsoft Gaming)",
+      "installer": {
+        "url": "https://downloader.battle.net/download/installer/win/1.0.66/Battle.net-Setup.exe",
+        "filename": "Battle.net-Setup.exe",
+        "silent_args": [
+          "--lang=enUS",
+          "--installpath=C:\\Program Files (x86)\\Battle.net"
+        ],
+        "sha256": "de5d32d4ea5eed5a9e120027fb68b370976dbfecc8f2a8f91305977f0b87fcaf",
+        "wait": "exit",
+        "success_codes": [
+          0
+        ],
+        "timeout_seconds": 3600,
+        "interactive": true,
+        "interactive_note": "Battle.net Setup has no silent mode: click Install in its window and let it download the client (needs *.blizzard.com / *.battle.net). When it finishes it starts the client with the login window; you can sign in there or close it and open Battle.net from Xodus.",
+        "notes": "Pinned to the versioned file that the official rolling link https://downloader.battle.net/download/getInstaller?os=win&installer=Battle.net-Setup.exe 302-redirects to (verified 2026-10-10: 4,896,464 bytes, sha256 as pinned, identical to winget's InstallerSha256 for 1.19.3.3219; the versioned URL keeps serving that exact file, so the hash stays valid until this recipe is deliberately bumped to a newer setup). The rolling link itself is kept under installer.alternatives. Official publisher URL (the one winget's Blizzard.BattleNet manifest uses); it 302-redirects to https://downloader.battle.net/download/installer/win/1.0.66/Battle.net-Setup.exe (4,896,464 bytes, Last-Modified 2026-06-10, PE32 i386, FileVersion 1.19.3.3219). Lutris uses the equivalent https://www.battle.net/download/getInstallerForGame?os=win&version=LIVE&gameProgram=BATTLENET_APP which ends at the same file. The sha256 above was computed on 2026-10-10 from the official URL and is identical to winget's InstallerSha256 for 1.19.3.3219; it changes whenever Blizzard ships a new setup bootstrapper, so treat a mismatch as 'unknown build, re-verify against microsoft/winget-pkgs manifests/b/Blizzard/BattleNet' rather than a hard failure. The switches come from the winget manifest (Custom: --lang=enUS, InstallLocation: --installpath=\"<path>\"); there is NO fully silent mode (Blizzard forum thread 'Desktop App silent install', last confirmed 2024-11: UI still shows), so the setup window appears and the user clicks Install. Setup is only a bootstrapper: it downloads the Agent (C:\\ProgramData\\Battle.net\\Agent) and the client from Blizzard CDNs during install, so it needs network access to *.blizzard.com and *.battle.net (DNS filters/proxies cause 'Object moved' or BLZBNTBTS00000029 at ~25%). Lutris' recipe writes drive_c/users/<wine user>/AppData/Roaming/Battle.net/Battle.net.config BEFORE running setup with this JSON: {\"Client\":{\"GameLaunchWindowBehavior\":\"2\",\"GameSearch\":{\"BackgroundSearch\":\"true\"},\"HardwareAcceleration\":\"false\",\"Install\":{\"DownloadLimitNextPatchInBps\":\"0\"},\"Sound\":{\"Enabled\":\"false\"},\"Streaming\":{\"StreamingEnabled\":\"false\"}},\"Games\":{\"s2\":{\"AdditionalLaunchArguments\":\"-Displaymode 1\"}}} (hardware acceleration off avoids the spinning-icon/blank login window, streaming off avoids a black screen when a game starts, GameLaunchWindowBehavior 2 hides the client while a game runs). Note the Wine user directory is drive_c/users/<$USER> for a prefix made with wine directly but drive_c/users/steamuser for one made by GE-Proton's proton script. When setup finishes it auto-starts the client and shows the login window; Lutris tells the user not to log in there but to close it (then runs winekill); for a guided sign-in flow the user can simply log in at that point. Install into the prefix's own filesystem (ext4/btrfs), never NTFS (Lutris docs).",
+        "alternatives": [
+          {
+            "name": "Battle.net Setup, current release (unversioned redirector)",
+            "url": "https://downloader.battle.net/download/getInstaller?os=win&installer=Battle.net-Setup.exe",
+            "filename": "Battle.net-Setup.exe",
+            "notes": "The publisher's rolling download link (the winget Blizzard.BattleNet manifest uses it); it 302-redirects to the versioned file of the moment. Use it with installer.sha256 set to null in an override when the pinned 1.0.66 build goes away."
+          }
+        ]
+      },
+      "runtime": {
+        "kind": "ge-proton",
+        "min_version": "GE-Proton9-23"
+      },
+      "prefix": {
+        "winetricks": [],
+        "dll_overrides": {
+          "locationapi": "d"
+        },
+        "registry": [
+          {
+            "key": "HKCU\\Software\\Wine\\DXVA2",
+            "name": "backend",
+            "type": "REG_SZ",
+            "value": "va"
+          }
+        ],
+        "env": {
+          "WINE_SIMULATE_WRITECOPY": "1",
+          "STORE": "battlenet",
+          "STAGING_SHARED_MEMORY": "1"
+        },
+        "arch": "win64",
+        "files": [
+          {
+            "path": "drive_c/users/{user}/AppData/Roaming/Battle.net/Battle.net.config",
+            "content": "{\n  \"Client\": {\n    \"GameLaunchWindowBehavior\": \"2\",\n    \"GameSearch\": {\n      \"BackgroundSearch\": \"true\"\n    },\n    \"HardwareAcceleration\": \"false\",\n    \"Install\": {\n      \"DownloadLimitNextPatchInBps\": \"0\"\n    },\n    \"Sound\": {\n      \"Enabled\": \"false\"\n    },\n    \"Streaming\": {\n      \"StreamingEnabled\": \"false\"\n    }\n  },\n  \"Games\": {\n    \"s2\": {\n      \"AdditionalLaunchArguments\": \"-Displaymode 1\"\n    }\n  }\n}\n",
+            "notes": "Lutris' pre-seeded client config: hardware acceleration off (blank/spinning login window), streaming off (black screen at game start), the client hides itself while a game runs. Written before setup runs and whenever it is missing."
+          }
+        ]
+      },
+      "exe": "drive_c/Program Files (x86)/Battle.net/Battle.net.exe",
+      "launch": {
+        "open_args": [],
+        "game_url": null,
+        "game_args": [
+          "--exec=launch {game_id}"
+        ],
+        "install_args": [
+          "--exec=install {game_id}"
+        ]
+      },
+      "installed_games": {
+        "method": "directory",
+        "scanner": "battlenet",
+        "registry_key": "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        "directory": "drive_c/ProgramData/Battle.net/Agent/product.db",
+        "notes": "Primary source (used by Lutris, Playnite and the GOG Galaxy Blizzard plugin): the Agent's protobuf database <prefix>/drive_c/ProgramData/Battle.net/Agent/product.db. Layout (Lutris product_db.py, verified on this machine's ~/.wine copy with a 40-line stdlib varint decoder): top-level message field 1 (repeated, length-delimited) = ProductInstall; ProductInstall field 1 = uid (string, the uninstall tag, e.g. 'fenris', 'prometheus', 'battle.net'), field 2 = product_code (string, NGDP code, e.g. 'fenris', 'pro', 'bna'), field 3 = settings {1 = install_path string, 2 = play_region string}, field 4 = cached_product_state {1 = base_product_state {1 = installed bool, 2 = playable bool, 7 = current_version_str string}}. Skip product codes 'bna' (the client itself, uid 'battle.net') and 'agent'. install_path is a Windows path written with forward slashes and a drive letter (observed: 'C:/ProgramData/Battle.net/Agent', 'Z:/home/martinv/Games/battlenet/drive_c/Program Files (x86)/Battle.net'), so map C:/ to <prefix>/drive_c/ and Z:/ to /. Map product_code -> launch code -> name with the table from Lutris GAME_IDS / Playnite BattleNetGames.cs: Game Pass-relevant rows (product_code | uid | --exec launch code | name): fenris|fenris|Fen|Diablo IV; d3|diablo3|D3|Diablo III; pro|prometheus|Pro|Overwatch 2; s1|s1|S1|StarCraft Remastered; s2|s2|S2|StarCraft II; rtro|rtro|RTRO|Blizzard Arcade Collection; hero|heroes|Hero|Heroes of the Storm; w1r|w1r|W1R|Warcraft I: Remastered; w2r|w2r|W2R|Warcraft II: Remastered; w3|w3|W3|Warcraft III: Reforged; hsb|hs_beta|WTCG|Hearthstone; wlby|wlby|WLBY|Crash Bandicoot 4; osi|osi|OSI|Diablo II: Resurrected; wow|wow|WoW|World of Warcraft; gryphon|gryphon|GRY|Warcraft Rumble; anbs|anbs|ANBS|Diablo Immortal; codhq|codhq|CODHQ|Call of Duty HQ. Xbox titles sold on Battle.net (Playnite only, uid | launch code): aqua|AQUA Avowed; aris|ARIS DOOM: The Dark Ages; scorpio|SCOR Sea of Thieves; libra|LBRA Tony Hawk's Pro Skater 3+4; arkansas|ARK The Outer Worlds 2; pinta|PNTA Call of Duty: Modern Warfare III; Diablo (1996) is 'D1' in Playnite; their product.db product_code values are unverified, so match on uid (Playnite matches uid case-insensitively by prefix, e.g. 'Fen' matches 'fenris'). Registry fallback (Playnite GetInstalledGames; Playnite notes the client does not create keys for some games, hence product.db first): enumerate HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\<DisplayName> (in <prefix>/system.reg: [Software\\\\Wow6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\<name>]) where UninstallString matches regex Battle\\.net.*--uid=(\\S+) and read InstallLocation + DisplayName. Verified locally for the client entry: DisplayName=\"Battle.net\", InstallLocation=\"Z:\\\\home\\\\...\\\\Program Files (x86)\\\\Battle.net\", UninstallString=\"\\\"C:\\\\ProgramData\\\\Battle.net\\\\Agent\\\\Blizzard Uninstaller.exe\\\" --lang=enUS --uid=battle.net --displayname=\\\"Battle.net\\\"\". The entry with --uid=battle.net gives the client install dir (Playnite's BattleNet.InstallationPath, exe = <InstallLocation>\\Battle.net.exe); the Galaxy plugin instead reads HKCR\\battlenet\\shell\\open\\command. The client also stores HKLM\\SOFTWARE\\WOW6432Node\\Blizzard Entertainment\\Battle.net\\Capabilities\\ApplicationIcon = \"<dir>\\Battle.net.exe\",0 (verified locally)."
+      },
+      "signin": {
+        "summary": "Battle.net makes the Game Pass titles installable at no charge once your Battle.net account is connected to the Microsoft account that holds the subscription. The connection is made on account.battle.net, not in the app.",
+        "game_pass_library": true,
+        "steps": [
+          "Click Open Battle.net and sign in with your Battle.net account (or create one at the 'Create account' link). If the login window shows only a spinning icon, close it and open Battle.net again.",
+          "In your web browser open https://account.battle.net/connections, choose Xbox and sign in with the Microsoft account that holds the PC Game Pass or Game Pass Ultimate subscription. Connect the right Battle.net account the first time: Blizzard enforces cooldowns on re-linking.",
+          "Quit Battle.net and open it again: the titles Game Pass includes (Diablo IV, StarCraft II, the Warcraft remasters, the Xbox titles sold on Battle.net such as Avowed and DOOM: The Dark Ages, ...) show Install instead of a price on their game pages. Call of Duty is not part of this (and its kernel anti-cheat cannot run on Linux).",
+          "Install the game in Battle.net - the download runs inside Battle.net."
+        ],
+        "xbox_link": "Game Pass entitlement reaches Battle.net through the Battle.net <-> Microsoft account connection (account.battle.net/connections). Per Blizzard support ('Games Playable on Battle.net with Game Pass', articles 367382/357107, read via search snippets because the support SPA does not render without JS): requires a linked Xbox account plus active PC Game Pass or Ultimate; titles: Diablo (PC), Diablo III, Diablo IV, Overwatch 2 (F2P, perks), StarCraft Remastered, StarCraft II, Blizzard Arcade Collection, Heroes of the Storm (F2P, perks), Warcraft I: Remastered, Warcraft II: Remastered, Warcraft III: Reforged, and the Xbox titles sold on Battle.net with Xbox Play Anywhere: Avowed, DOOM: The Dark Ages (from 2025-05-15), Sea of Thieves (from 2025-05-22), Tony Hawk's Pro Skater 3+4, Crash Bandicoot 4: It's About Time. The Outer Worlds 2 is sold on Battle.net (Playnite code ARK) but its Game Pass-on-Battle.net status was not confirmed. Call of Duty is NOT on the Battle.net Game Pass list: Game Pass CoD goes through the Xbox app, and it would not run on Linux anyway (Ricochet). Games are NOT delivered as Store packages, so xodus-cli/run_download does not apply; Battle.net's own Agent downloads and updates them inside the launcher prefix.",
+        "notes": [
+          "Start Battle.net.exe in the launcher prefix; the login window is a Chromium (CEF) web view. Sign in with the Battle.net account (or create one at the 'Create account' link). If the window shows only a spinning icon / no buttons, hardware acceleration must be off (Battle.net.config Client.HardwareAcceleration=false) and the drive_c/ProgramData/Battle.net cache can be deleted.",
+          "Link the Microsoft/Xbox account that holds the Game Pass subscription: open https://account.battle.net/connections in the system browser (Blizzard support and NVIDIA GFN both direct here), choose Xbox, and sign in with that Microsoft account. Blizzard warns to connect it to the correct Battle.net account because linking has cooldowns that Customer Support will not bypass.",
+          "Alternative official route (Blizzard support 'How to Access Battle.net Games Through Game Pass'): find the Battle.net title on the Game Pass site (xbox.com), press Install, pick Battle.net, install the app if needed, create/confirm the Battle.net account and confirm the link to the Microsoft account.",
+          "An active PC Game Pass or Game Pass Ultimate subscription is required (console-only Game Pass does not count; free-to-play titles like Overwatch 2 and Heroes of the Storm need no subscription but get perks with one).",
+          "Back in the Battle.net app (restart it after linking), the Game Pass-included titles become installable at no charge from their game pages / the games list; the launcher can then start them with --exec=launch <code> or open a game page with --game=<uid> (or start an install with --exec=install <code>). The exact in-app label ('Game Pass' tag) is not verified in the sources."
+        ]
+      },
+      "anticheat": {
+        "notes": "No EAC or BattlEye runtime is needed for the launcher or for any Blizzard title (Lutris scripts set eac:false, battleye:false). Blizzard games use Warden, a user-mode module that runs under Wine: AreWeAntiCheatYet lists Overwatch 2 as Supported and Diablo IV / Diablo III / Diablo II: Resurrected / StarCraft / StarCraft II / Warcraft III: Reforged / Heroes of the Storm / World of Warcraft as Running (online play works, no bypass needed). Modern Call of Duty titles sold on Battle.net use the Ricochet kernel driver and are Broken on Linux (MW 2019, Warzone, Vanguard, MWII, MWIII, Black Ops 6; Black Ops 7 Denied), single-player included, so there is nothing to bypass; Black Ops 4 and Black Ops Cold War use Treyarch anti-cheat and are reported Running/Supported via the Lutris Battle.net runner. Xbox titles via Battle.net: Avowed, DOOM: The Dark Ages, The Outer Worlds 2, Tony Hawk's Pro Skater 3+4 and Crash Bandicoot 4 have no AreWeAntiCheatYet entry (no known anti-cheat). Sea of Thieves uses Easy Anti-Cheat (Steam build Supported with Proton's EAC runtime); whether the Battle.net build ships the Linux EAC module (easyanticheat_x64.so) is unverified, so treat it as 'needs Proton EasyAntiCheat Runtime + verification' and label online modes unavailable if the module is missing. FACEIT/ChallengerMode third-party clients for Overwatch 2 / WC3 / Hearthstone are Broken (not relevant to Game Pass)."
+      },
+      "known_issues": [
+        "Grey/blank client window after a Battle.net self-update (build 14542, Dec 2024, and later): fixed by WINE_SIMULATE_WRITECOPY=1 on Proton-like Wine builds (CodeWeavers/Lutris advice) and by GE-Proton9-23 ('update wine to bleeding-edge, fixes battle.net broken updates'); GE-Proton10-18+ sets the variable itself only when STORE=battlenet reaches its proton script (accidentally dropped, re-added in GE-Proton10-21), so set it explicitly when invoking wine directly; the old workaround (delete the newer Battle.net.<build> folder under the install dir) must be repeated at every start.",
+        "Native Wine-Wayland driver (PROTON_ENABLE_WAYLAND=1 / WINE_GRAPHICS_DRIVER=wayland) gave a white screen until GE-Proton11-2/11-3 added '--in-process-gpu handling for Wine Wayland launchers' and the Wayland white-screen fix; keep the default X11/XWayland path or use GE-Proton >= 11-3. Latest release at research time: GE-Proton11-7 (2026-09-16).",
+        "Spinning icon / no login buttons: disable hardware acceleration in the app (Battle.net.config Client.HardwareAcceleration=false) and/or delete the cache in drive_c/ProgramData/Battle.net (Lutris docs, Blizzard article 34721). One CachyOS report in 2026 had the opposite fix (enable browser hardware acceleration), so expose the toggle.",
+        "Black screen when a game starts: disable streaming (Client.Streaming.StreamingEnabled=false).",
+        "Installer stuck / 'Object moved' / error BLZBNTBTS00000029 at ~25% / 'trouble launching the Blizzard Update Agent': network filtering or throttling of *.blizzard.com and *.battle.net (PiHole, proxy, custom DNS; a 2026 CachyOS thread was solved by switching networks), missing 32-bit Vulkan/Mesa libraries (Battle.net and its Agent are 32-bit; lib32-mesa / lib32-vulkan-icd-loader and lib32 driver ICD required), or no reboot after a driver install.",
+        "Prefix on NTFS: Battle.net does not work (Lutris docs).",
+        "Very slow login/UI: the machine hostname must resolve to 127.0.0.1 in /etc/hosts.",
+        "Agent 'went to sleep' / greyed Install button / stuck updates: kill Agent.exe, Battle.net.exe and wineserver (stop_wine), delete drive_c/ProgramData/Battle.net, restart; existing games come back via Settings > Game Install/Update > Scan for Games.",
+        "'Battle.net Launcher.exe' (the Start Menu shortcut target and Lutris' base exe) sometimes does not start under Wine; Lutris docs say switch to Battle.net.exe, which Playnite, the Galaxy plugin and all per-game Lutris installers use, hence the exe in this recipe.",
+        "'Blizzard Error: The Application Encountered an unexpected error': bad system fonts (e.g. AUR all-repository-fonts) or missing 32-bit Vulkan loader. Garbled/missing UI text was worked around in a CachyOS thread with winetricks corefonts/tahoma, but that was not the root cause there.",
+        "dxvk.conf with dxgi.nvapiHack enabled crashes Battle.net (GE-Proton8-1 release note); keep DXVK defaults in the launcher prefix.",
+        "Process lifecycle: the client keeps running in the background (Agent.exe, 'Battle.net Helper.exe' CEF helpers) and does not exit on window close; Lutris excludes Agent.exe and \"Battle.net Helper.exe\" from process tracking and the Galaxy plugin taskkills Battle.net.exe; GameLaunchWindowBehavior=2 hides the client when a game starts. Expect the game to be a child/sibling Wine process rather than the exe you launched.",
+        "Setup has no silent mode; it shows UI and auto-launches the client with the login window when done. Lutris' instruction: do not log in during the install step, close the window, log in on the next start (winekill between steps).",
+        "Account linking has cooldowns; linking the wrong Battle.net account to the Microsoft account is the top support issue (Blizzard 'Common Problems' article 358216). Only PC Game Pass / Ultimate unlock titles; free-to-play titles never need a subscription.",
+        "Lutris also exports STAGING_SHARED_MEMORY=1, DXVK_HUD=compiler, DXVK_STATE_CACHE_PATH=$GAMEDIR and NVIDIA __GL_SHADER_DISK_CACHE* variables; only the first is kept here (the rest are cosmetic/NVIDIA cache tuning). The base Lutris script installs no winetricks verbs; the Overwatch 2 script adds 'arial' for in-game fonts and writes a dxvk.conf with dxgi.nvapiHack = False, and the StarCraft II entry passes '-Displaymode 1' via Battle.net.config Games.s2.AdditionalLaunchArguments.",
+        "umu-database has no battlenet rows and umu-protonfixes has no gamefixes-umu/umu-battlenet.py, so no automatic protonfix exists beyond the proton script's STORE=battlenet writecopy rule; Heroic Games Launcher has no Battle.net integration (not relevant).",
+        "The battlenet:// and blizzard:// URL protocols are registered by the client (verified in the local prefix registry: Software\\Classes\\battlenet with 'URL Protocol', Capabilities\\URLAssociations battlenet->Blizzard.URI.Battlenet, heroes->Blizzard.URI.Heroes, starcraft->Blizzard.URI.SC2), but no source documents a URL form that launches a specific game and the shell\\open\\command value was not present in the partially removed local prefix, so game_url is null; --exec=launch <code> is the documented path (Blizzard forum, Lutris, Playnite, Galaxy plugin)."
+      ],
+      "sources": [
+        "https://lutris.net/api/installers/battlenet",
+        "https://lutris.net/games/battlenet/",
+        "https://github.com/lutris/docs/blob/master/Battle.Net.md",
+        "https://raw.githubusercontent.com/lutris/lutris/master/lutris/services/battlenet.py",
+        "https://raw.githubusercontent.com/lutris/lutris/master/lutris/util/battlenet/product_db.py",
+        "https://lutris.net/api/installers/diablo-iv",
+        "https://lutris.net/api/installers/overwatch-2",
+        "https://lutris.net/api/installers/starcraft-ii",
+        "https://lutris.net/api/installers/starcraft-remastered",
+        "https://lutris.net/api/installers/diablo-ii-resurrected",
+        "https://github.com/microsoft/winget-pkgs/blob/master/manifests/b/Blizzard/BattleNet/1.19.3.3219/Blizzard.BattleNet.installer.yaml",
+        "https://downloader.battle.net/download/getInstaller?os=win&installer=Battle.net-Setup.exe (downloaded and hashed 2026-10-10)",
+        "https://www.battle.net/download/getInstallerForGame?os=win&version=LIVE&gameProgram=BATTLENET_APP (redirect chain checked 2026-10-10)",
+        "https://github.com/JosefNemec/PlayniteExtensions/blob/master/source/Libraries/BattleNetLibrary/BattleNetGames.cs",
+        "https://github.com/JosefNemec/PlayniteExtensions/blob/master/source/Libraries/BattleNetLibrary/BattleNetLibrary.cs",
+        "https://github.com/JosefNemec/PlayniteExtensions/blob/master/source/Libraries/BattleNetLibrary/BattleNetGameController.cs",
+        "https://github.com/JosefNemec/PlayniteExtensions/blob/master/source/Libraries/BattleNetLibrary/BattleNet.cs",
+        "https://github.com/bartok765/galaxy_blizzard_plugin/blob/master/src/local_client_base.py",
+        "https://github.com/bartok765/galaxy_blizzard_plugin/blob/master/src/local_client.py",
+        "https://github.com/bartok765/galaxy_blizzard_plugin/blob/master/src/definitions.py",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases (notes for GE-Proton9-23, 10-2, 10-18, 10-21, 11-2, 11-3; latest 11-7)",
+        "https://raw.githubusercontent.com/GloriousEggroll/proton-ge-custom/master/proton (STORE=battlenet -> writecopy -> WINE_SIMULATE_WRITECOPY=1)",
+        "https://www.gamingonlinux.com/2025/01/ge-proton-9-23-released-with-a-battlenet-fix-for-linux-steam-deck/",
+        "https://lemmy.nekusoul.de/post/169659",
+        "https://universal-blue.discourse.group/t/battle-net-blank-login-window/11350",
+        "https://discuss.cachyos.org/t/battle-net-not-working-steam-heroic-bottles-lutris-faugus/36284",
+        "https://us.forums.blizzard.com/en/blizzard/t/desktop-app-silent-install/431?page=2",
+        "https://silentinstallhq.com/battle-net-silent-install-how-to-guide/",
+        "https://eu.forums.blizzard.com/en/wow/t/wow-classic-launch-code/86660",
+        "https://us.support.blizzard.com/en/article/000357106 (How to Access Battle.net Games Through Game Pass; content via search snippets, SPA did not render)",
+        "https://eu.support.blizzard.com/en/article/367382 and https://eu.support.blizzard.com/en/article/357107 (Games Playable on Battle.net with Game Pass; via search snippets)",
+        "https://us.battle.net/support/en/article/357108 (Starting Your Blizzard Games on Game Pass) and https://battle.net/support/en/article/358216 (Common Problems)",
+        "https://overwatch.blizzard.com/en-us/news/24107758/",
+        "https://nvidia.custhelp.com/app/answers/detail/a_id/5529/",
+        "https://www.neowin.net/news/sea-of-thieves-is-the-next-xbox-game-to-hit-battlenet-and-with-play-anywhere-support/",
+        "https://www.purexbox.com/news/2025/07/some-xbox-game-pass-titles-are-now-playable-natively-on-steam-deck",
+        "https://raw.githubusercontent.com/AreWeAntiCheatYet/AreWeAntiCheatYet/HEAD/games.json",
+        "https://github.com/Open-Wine-Components/umu-launcher/blob/main/README.md (STORE variable)",
+        "https://raw.githubusercontent.com/Open-Wine-Components/umu-database/main/umu-database.csv (no battlenet rows)",
+        "https://api.github.com/repos/Open-Wine-Components/umu-protonfixes/contents/gamefixes-umu (no battlenet fix)",
+        "local verification: /home/martinv/.wine (drive_c/ProgramData/Battle.net/Agent/product.db, system.reg Uninstall + Classes keys, Battle.net.config)"
+      ],
+      "confidence": "high",
+      "publisher_match": [
+        "blizzard"
+      ]
+    },
+    "rockstar": {
+      "name": "Rockstar Games Launcher",
+      "publisher": "Rockstar Games",
+      "installer": {
+        "url": "https://gamedownloads.rockstargames.com/public/installer/Rockstar-Games-Launcher.exe",
+        "filename": "Rockstar-Games-Launcher.exe",
+        "silent_args": [
+          "/quiet",
+          "/norestart"
+        ],
+        "sha256": null,
+        "wait": "exe",
+        "settle_seconds": 20,
+        "success_codes": [
+          0
+        ],
+        "timeout_seconds": 1800,
+        "notes": "Official URL (same one Lutris, NonSteamLaunchers, winget and Chocolatey use; the socialclub.rockstargames.com download page links to it). The file is replaced in place, so never pin a hash: at research time (2026-10-10) it was launcher 1.0.109.3031, 111,419,512 bytes, Last-Modified 2026-09-03, sha256 321886457b7e4ab727a27671c17a815684a3943579eedf7e2248a3b9f0973746 (matches the winget manifest and a local download); verify size + Authenticode/DigiCert signature or compare against the winget manifest at install time instead. It is a WiX Burn bootstrapper with a custom UI (Burn engine strings in the binary), x64 only, Windows 10+ (Win7/8 support ended 2024-01-30), payloads stored uncompressed as PE resources: Launcher.exe, LauncherPatcher.exe, RockstarService.exe (the 'Rockstar Game Library Service'), RockstarSteamHelper.exe, RockstarXboxHelper.dll, Launcher.rpf, offline.pak, libovr.dll, ucrtbase + api-ms-win-* DLLs, vc_redist.x64/x86 (VC++ 2015-2022, run with '/install /quiet /norestart' by the installer itself), ThirdParty/Steam/steam_api64.dll, ThirdParty/Epic/EOSSDK-Win64-Shipping-1.17.1.3.dll. Silent switches: '/quiet /norestart' is measured to install unattended under GE-Proton11-7 + umu 1.4.4 (unifideck, 2026-09-24); winget lists '/s /f', Chocolatey '/install /quiet /norestart'; '/silent' appears in the binary too. No install-directory switch is known: it always installs to C:\\Program Files\\Rockstar Games\\Launcher and writes HKLM\\SOFTWARE\\WOW6432Node\\Rockstar Games\\Launcher\\InstallFolder plus the Uninstall key 'Rockstar Games Launcher' (InstallLocation, UninstallString uninstall.exe, QuietUninstallString 'uninstall.exe /S'). The installer does NOT exit on its own: at the end it starts Launcher.exe -upgrade (LauncherPatcher self-update) and waits, so the install step must poll for drive_c/Program Files/Rockstar Games/Launcher/Launcher.exe (or the Uninstall key) and then stop the prefix (Lutris: exclude_processes 'RockstarService.exe Launcher.exe LauncherPatcher.exe' then winekill; its prompt says 'Don't login, close the window'). Social Club (SocialClubHelper.exe, the CEF web view, installed to C:\\Program Files\\Rockstar Games\\Social Club) is NOT in the bundle: it is a prerequisite of the 'launcher' title in title_metadata.json and is downloaded and run as Social-Club-Setup.exe /silent /forceinstall on first start, so the first launch needs network and a minute or two. Installer regression: GE-Proton10-32 through 10-34 fail with 'Installation failed' (GloriousEggroll/proton-ge-custom#468, still open; #527 confirms setup crashes on 'latest' GE in May 2026); GE-Proton10-30, Valve Proton, CachyOS Proton and GE-Proton11-7 install fine; one user reported PROTON_NO_NTSYNC=1 helped on 10-32. Once installed, the launcher runs on the builds that failed to install it."
+      },
+      "runtime": {
+        "kind": "ge-proton",
+        "min_version": "GE-Proton11-7"
+      },
+      "prefix": {
+        "winetricks": [],
+        "dll_overrides": {},
+        "registry": [
+          {
+            "key": "HKLM\\System\\CurrentControlSet\\Services\\winebus",
+            "name": "DisableHidraw",
+            "type": "REG_DWORD",
+            "value": "1"
+          },
+          {
+            "key": "HKLM\\System\\CurrentControlSet\\Services\\winebus",
+            "name": "Enable SDL",
+            "type": "REG_DWORD",
+            "value": "1"
+          }
+        ],
+        "env": {
+          "PROTON_USE_XALIA": "0"
+        },
+        "arch": "win64"
+      },
+      "exe": "drive_c/Program Files/Rockstar Games/Launcher/Launcher.exe",
+      "launch": {
+        "open_args": [],
+        "game_url": null,
+        "game_args": [
+          "-launchTitleInFolder",
+          "{install_dir}"
+        ],
+        "install_args": []
+      },
+      "installed_games": {
+        "method": "registry",
+        "scanner": "rockstar",
+        "registry_key": "HKLM\\SOFTWARE\\WOW6432Node\\Rockstar Games",
+        "directory": "drive_c/Program Files/Rockstar Games/<Title name>",
+        "notes": "Each installed title is a subkey of HKLM\\SOFTWARE\\WOW6432Node\\Rockstar Games (in a Wine prefix: the [Software\\\\Wow6432Node\\\\Rockstar Games\\\\<Name>] sections of <prefix>/system.reg, which is exactly how NonSteamLaunchers' NSLGameScanner does it) with a REG_SZ 'InstallFolder' (Windows path); skip the subkeys 'Launcher' and 'Rockstar Games Social Club'. Launcher.exe also knows 'InstallFolderSteam'/'installfoldersteam', 'InstallFolderEpic' and 'InstallFolderXboxPc' value names for copies owned on other stores (Game Pass installs are recorded as InstallFolderXboxPc), so harvest every value whose name starts with 'InstallFolder'. Key name -> titleId -> main exe, from Rockstar's public catalog https://gamedownloads-rockstargames-com.akamaized.net/public/title_metadata.json (installFolderRegKey / titleId / principalFileName; read at runtime, do not redistribute): 'Grand Theft Auto V' -> gta5 -> GTA5.exe (Play wrapper PlayGTAV.exe); 'Red Dead Redemption 2' -> rdr2 -> RDR2.exe (PlayRDR2.exe); 'LANoireMTL' -> lanoire -> LANoire.exe; 'MP3MTL' -> mp3 -> MaxPayne3.exe; 'LANoireVR' -> lanoirevr; 'GTA: San Andreas' -> gtasa -> gta_sa.exe; 'Grand Theft Auto III' -> gta3 -> gta3.exe; 'Grand Theft Auto: Vice City' -> gtavc -> gta-vc.exe; 'Bully' -> bully -> Bully.exe; 'Grand Theft Auto IV' -> gta4 -> GTAIV.exe (PlayGTAIV.exe / LaunchGTAIV.exe); 'GTA III - DE' -> gta3unreal -> Gameface\\Binaries\\Win64\\LibertyCity.exe; 'GTA Vice City - DE' -> gtavcunreal -> ...\\ViceCity.exe; 'GTA San Andreas - DE' -> gtasaunreal -> ...\\SanAndreas.exe. Two titles are missing from that feed and are added by hand by Playnite/Galaxy: 'Grand Theft Auto V Enhanced' -> gta5_gen9 -> GTA5_Enhanced.exe (BattlEye wrapper GTA5_Enhanced_BE.exe, Play wrapper PlayGTAV.exe; the registry key name 'Grand Theft Auto V Enhanced' is what the Vortex extension and gta-mod-manager probe, not verified by me on a real install) and 'Red Dead Redemption' -> rdr -> RDR.exe (Uninstall key named 'Red Dead Redemption'; registry key name unverified). Second, title-id based method (Playnite's official RockstarLibrary): enumerate HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, match UninstallString against (?:Launcher|uninstall)\\.exe.+uninstall=(.+)$ to get the titleId, use InstallLocation as the install dir and DisplayIcon for the icon (Galaxy's plugin notes that GTA V Enhanced often has no classic uninstall entry, so combine both methods). Third, the launcher's own log Documents\\Rockstar Games\\Launcher\\launcher.log ('[titlemanager]' lines, 'on branch' = owned) lists owned and installed titles after sign-in. Default install root is C:\\Program Files\\Rockstar Games\\<Title name> but users can pick any folder, so trust the registry. Launch a detected game with Launcher.exe -launchTitleInFolder \"<InstallFolder>\" (Playnite, GameLib.NET) or by running the title's Play wrapper (PlayGTAV.exe / PlayRDR2.exe), which the Galaxy plugin starts as '<PlayExe> -launchTitleInFolder <dir> @commandline.txt' (@commandline.txt = read extra game arguments from commandline.txt in the game folder, e.g. -fullscreen -vulkan or -nobattleye). Install/uninstall through the client: Launcher.exe -enableFullMode -install=<titleId> / -uninstall=<titleId> (strings confirmed in Launcher.exe). Game Pass titles are NOT installed or launched this way: see signin.xbox_link."
+      },
+      "signin": {
+        "summary": "Game Pass Rockstar titles never show up in the Rockstar Games Launcher's library: it only lists Rockstar Store purchases, and the Game Pass copy is a Store package started from the Xbox side (not supported by Xodus yet). Signing in and linking the Xbox account here is still required to play them.",
+        "game_pass_library": false,
+        "steps": [
+          "Click Open Rockstar Games Launcher. The first start updates itself and installs Rockstar Games Social Club (1-3 minutes); if it crashes once, open it again.",
+          "Sign in in the 'Rockstar Games - Sign In' window with your Rockstar Games Social Club account, tick 'Remember me' and enter the e-mail verification code if asked. Keep this prefix afterwards: every rebuilt prefix counts as a new device, and repeated codes can lock the account.",
+          "In your web browser open https://www.rockstargames.com/account/connections, choose Xbox network and sign in with the Microsoft account that holds the PC Game Pass or Game Pass Ultimate subscription. One Rockstar account can be linked to one Xbox account.",
+          "Game Pass titles do not appear in the launcher's library and cannot be installed from here yet; games bought on the Rockstar Store can. For GTA V story mode on Linux untick BattlEye in the launcher's Settings > General - GTA Online stays unavailable either way."
+        ],
+        "xbox_link": "Game Pass entitlement never goes through the launcher's store account; it comes from the Xbox app side. Since launcher 1.0.9x (update of 2025-03-18, 'adds support for the Xbox PC app') the launcher ships RockstarXboxHelper.dll and the Game Pass build of the game ships RockstarXboxHelper.exe (not in the launcher bundle). Strings in Launcher.exe describe the flow: the Xbox app starts the game package, which writes external Xbox PC metadata (external_launch.xboxpc / launcher_external_xboxpc: xboxpcLocation, xboxpcTitleId, sandbox) and starts the launcher ('Launching via Xbox App', 'Creating Xbox PC min mode launch'); the launcher reads it, stores InstallFolderXboxPc under the title's registry key, checks ownership with an Xbox Live token ('xbl30token', 'CheckXboxPcEntitlement', entitlements.asmx/GetMSStoreCollectionsAccessToken), asks to link the accounts, then has the Rockstar Xbox Helper spawn the game process ('Game launched from Rockstar Xbox Helper'; after too many failed launches it clears the install location from the registry). The helper gets the sandbox and the user token 'from the GDK' (literal log string), so the Game Pass title and the launcher must live in ONE prefix that has a working GDK runtime (xodus's WineGDK), not in a plain GE-Proton prefix: whether xodus-service's Xbox sign-in can hand the helper a usable XSTS token is the untested open question. The Store package itself is the full game (GTA V Enhanced (PC) 9NXFX68ZNKK0 maxInstallSize 103,837,704,192 bytes; GTA V Legacy (PC) 9N9RSV4F7ZR0), so it would be downloaded with xodus-cli, not through the launcher; note that neither product is in data/compat/catalog-index.json, so check why the catalog SIGL omits them before building on this. A linked Rockstar account is still required by Rockstar ('Linking your account with Xbox is required to play Rockstar Games titles via the Xbox app on PC').",
+        "notes": [
+          "Install the launcher (see installer.notes), wait for Launcher.exe to appear, then stop Wine without signing in.",
+          "Start drive_c/Program Files/Rockstar Games/Launcher/Launcher.exe with no arguments. The first start runs LauncherPatcher (self-update) and downloads/installs Rockstar Games Social Club (Social-Club-Setup.exe /silent /forceinstall); expect 1-3 minutes and a possible one-off crash after the first login (Lutris notes) - just start it again.",
+          "Sign in in the separate 'Rockstar Games - Sign In' window (about 700x800) with your Rockstar Games Social Club account. Tick 'Remember me' and, if asked, enter the e-mail verification code. You will get a 'sign-in from an unknown device' e-mail; keep this prefix (and Documents\\Rockstar Games\\Social Club) forever, because every rebuilt prefix counts as a new device and repeated codes can lock the account (Heroic issue #5004).",
+          "Link your Xbox account. Officially this happens inside the launcher: when a Rockstar title is started from the Xbox app / Game Pass hand-off the launcher shows a 'Link Account' prompt; accept it and choose whether to enable cloud saves (if you cancel, the official instruction is to go back to the Xbox app and press Play again). You can also link ahead of time on the web: https://www.rockstargames.com/account/connections -> 'Xbox network' -> Link -> sign in with the Microsoft account that holds the Game Pass subscription (Rockstar support articles 1pdAM0aqBhazhqv1gxxA9D and 3pfU39dbg9x6VZG9diluJ9; unlinking: LEB9IlpOwYzfpw7hugY00). One Rockstar account can be linked to one Xbox account.",
+          "Game Pass titles do not appear in the launcher's own library or store: the launcher only lists Rockstar Store purchases there. A Game Pass copy shows up as an installed title only after the Xbox PC hand-off has registered it (InstallFolderXboxPc), and it is launched from the Xbox side, not from the launcher.",
+          "Optional, for GTA V story mode on Linux: Settings (top right) -> General -> untick BattlEye. GTA Online stays unavailable either way."
+        ]
+      },
+      "anticheat": {
+        "notes": "The launcher itself has no anti-cheat; it only needs its Windows service RockstarService.exe (Rockstar Game Library Service) to run inside the prefix, and Social Club does a 'modScan' of the game folder (whitelisted files in title_metadata.json). Per game: GTA V Legacy and GTA V Enhanced use BattlEye for GTA Online since 2024-09-17 and Rockstar has not enabled BattlEye's Proton/Linux support, so GTA Online is 'Denied' on AreWeAntiCheatYet and installing Steam's 'Proton BattlEye Runtime' changes nothing (publisher opt-in is required); Story Mode works with BattlEye off (launcher Settings -> General -> untick BattlEye, or '-nobattleye' in the game's commandline.txt; the launcher's own 'BattlEye is required to play GTA Online' screen just blocks Online) -> label GTA V 'story mode only, online unavailable'. Red Dead Redemption 2 / Red Dead Online: no BattlEye/EAC (Rockstar-side detection only); RDO worked under GE-Proton since 6.5-GE-2 (ProtonDB gold, trending platinum) but reports are mixed, so label online 'may work'. Red Dead Redemption (2024 PC port): single-player only, no anti-cheat, ProtonDB platinum. Max Payne 3, L.A. Noire, GTA IV, GTA Trilogy DE, San Andreas/Vice City/III: no kernel anti-cheat (MP3 multiplayer unverified). No Rockstar title needs the Proton EasyAntiCheat Runtime and there is no start_protected_game-style bypass to apply; the only 'bypass' is the official BattlEye toggle for GTA V."
+      },
+      "known_issues": [
+        "GE-Proton10-32..10-34 cannot run the installer ('Installation failed', GE #468 open since 2026-03; GE #527 adds 'Rockstar client setup crashes with latest GE-Proton' in May 2026). Install with GE-Proton10-30, Valve Proton, CachyOS Proton or GE-Proton11-7 (measured OK), then run with whatever build; PROTON_NO_NTSYNC=1 helped one reporter only.",
+        "The installer never exits: it spawns Launcher.exe -upgrade and waits. Poll for Launcher.exe / the Uninstall key, then stop the prefix (Lutris: exclude_processes RockstarService.exe Launcher.exe LauncherPatcher.exe + winekill). Lutris issue #6723 'Launcher.exe missing' is this step crashing under a bad GE build.",
+        "First start downloads Social Club and self-updates (LauncherPatcher); the launcher may crash once right after the first login (Lutris GTA IV installer note) - relaunch. 'Stuck on connecting' / 'could not connect to Rockstar services, cannot start offline' appeared after some GE-Proton updates (fixed in 7.0rc3-GE-1 and 6.10-GE-1; regression in GE-Proton10-24 fixed in 10-25).",
+        "Blank or black launcher/sign-in window under wine-wayland or some builds (GE #310 wine_wayland content not shown; Heroic #5888 'login only showed up on an X11-focused Proton build, probably wayland CEF issues'; Arch BBS: 'proton 9 works, proton-ge gave a black window'). Keep the launcher on X11/XWayland and do not set PROTON_ENABLE_WAYLAND; update GPU drivers (PCGW 'stuck at black loading screen').",
+        "Social Club 2.4.0.240 (CEF 143, Sep 2026) under Proton: SocialClubHelper blocked ~30 s in CoCreateInstance(MMDeviceEnumerator) (PipeWire audio enumeration), the launcher aborts after 30 s with SC_INIT_ERR_WEBSITE_FAILED_LOAD or 'An error occurred while authenticating with Rockstar Games services (Code: 2)' (Proton #3291 comments 2026-09-04/06; also 'invalid request' at sign-in on Proton Experimental, Proton #8495 2026-09-17). Workaround: per-process native mmdevapi.dll stub for SocialClubHelper (gist aliannas2/735af663bfdeeacc944d6e75f45509f3); reporters say it resolved itself by 2026-09-20 (cause unknown) - treat as recurring risk whenever Social Club/CEF updates.",
+        "E-mail 2FA on every launch / account lockout when the device fingerprint changes (Heroic #5004): never rebuild or move the launcher prefix; persist Documents\\Rockstar Games\\Social Club and the launcher AppData; tick 'Remember me'. Offline mode only works after an online sign-in with 'Remember my password' and each game launched once online (PCGW).",
+        "Ownership is store-specific: a title bought on Steam needs RockstarSteamHelper (launcher reads SteamAppId env and tries to init Steam - never export SteamAppId/SteamGameId into the launcher prefix unless the game really is the Steam copy; umu-protonfixes deletes it for non-Steam launches); Epic copies need the fake EpicGamesLauncher.exe + com.epicgames.launcher protocol (Heroic wiki); Game Pass copies need the RockstarXboxHelper hand-off with a GDK runtime. Without the right helper the launcher says the game is not owned and offers to buy it.",
+        "Launcher self-updates (downloadAndSwap=true for 'launcher' in title_metadata.json) and must be running for any game (it is the DRM): a launcher update can change the install flow, the CEF version or the log format at any time; the launcher's Social Club IPC verification kills the game if the launcher is killed first (kill LauncherPatcher.exe only after Launcher.exe, Galaxy plugin note).",
+        "Gamescope does not work with the launcher or its games (lutris #5870). Regional network blocks can break the first configuration (Manjaro forum: VPN during install and first start + newest Wine-GE).",
+        "GTA Online is not playable on Linux (BattlEye without Proton opt-in); Story Mode needs BattlEye unticked in Settings -> General or -nobattleye in commandline.txt. GTA V Enhanced needs GE-Proton9-27+ (GetDpiAwarenessContextForProcess patch, now upstream) and, in a fresh prefix, winetricks vcrun2019 if it dies with 'ucrtbase.dll._strerror_s' (Heroic wiki); GE-Proton10-34 added the GTA V protonfix winebus DisableHidraw=1 / Enable SDL=1 for controllers (included in prefix.registry because games share this prefix).",
+        "Red Dead Redemption 2: may refuse to start unless commandline.txt contains -fullscreen -vulkan (umu-protonfixes 1174180); DX12 default can black-screen -> use Vulkan (Settings or <API>kSettingAPI_Vulcan</API> in Documents\\Rockstar Games\\Red Dead Redemption 2\\Settings\\system.xml); 'exited unexpectedly' -> WINEDLLOVERRIDES=vulkan-1=n,b for that game (Heroic wiki, unifideck); 'failed to initialize graphics device' -> run the game's Redistributables\\VulkanRT installer in the prefix or switch to DX12; GE-Proton11-6 ships an RDR2 DualSense->DS4 controller preset.",
+        "GTA V/RDR2 first launch may pick a wrong resolution: switch to borderless windowed (Lutris notes). GTA IV Complete Edition on the launcher: PlayGTAIV.exe is sometimes renamed LaunchGTAIV.exe by community fixes (Galaxy plugin fallback).",
+        "Winetricks used by the vanilla-Wine Lutris scripts (corefonts for the launcher; corefonts vcrun2019 win10 for GTA V; arial vcrun2019 win10 for GTA IV) are not needed under GE-Proton (the bundle installs VC++ itself, GE prefixes are Windows 10 by default, and the unifideck measurement used no winetricks); add corefonts only if the CEF sign-in page shows missing glyphs.",
+        "Installer hash changes in place (same URL, Last-Modified bumps with every launcher release): verify the download by size/signature or against the winget manifest, never against a pinned sha256.",
+        "Windows-only issues that do not apply under Wine: Social-Club-Setup.exe loop with mandatory ASLR (PCGW), 'Install additional software' UAC prompts, and the launcher's Brazil purchase block (2026-03-16)."
+      ],
+      "sources": [
+        "https://lutris.net/api/installers/rockstar-games-launcher",
+        "https://lutris.net/api/installers/grand-theft-auto-v",
+        "https://lutris.net/api/installers/grand-theft-auto-iv",
+        "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/r/RockstarGames/Launcher/1.0.109.3031/RockstarGames.Launcher.installer.yaml",
+        "https://community.chocolatey.org/packages/rockstar-launcher",
+        "https://www.pcgamingwiki.com/wiki/Store:Rockstar_Games_Launcher",
+        "https://gamedownloads-rockstargames-com.akamaized.net/public/title_metadata.json",
+        "https://gamedownloads.rockstargames.com/public/installer/Rockstar-Games-Launcher.exe (downloaded to the scratchpad; hash, headers, payload map and string scan of Launcher.exe / RockstarXboxHelper.dll)",
+        "https://github.com/JosefNemec/PlayniteExtensions/tree/master/source/Libraries/RockstarLibrary",
+        "https://github.com/tylerbrawl/Galaxy-Plugin-Rockstar/blob/master/src/local.py",
+        "https://github.com/melcom-creations/galaxy-integration-rockstar (CHANGELOG.md, src/game_cache.py)",
+        "https://github.com/tekgator/GameLib.NET/blob/main/GameLib.Plugin/GameLib.Plugin.Rockstar/RockstarGameFactory.cs",
+        "https://github.com/mubaraknumann/unifideck/blob/main/docs/feasibility/rockstar.md",
+        "https://github.com/mubaraknumann/unifideck/blob/main/py_modules/unifideck/launcher/proton/fixes/game_fixes.py",
+        "https://github.com/moraroy/NonSteamLaunchers-On-Steam-Deck/blob/main/NonSteamLaunchers.sh",
+        "https://github.com/moraroy/NonSteamLaunchers-On-Steam-Deck/blob/main/NSLGameScanner.py",
+        "https://github.com/Open-Wine-Components/umu-protonfixes/blob/master/gamefixes-steam/271590.py",
+        "https://github.com/Open-Wine-Components/umu-protonfixes/blob/master/gamefixes-steam/1174180.py",
+        "https://github.com/Open-Wine-Components/umu-database/blob/main/umu-database.csv",
+        "https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/wiki/Rockstar-Games-from-Epic-Games",
+        "https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/issues/5004",
+        "https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/issues/5888",
+        "https://github.com/GloriousEggroll/proton-ge-custom/issues/468",
+        "https://github.com/GloriousEggroll/proton-ge-custom/issues/342",
+        "https://github.com/GloriousEggroll/proton-ge-custom/issues/345",
+        "https://github.com/GloriousEggroll/proton-ge-custom/issues/527",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases (notes of 6.5-GE-2, 6.10-GE-1, 7.0rc3-GE-1, GE-Proton9-26/9-27, GE-Proton10-34, GE-Proton11-6)",
+        "https://github.com/ValveSoftware/Proton/issues/3291",
+        "https://github.com/ValveSoftware/Proton/issues/8495",
+        "https://gist.github.com/aliannas2/735af663bfdeeacc944d6e75f45509f3",
+        "https://github.com/lutris/lutris/issues/6723",
+        "https://github.com/lutris/lutris/issues/6062",
+        "https://github.com/lutris/lutris/issues/5870",
+        "https://www.protondb.com/api/v1/reports/summaries/271590.json (and 3240220, 1174180, 2668510, 204100, 110800, 12210)",
+        "https://raw.githubusercontent.com/AreWeAntiCheatYet/AreWeAntiCheatYet/HEAD/games.json",
+        "https://www.gamingonlinux.com/2024/09/grand-theft-auto-v-gets-battleye-anti-cheat-breaks-online-play-on-steam-deck-linux/",
+        "https://support.rockstargames.com/articles/1pdAM0aqBhazhqv1gxxA9D (Xbox account linking for Rockstar titles on the Xbox app on PC; site refuses non-browser connections, steps taken from search-engine excerpts)",
+        "https://support.rockstargames.com/articles/3pfU39dbg9x6VZG9diluJ9 (linking the Xbox network on the web)",
+        "https://support.rockstargames.com/articles/LEB9IlpOwYzfpw7hugY00 (unlinking)",
+        "https://support.rockstargames.com/articles/3XfrNcY1EJFkCi7LanUvR1 (BattlEye is required to play GTA Online alert)",
+        "https://support.rockstargames.com/articles/q8QWIl8x3JvN0BRv2xXiY (supported titles), https://support.rockstargames.com/articles/DlPyzGduXWUU1kdkHWHjy (system requirements)",
+        "https://www.xbox.com/en-US/games/store/grand-theft-auto-v-enhanced/9NXFX68ZNKK0",
+        "https://xbox.com/en-us/games/store/game/9N9RSV4F7ZR0",
+        "https://news.xbox.com/en-us/2025/04/03/grand-theft-auto-v-game-pass-gtav-enhanced-april-15/",
+        "https://www.sportskeeda.com/gta/news-gta-5-release-xbox-pc-games-pass-imminent-suggests-new-launcher-update",
+        "https://piefed.keyboardvagabond.com/post/129197",
+        "https://forum.manjaro.org/t/how-to-fix-rockstar-launcher-with-lutris/137337",
+        "https://bbs.archlinux.org/viewtopic.php?id=303764",
+        "https://github.com/Thrainkrilleve/Grand-Theft-Auto-V-Enhanced-Edition---Vortex-Extension/blob/main/src/discovery.ts",
+        "https://github.com/caiojohnston/gta-mod-manager/blob/main/internal/gamedetect/detect_windows.go"
+      ],
+      "confidence": "medium",
+      "publisher_match": []
+    },
+    "riot": {
+      "name": "Riot Client",
+      "publisher": "Riot Games",
+      "installer": {
+        "url": "https://bacon.secure.dyn.riotcdn.net/channels/public/x/installer/current/live.live.americas.exe",
+        "filename": "Legends_Of_Runeterra_Installer.exe",
+        "silent_args": [
+          "--skip-to-install",
+          "--disable-auto-launch"
+        ],
+        "sha256": null,
+        "wait": "exit",
+        "success_codes": [
+          0
+        ],
+        "timeout_seconds": 3600,
+        "alternatives": [
+          {
+            "name": "League of Legends bootstrapper (NA)",
+            "url": "https://lol.secure.dyn.riotcdn.net/channels/public/x/installer/current/live.na.exe",
+            "filename": "Install League of Legends na.exe",
+            "notes": "Riot's own download-page link (winget RiotGames.LeagueOfLegends.NA, all Lutris scripts); installs the same shared Riot Client but then downloads League of Legends, which cannot run under Wine (Vanguard). Region variants: live.{na,euw,eune,br,la1,la2,oc1,ru,tr,jp,kr,tw2,ph2,sg2,vn2}.exe."
+          }
+        ],
+        "notes": "Default: the Legends of Runeterra bootstrapper (Americas; europe / asia variants: live.live.europe.exe, live.live.asia.exe), because League cannot run under Wine at all (Vanguard) and LoR is the one Riot title without the kernel driver; it installs the same shared Riot Client. The League bootstrapper is kept under installer.alternatives. Riot publishes no standalone Riot Client installer (riot-client.secure.dyn.riotcdn.net/channels/public/x/installer/current/live*.exe returns 404). Every Riot game bootstrapper (~75 MB, PE32+ x86-64) installs the shared Riot Client into C:\\Riot Games\\Riot Client\\ and then has the client download that product. This URL is the one on Riot's own download page, in all 15 Lutris scripts and in the winget manifest RiotGames.LeagueOfLegends.NA. It is a rolling 'current' link that Riot republishes in place (Content-Disposition 'Install League of Legends na.exe', Last-Modified 2026-08-12), so a hard-pinned hash would break on Riot's next bootstrapper update; as of 2026-10-10 the served file (75,831,040 bytes) hashes to sha256 cc897ef385ff3ae1481106c251a86ac7382f2b736053e9e577aada327cabeb54, identical to winget 138.0.0.4786 (use as a point-in-time check only). Region variants (Lutris): live.{na,euw,eune,br,la1,la2,oc1,ru,tr,jp,kr,tw2,ph2,sg2,vn2}.exe. Bootstrappers of other Riot titles install the same client: VALORANT https://valorant.secure.dyn.riotcdn.net/channels/public/x/installer/current/live.live.{na,eu,ap,kr,br,latam}.exe ('Install VALORANT.exe', winget RiotGames.Valorant.NA, same switches); Legends of Runeterra https://bacon.secure.dyn.riotcdn.net/channels/public/x/installer/current/live.live.{americas,europe,asia}.exe ('Legends_Of_Runeterra_Installer.exe', used by the Lutris 'Riot Games' installer and the LoR snap). Because League cannot run under Wine at all (Vanguard), the LoR bootstrapper is the only sensible default for a Linux install: it pulls the one Riot Client title that has no kernel anti-cheat instead of tens of GB of League. Silent switches (winget manifest): Silent/SilentWithProgress '--skip-to-install', InstallLocation '--install-path=\"<dir>\"', Log '--log-root=\"<dir>\"', Custom '--disable-auto-launch'; silentinstallhq.com additionally lists '--disable-self-update' and '--disable-patching' (not independently verified). Scope is per-user, so uninstall entries land under HKCU. Lutris runs the bootstrapper interactively with the instruction 'Do not log in during installation, just close the installation client once it finishes downloading', then kills Wine. Whether '--skip-to-install' also downloads the game or only the client was not verified."
+      },
+      "runtime": {
+        "kind": "ge-proton",
+        "min_version": null
+      },
+      "prefix": {
+        "winetricks": [],
+        "dll_overrides": {},
+        "registry": [
+          {
+            "key": "HKEY_CURRENT_USER\\Software\\Wine\\X11 Driver",
+            "name": "GrabFullScreen",
+            "type": "REG_SZ",
+            "value": "Y"
+          },
+          {
+            "key": "HKEY_CURRENT_USER\\Software\\Wine\\DirectInput",
+            "name": "MouseWarpOverride",
+            "type": "REG_SZ",
+            "value": "enable"
+          },
+          {
+            "key": "HKEY_CURRENT_USER\\Control Panel\\Colors",
+            "name": "background",
+            "type": "REG_SZ",
+            "value": "40 40 40"
+          }
+        ],
+        "env": {
+          "WINE_LARGE_ADDRESS_AWARE": "1",
+          "STAGING_SHARED_MEMORY": "1",
+          "DXVK_LOG_LEVEL": "none"
+        },
+        "arch": "win64"
+      },
+      "exe": "drive_c/Riot Games/Riot Client/RiotClientServices.exe",
+      "launch": {
+        "open_args": [],
+        "game_url": null,
+        "game_args": [
+          "--launch-product={game_id}",
+          "--launch-patchline=live"
+        ],
+        "install_args": []
+      },
+      "installed_games": {
+        "method": "directory",
+        "scanner": "riot",
+        "registry_key": "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Riot Game {product}.{patchline}",
+        "directory": "drive_c/ProgramData/Riot Games",
+        "notes": "Primary source: drive_c/ProgramData/Riot Games/RiotClientInstalls.json, e.g. {\"associated_client\": {\"D:/Riot Games/VALORANT\": \"C:/Riot Games/Riot Client/RiotClientServices.exe\", \"C:/Riot Games/Riot Client\": \"C:/Riot Games/Riot Client/RiotClientServices.exe\"}, \"rc_default\": \"C:/Riot Games/Riot Client/RiotClientServices.exe\"} (optional \"rc_live\" too; paths use Windows drive letters with forward slashes). Every associated_client key whose basename is not 'Riot Client' is a game install dir; rc_live/rc_default give the client exe. Per-product details: drive_c/ProgramData/Riot Games/Metadata/<product>.<patchline>/<product>.<patchline>.product_settings.yaml with product_install_full_path (e.g. \"D:/Riot Games/VALORANT/live\"), product_install_root, shortcut_enabled; after an uninstall the folder can remain holding only product_install_root (treat as not installed); an update-status.json may sit beside it. The folder name is the game id + patchline: league_of_legends.live (also serves Teamfight Tactics), valorant.live, bacon.live (Legends of Runeterra), lion.live (2XKO). Launch ids for game_args are exactly these product names (league_of_legends, valorant, bacon, lion). Game exe inside the install dir: LeagueClient.exe, VALORANT.exe, LoR.exe, Lion.exe. Display names: League of Legends, VALORANT, Legends of Runeterra, 2XKO. Registry alternative (per-user installer): HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Riot Game <product>.<patchline> -> InstallLocation; UninstallString is '\"C:\\Riot Games\\Riot Client\\RiotClientServices.exe\" --uninstall-product=<product> --uninstall-patchline=<patchline>'. The client itself registers a riotclient:// protocol: HKCR\\riotclient\\shell\\open\\command (or HKLM\\SOFTWARE\\Classes\\riotclient\\shell\\open\\command) default value quotes the RiotClientServices.exe path; the URL grammar of that scheme was not verified, hence game_url null."
+      },
+      "signin": {
+        "summary": "Riot games are free-to-play, so Game Pass unlocks in-game perks rather than games; the link is made on account.riotgames.com. On Linux only Legends of Runeterra can run - League of Legends, Teamfight Tactics, VALORANT and 2XKO need the Vanguard kernel driver.",
+        "game_pass_library": false,
+        "steps": [
+          "Click Open Riot Client and sign in with your Riot Account (create one at https://signup.riotgames.com if needed). Let any download in the client finish before signing in.",
+          "In your web browser open https://account.riotgames.com/xbox-game-pass, click 'Go to the Xbox Social Sign-in Page', sign in with the Microsoft account that holds the Game Pass subscription, allow Riot Games to access the Xbox profile and sign in with your Riot Account.",
+          "The perks (all champions and agents, XP boosts, ...) unlock at the next game login, up to 24 hours later. Nothing is added to a library: every Riot title is already free to install from the client.",
+          "On Linux install only Legends of Runeterra (what this recipe's bootstrapper fetches); League of Legends, Teamfight Tactics, VALORANT and 2XKO need the Vanguard kernel driver and cannot start under Wine."
+        ],
+        "xbox_link": "Account linking at https://account.riotgames.com/xbox-game-pass (Riot Account <-> Xbox profile). It is not a game license: Riot games are free-to-play and there is no Xbox-app install/launch path through the Riot Client; the link only unlocks in-game benefits for an active Game Pass membership (Xbox Wire, Dec 2022: all Game Pass members). Riot's FAQ (updated 2024-09-30) and the riotgames.com benefits page publish no end date.",
+        "notes": [
+          "Run RiotClientServices.exe with no arguments in the launcher prefix (a bare launch opens the Riot Client home/library; a --launch-product launch goes straight to that game's patch-and-login flow). The CEF-based sign-in window appears: sign in with the Riot Account (username + password, optional 'Stay signed in'); create one at https://signup.riotgames.com if needed. Do not sign in while a bootstrapper is still downloading (Lutris instruction).",
+          "Link the Xbox profile in a normal browser, not inside the prefix: open https://account.riotgames.com/xbox-game-pass -> 'Go to the Xbox Social Sign-in Page' -> log in with the Microsoft account that has an Xbox profile and the active Game Pass membership -> click Yes to allow Riot Games to access the Xbox Live information -> sign in with the Riot Account.",
+          "Benefits unlock on the next login to any Riot game (pop-up notification; can take up to 24 h). League shows a persistent Rewards Program icon in the client with 'Game Pass' listed while the link and membership are active.",
+          "Nothing 'appears' as a Game Pass entitlement: all Riot PC titles are free-to-play and the Riot Client shows every one of them to every account. Game Pass only adds in-game perks (all LoL champions, all VALORANT agents, TFT tacticians/arena skin, LoR Foundations cards, 20% XP boosts) that lapse when the membership lapses. Installing a title from its Riot Client tile starts its download; on Linux only Legends of Runeterra (bacon) is worth installing."
+        ]
+      },
+      "anticheat": {
+        "notes": "Riot Vanguard = a user-mode client plus a Windows kernel-mode driver (vgk.sys). Required by League of Legends (mandatory worldwide since patch 14.9, 1 May 2024; TPM 2.0 / Secure Boot on Windows 11), Teamfight Tactics PC (Riot FAQ: 'Vanguard works in tandem with the League Client, so it will need to be running for Teamfight Tactics PC as well'), VALORANT (since launch; its spec page lists Windows 10/11 only) and 2XKO (product 'lion'; AreWeAntiCheatYet: Denied). It is impossible under Wine/Proton: Wine cannot load Windows kernel drivers, and Riot's own dev post states 'the current Lutris-based implementation for League (that uses wine) will not be able to satisfy the Vanguard driver requirements', 'Linux does not currently afford us sufficient ability to attest boot state or kernel modules', and that VMs/emulation are rejected as well ('an exceptionally dangerous game'); Riot cited 'just over 800 Linux users'. AreWeAntiCheatYet lists League, TFT, VALORANT and 2XKO as Denied; lutris.net flags League as 'kernel-level anticheat, unsupported on Linux'. Vanguard is not EasyAntiCheat or BattlEye, so Steam's 'Proton EasyAntiCheat Runtime' / 'Proton BattlEye Runtime' do nothing here, and there is no single-player bypass: these are online-only games whose exes refuse to start without the driver. 'Vanguard On-Demand' (2026) only changes when the driver loads on qualifying Windows 11 25H2 machines; it does not help Linux. Legends of Runeterra (bacon) does not use Vanguard: leagueoflinux.org lists its desktop version as fully playable via the Lutris 'Riot Games' installer, but AreWeAntiCheatYet marks it 'Broken' with 'Packman' (Riot's legacy anti-tamper) since 2024-11-11 without a reference, and a Feb 2026 Lutris forum thread reports an immediate crash at launch, so its current status is unverified. Practical rule for the UI: mark League/TFT/VALORANT/2XKO as 'cannot run on Linux (Vanguard kernel anti-cheat)' and never attempt them; offer LoR as untested."
+      },
+      "known_issues": [
+        "League of Legends, Teamfight Tactics (PC), VALORANT and 2XKO cannot run under Wine/Proton at all because of the Vanguard kernel driver; no bypass, no Proton anti-cheat runtime applies, and online modes are the whole game.",
+        "Riot Client window renders black when the prefix has no Arial/Times fonts (Wine bug 54792, duplicate of 32342: CEF font validation); fix is winetricks corefonts. Lutris scripts do not install it; GE-Proton ships Liberation substitutes, so add 'corefonts' only if the client comes up black.",
+        "The bootstrapper auto-launches the Riot Client after installing unless --disable-auto-launch is passed; Lutris tells users to close the client once its download finishes and then kills all Wine processes before first launch.",
+        "The Riot Client keeps running as a tray icon/background RiotClientServices.exe after a game exits (Lutris LoR note: 'don't forget to quit Riot icon notification in taskbar'); stop_wine() the prefix after play.",
+        "Legends of Runeterra may crash on its first start; Lutris advises closing all Wine processes and starting again. Its 2025/2026 playability is contested (see anticheat).",
+        "GE-Proton behaviour is untested here: no Riot entry exists in umu-protonfixes gamefixes-umu or umu-database; Lutris 0.5.20+ runs these same scripts on GE-Proton via umu by default, which is the only indirect evidence that the CEF client works there. GE-Proton release assets are GE-ProtonX-Y-x86_64.tar.gz with a .sha512sum file (sha512, not sha256).",
+        "Historical only: pre-Vanguard League needed patched wine-ge 'LoL' builds (lutris-GE-Proton8-27-LoL, GE-LOL) and older Lutris scripts added d3dx9/d3dcompiler; StartWine/PortWINE/lux-wine DB entries still reference those builds. None of it applies to the launcher itself.",
+        "The Lutris registry/env tweaks in this recipe (GrabFullScreen, MouseWarpOverride, grey background, STAGING_SHARED_MEMORY, WINE_LARGE_ADDRESS_AWARE) target the in-game League window, not the client; they are harmless under Proton (LAA is already Proton's default) and can be dropped.",
+        "Installer region only selects which League shard the bootstrapper downloads; the account's region is fixed by the Riot Account, and the client UI language is chosen with --locale=xx_XX (Lutris offers cs_CZ, en_AU, en_GB, en_US, fr_FR, de_DE, es_ES, es_MX, it_IT, ja_JP, hu_HU, pl_PL, pt_BR, ro_RO, ru_RU, tr_TR).",
+        "Paths in RiotClientInstalls.json and product_settings.yaml use Windows drive letters with forward slashes; map C:/ to <prefix>/drive_c/ before using them."
+      ],
+      "sources": [
+        "https://lutris.net/api/installers/league-of-legends",
+        "https://lutris.net/api/installers/legends-of-runeterra",
+        "https://lutris.net/games/league-of-legends/",
+        "https://forums.lutris.net/t/legends-of-runeterra-not-working/18796",
+        "https://www.leagueoflegends.com/en-us/download/",
+        "https://playvalorant.com/en-us/download/",
+        "https://playvalorant.com/en-us/specs/",
+        "https://github.com/microsoft/winget-pkgs/tree/master/manifests/r/RiotGames/LeagueOfLegends/NA/138.0.0.4786",
+        "https://github.com/microsoft/winget-pkgs/tree/master/manifests/r/RiotGames/Valorant/NA/138.0.1.4874",
+        "https://silentinstallhq.com/league-of-legends-silent-install-how-to-guide/",
+        "https://support.riotgames.com/en-us/riot/gameplay/xbox-game-pass-faqs",
+        "https://www.riotgames.com/en/riot-game-pass-benefits",
+        "https://news.xbox.com/en-us/2022/12/08/riot-games-and-xbox-game-pass-benefits-coming-soon/",
+        "https://support.riotgames.com/league-of-legends/performance/riot-vanguard-faq-league-of-legends",
+        "https://www.leagueoflegends.com/en-us/news/dev/dev-vanguard-x-lol/",
+        "https://www.gamingonlinux.com/2024/04/riot-games-talk-vanguard-anti-cheat-for-league-of-legends-and-why-its-a-no-for-linux/",
+        "https://www.gosugamers.net/news/78679-riot-games-vanguard-on-demand-lets-lol-valorant-and-2xko-players-run-anti-cheat-on-demand",
+        "https://raw.githubusercontent.com/AreWeAntiCheatYet/AreWeAntiCheatYet/HEAD/games.json",
+        "https://leagueoflinux.org/ (home, /faq/vanguard/, /other_games/teamfight_tactics/, /other_games/legends_of_runeterra/, /other_games/2xko/)",
+        "https://bugs.winehq.org/show_bug.cgi?id=54792",
+        "https://github.com/PenguLoader/PenguLoader (loader/src/lib/league-client.ts: RiotClientInstalls interface)",
+        "https://github.com/JustNak/RusticGU (crates/stores/tests/fixtures/riot/* real RiotClientInstalls.json and product_settings.yaml; crates/stores/src/riot.rs)",
+        "https://github.com/ASchoe311/RiotGamesLibrary (RiotClient.cs: HKCU Uninstall 'Riot Game <id>.live' InstallLocation, HKCR riotclient protocol; RiotGamesLibrary.cs: product ids league_of_legends/valorant/bacon/lion)",
+        "https://github.com/marvinscham/disenchanter (internal/app/platform_windows.go)",
+        "https://github.com/KebsCS/LeagueClientDebugger (LeagueClientDebugger/SystemYaml.py)",
+        "https://github.com/Pupix/rift-explorer (app/util/RiotConnector.ts)",
+        "https://github.com/liamcottle/valorant.js (docs/RiotClientServices.md)",
+        "https://github.com/aPinat/RiotLauncher (RiotLauncher/Program.cs)",
+        "https://github.com/mmtrt/legendsofruneterra-snap (snap/snapcraft.yaml, snap/local/scripts/sommelier)",
+        "https://github.com/RusNor/StartWine-Launcher (data/app_config/.default/RiotClientServices)",
+        "https://github.com/Castro-Fidel/PortWINE (data_from_portwine/scripts/portwine_db/League of Legends.ppdb)",
+        "https://github.com/VHSgunzo/lux-wine (db/LeagueClient.lwdb)",
+        "https://api.github.com/repos/Open-Wine-Components/umu-protonfixes/contents/gamefixes-umu",
+        "https://raw.githubusercontent.com/Open-Wine-Components/umu-database/main/umu-database.csv",
+        "https://github.com/GloriousEggroll/proton-ge-custom/releases (GE-Proton11-7 assets and .sha512sum)"
+      ],
+      "confidence": "medium",
+      "publisher_match": [
+        "riot games"
+      ]
+    }
+  }
+}

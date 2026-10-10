@@ -32,6 +32,30 @@ wins, so a fresh launcher never loses entries to a stale cache.
 | playable | the game plays; some things missing or broken (see notes) |
 | perfect | everything works, including Xbox Live features the title uses |
 
+## Titles delivered through a third-party launcher
+
+Ubisoft, EA, Blizzard, Rockstar and Riot titles have no Store package (`xodus-cli` reports
+"no PC package"): the Xbox app hands them to the publisher's launcher. Their entries carry
+`launcher` (a recipe id from `data/compat/launchers.json`) and `launcher_game_id` (what that
+launcher starts the title with, `null` until known). The launcher then offers to install that
+client into its own GE-Proton prefix and walks you through the sign-in; see
+[launchers.md](launchers.md).
+
+## Anti-cheat
+
+An entry's `anticheat` object records what the title's anti-cheat means on Linux: `kind`
+(`eac`, `battleye`, `ricochet`, `vanguard`, `none`, `unknown`), `linux_module` (the game ships
+EAC's Linux module / the publisher enabled BattlEye's Proton support, so Steam's "Proton
+EasyAntiCheat Runtime" or "Proton BattlEye Runtime" make online modes work), `bypass` (the real
+executable started instead of the EAC bootstrapper for single-player, the Space Marine 2
+pattern) and `online` (`supported`, `unsupported`, `unknown`). What the entry does not say is
+read from the game files (`anticheat_for_game()` in `launcher/thirdparty.py`); the details panel
+shows the resulting message. The single-player bypass stays the default: only an entry with
+`online: "supported"`, run by a Proton-derived build with Steam's runtime installed, starts the
+protected bootstrapper with `PROTON_EAC_RUNTIME` / `PROTON_BATTLEYE_RUNTIME` exported (WineGDK has
+no such hooks, so under it they never are). Kernel drivers (Ricochet, Vanguard, EA Javelin) have
+no Linux path at all.
+
 ## Overriding an entry locally
 
 Create `~/.config/xodus-launcher/compat/<STOREID>.json` with just the fields you want to

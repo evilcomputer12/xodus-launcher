@@ -80,6 +80,10 @@ DEFAULT_CONFIG = {
     "prefix": str(DATA_DIR / "prefix-gdk"),
     "parallel": 4,
     "extra_env": {},
+    "anticheat_warned": [],  # Store IDs whose "online modes unavailable" notice was shown once
+    # third-party launchers: link a GE-Proton that Steam / umu already installed instead of
+    # downloading one (launcher/thirdparty.py ensure_ge_proton)
+    "ge_proton_reuse_existing": True,
 }
 
 
@@ -401,6 +405,11 @@ COMPAT_DEFAULTS = {
     "launch": {"executable": "", "args": [], "eac_bypass": None, "working_dir": ""},
     "winetricks": [],
     "registry": [],
+    # titles delivered through a third-party launcher (data/compat/launchers.json) and their
+    # anti-cheat: {"kind": "eac|battleye|...", "linux_module": bool, "bypass": "exe", "online": ...}
+    "launcher": "",
+    "launcher_game_id": None,
+    "anticheat": {},
 }
 _compat_db = None
 
@@ -710,6 +719,185 @@ def report_issue_url(report, path):
     q = urllib.parse.urlencode({"title": f"Compat: {g['title']} ({g['id']})",
                                 "labels": "compat-report", "body": body})
     return f"{REPORT_ISSUES_URL}?{q}"
+
+
+# --------------------------------------------------------------------------
+# third-party launchers and anti-cheat (launcher/thirdparty.py, data/compat/launchers.json)
+# --------------------------------------------------------------------------
+
+ANTICHEAT_LABELS = {"eac": "Easy Anti-Cheat", "battleye": "BattlEye", "ricochet": "Ricochet",
+                    "vanguard": "Vanguard", "none": "none", "unknown": "unknown"}
+
+
+def thirdparty_module():
+    """launcher/thirdparty.py (third-party launchers in GE-Proton prefixes, anti-cheat runtimes),
+    imported on first use from the launcher's own directory. Raises RuntimeError with a readable
+    message when it is missing or broken, so every caller can fall back or show it."""
+    d = str(_SELF.parent)
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    try:
+        import thirdparty
+    except Exception as e:  # noqa: BLE001 - ImportError, or a syntax error in the module
+        raise RuntimeError("third-party launcher support is unavailable: launcher/thirdparty.py "
+                           f"could not be imported ({e})") from e
+    return thirdparty
+
+
+def launchers_db():
+    """{launcher id: recipe} from data/compat/launchers.json: through the thirdparty module when
+    it imports, else read next to titles.json (names and tags still work), else {}."""
+    try:
+        return dict(thirdparty_module().load_launchers_db().get("launchers") or {})
+    except Exception:  # noqa: BLE001 - the module reports its own problems where it matters
+        pass
+    p = BUNDLED_COMPAT.parent / "launchers.json" if BUNDLED_COMPAT else None
+    db = _read_json(p) if p and p.exists() else None
+    return dict(db.get("launchers") or {}) if isinstance(db, dict) else {}
+
+
+def launcher_name(lid, db=None):
+    rec = (launchers_db() if db is None else db).get(lid) or {}
+    return str(rec.get("name") or lid)
+
+
+def launcher_for_publisher(publisher, db=None):
+    """Id of the recipe whose `publisher_match` prefixes fit a catalog publisher name
+    ("Ubisoft Entertainment" -> ubisoft-connect): the Ubisoft, EA, Blizzard and Riot titles never
+    have a Store package, so they are treated as launcher titles before a download is even
+    tried. Recipes without prefixes (Rockstar: its Game Pass titles are Store packages) never
+    match. "" when nothing fits."""
+    pub = re.sub(r"\s+", " ", str(publisher or "")).strip().lower()
+    if not pub:
+        return ""
+    for lid, rec in sorted((launchers_db() if db is None else db).items()):
+        pats = (rec.get("publisher_match") or []) if isinstance(rec, dict) else []
+        for pat in pats:
+            pat = str(pat).strip().lower()
+            if pat and pub.startswith(pat):
+                return lid
+    return ""
+
+
+def title_launcher(entry, game=None, inst=None, db=None):
+    """Which third-party launcher delivers a title: the compatibility entry's `launcher`, the
+    library link's, else the recipe matching the catalog publisher; "" for a Store title."""
+    lid = (entry or {}).get("launcher") or (inst or {}).get("launcher") or ""
+    if lid:
+        return str(lid)
+    pub = (game or {}).get("publisher") or (inst or {}).get("publisher") or ""
+    return launcher_for_publisher(pub, db)
+
+
+def launcher_meta(game_dir):
+    """The library meta of a title linked to a game inside a third-party launcher (status
+    "launcher": the folder under games_dir holds only the meta file), or None."""
+    meta = read_meta(game_dir)
+    if meta and meta.get("status") == "launcher" and meta.get("launcher"):
+        return meta
+    return None
+
+
+def link_launcher_game(cfg, game, lid, game_id, game_name="", game_dir=""):
+    """Record that a Game Pass title is installed inside a third-party launcher: a folder named
+    like the title under games_dir with just the meta file (status "launcher", the launcher and
+    the game's id there), so the library lists it and Play / --play know what to start."""
+    dest = Path(cfg["games_dir"]) / safe_dirname(game.get("title") or game_id)
+    meta = read_meta(dest) or {}
+    meta.update({k: game.get(k) for k in ("id", "title", "publisher", "poster", "poster_big",
+                                          "hero", "genres") if game.get(k) is not None})
+    meta.update({"status": "launcher", "launcher": lid, "launcher_game_id": str(game_id),
+                 "launcher_game_name": game_name or "", "launcher_game_dir": str(game_dir or "")})
+    meta.pop("dir", None)  # installed_games() adds it at read time
+    write_meta(dest, meta)
+    return dest
+
+
+def unlink_launcher_game(game_dir):
+    """Remove a launcher title's library link: the meta file, and its folder when nothing else
+    is in it. The game itself stays installed in the launcher."""
+    d = Path(game_dir)
+    (d / META_NAME).unlink(missing_ok=True)
+    try:
+        d.rmdir()
+    except OSError:
+        pass
+
+
+def anticheat_status(game_dir, entry=None, wine=None):
+    """(info, env) from the thirdparty module: anticheat_for_game() for the Wine build that will
+    run the game (the Steam runtimes only work under a Proton-derived build, never under
+    WineGDK) and the PROTON_*_RUNTIME variables of anticheat_env(). A neutral answer (kind
+    "unknown", no env) when the module is missing or the check fails, so launching never
+    depends on it."""
+    try:
+        tp = thirdparty_module()
+        info = dict(tp.anticheat_for_game(game_dir, entry, wine=wine))
+        env = {k: str(v) for k, v in (tp.anticheat_env(info) or {}).items()}
+    except Exception as e:  # noqa: BLE001
+        info = {"message": f"anti-cheat check skipped: {e}"}
+        env = {}
+    for k, v in (("kind", "unknown"), ("linux_module", False), ("runtime", None),
+                 ("runtime_usable", False), ("bypass", None), ("online", "unknown"), ("message", "")):
+        info.setdefault(k, v)
+    return info, env
+
+
+def anticheat_summary(info):
+    """One line for the game log and reports."""
+    kind = info.get("kind") or "unknown"
+    if kind == "none":
+        return "anti-cheat: none"
+    return (f"anti-cheat: {ANTICHEAT_LABELS.get(kind, kind)}, Linux module: "
+            f"{'yes' if info.get('linux_module') else 'no'}, runtime: "
+            f"{info.get('runtime') or 'not installed'}, online: {info.get('online') or 'unknown'}"
+            + (f" - {info['message']}" if info.get("message") else ""))
+
+
+def launch_launcher_game(cfg, game_dir, log=print, on_start=None):
+    """Start a linked title through its third-party launcher (ThirdPartyLauncher.launch_game with
+    the game id from the compatibility entry, else from the meta) and wait until the launcher's
+    prefix is idle (the client and the game are closed). Returns (code, tail) like launch_game()."""
+    meta = launcher_meta(game_dir) or {}
+    try:
+        tpl = thirdparty_module().ThirdPartyLauncher(meta.get("launcher", ""), cfg, log=log)
+    except Exception as e:  # noqa: BLE001 - module missing, unknown launcher id
+        return 1, f"Cannot start {meta.get('launcher') or 'the launcher'}: {e}"
+    if not tpl.is_installed():
+        return 1, f"{tpl.name} is not set up yet - open Xodus Launcher and use Set up {tpl.name}."
+    entry = compat_entry(meta.get("id") or game_store_id(game_dir))
+    # the user's own link (Link / Re-link installed game…) beats what the database pins
+    gid = meta.get("launcher_game_id") or entry.get("launcher_game_id") or None
+    header = [f"compat: {entry['id'] or 'unknown title'} status={entry['status']} via {tpl.name} "
+              f"game={gid or '?'} prefix={tpl.prefix}"]
+    if entry.get("status") == "broken":
+        header.append("compat: this title is known not to work yet. " + (entry.get("notes") or ""))
+    for line in header:
+        log(line)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (LOG_DIR / (safe_dirname(Path(game_dir).name) + ".log")).write_text("\n".join(header) + "\n")
+    try:
+        p = tpl.launch_game(gid, on_start=on_start)
+    except Exception as e:  # noqa: BLE001 - GE-Proton download, missing executable, ...
+        return 1, f"Could not start {tpl.name}: {e}"
+    code = p.wait()
+    if code == 0:
+        # the executable hands off to the real client within seconds (UbisoftConnect.exe ->
+        # upc.exe); "running" means until nothing is left in the launcher's prefix
+        tpl.wait()
+    return code, "" if code == 0 else f"{tpl.name} exited with code {code}"
+
+
+def stop_game(cfg, game_dir):
+    """Force-stop whatever a title runs in: its third-party launcher's prefix, or its Wine prefix."""
+    meta = launcher_meta(game_dir)
+    if meta:
+        try:
+            thirdparty_module().ThirdPartyLauncher(meta["launcher"], cfg).stop()
+        except Exception:  # noqa: BLE001 - best effort, like stop_wine
+            pass
+        return
+    stop_wine(cfg, game_prefix(cfg, game_dir))
 
 
 # --------------------------------------------------------------------------
@@ -1136,20 +1324,66 @@ def launch_game(cfg, game_dir, log=print, on_start=None):
     """Run the game via `xodus-cli run` with its compatibility entry applied (Wine build,
     prefix, environment, executable). Blocks until it exits. Returns (code, tail).
 
-    on_start(popen) is called once the process is spawned, so a caller can stop it."""
+    on_start(popen) is called once the process is spawned, so a caller can stop it.
+
+    A title linked to a game inside a third-party launcher (meta status "launcher") is started
+    through that launcher instead: see launch_launcher_game()."""
+    if launcher_meta(game_dir):
+        return launch_launcher_game(cfg, game_dir, log, on_start)
     entry = compat_entry(game_store_id(game_dir))
     wine = resolve_wine(cfg, entry)
     if not wine or not Path(wine).exists():
         return 1, "Wine is not set up yet - open Xodus Launcher and use Settings > Set up Wine."
     prefix = game_prefix(cfg, game_dir, entry)
     launch = entry.get("launch") or {}
-    exe = launch.get("executable") or find_executable(game_dir, launch.get("eac_bypass"))
+    # anti-cheat: the single-player bypass (the real executable instead of the EAC bootstrapper)
+    # stays the default. Only a title whose entry says online is supported, run by a
+    # Proton-derived build with Steam's runtime present, starts the protected bootstrapper
+    # with PROTON_*_RUNTIME in the environment; WineGDK has no such hooks, so under it the
+    # runtime is never exported and the bootstrapper never forced
+    ac, ac_env = anticheat_status(game_dir, entry, wine)
+    eac_bypass = launch.get("eac_bypass")
+    protected = ac["online"] == "supported" and bool(ac_env)
+    if protected and eac_bypass is None:
+        eac_bypass = False
+    bypass = ac.get("bypass") if not protected and eac_bypass is not False else None
+    if bypass and not (Path(game_dir) / str(bypass).replace("\\", "/")).exists():
+        bypass = None
+    exe = launch.get("executable") or bypass or find_executable(game_dir, eac_bypass)
     candidates = exe_candidates(exe) if exe else [None]
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logfile = LOG_DIR / (safe_dirname(Path(game_dir).name) + ".log")
     env = wine_env(cfg, wine, entry, prefix)
+    for k, v in ac_env.items():  # an explicit env entry (title or user) keeps precedence
+        env.setdefault(k, v)
+    if ac_env:  # what the proton script adds for BattlEye (the bridge builtin); EAC needs none
+        try:
+            ac_ov = thirdparty_module().anticheat_dll_overrides(ac) or {}
+        except Exception:  # noqa: BLE001
+            ac_ov = {}
+        if ac_ov:
+            env["WINEDLLOVERRIDES"] = ";".join(
+                p for p in [env.get("WINEDLLOVERRIDES", "")] + [f"{k}={v}" for k, v in ac_ov.items()] if p)
     header = [f"compat: {entry['id'] or 'unknown title'} status={entry['status']} wine={wine} "
-              f"prefix={prefix}" + (" (user override)" if entry.get("_user") else "")]
+              f"prefix={prefix}" + (" (user override)" if entry.get("_user") else ""),
+              "compat: " + anticheat_summary(ac)]
+    bypassed = bool(launch.get("executable") or bypass or
+                    (eac_bypass is not False and eac_real_executable(game_dir)))
+    if protected:
+        header.append("compat: the protected bootstrapper runs with Steam's anti-cheat runtime "
+                      f"({', '.join(ac_env)}): online modes should work")
+    elif ac["online"] == "unsupported":
+        if bypassed:
+            header.append("compat: online modes are unavailable - the game is started past its "
+                          "anti-cheat (single-player bypass)")
+        else:
+            header.append("compat: WARNING no single-player bypass is known for this anti-cheat; "
+                          "the game may not start")
+    elif ac.get("kind") in ("eac", "battleye") and bypassed:
+        header.append("compat: online support is not verified for this title - the game is started "
+                      "past its anti-cheat (single-player bypass)" +
+                      ("; the runtime is exported, set launch.eac_bypass to false in the title's "
+                       "override to try the protected bootstrapper" if ac_env else ""))
     if entry["status"] == "broken":
         header.append("compat: this title is known not to work yet. " + (entry.get("notes") or ""))
     need = (entry.get("runtime") or {}).get("min_winegdk") or ""
@@ -1314,36 +1548,48 @@ def run_gui(install_id=None):
     from PySide6.QtCore import (QObject, QRect, QSize, QSortFilterProxyModel, Qt, QThread, QUrl,
                                 Signal, QStandardPaths)
     from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap,
-                               QStandardItem, QStandardItemModel)
+                               QStandardItem, QStandardItemModel, QTextCursor)
     from PySide6.QtNetwork import QNetworkAccessManager, QNetworkDiskCache, QNetworkRequest
     from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox,
-                                   QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-                                   QListView, QMainWindow, QMessageBox, QPlainTextEdit,
-                                   QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
-                                   QTabWidget, QVBoxLayout, QWidget)
+                                   QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+                                   QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem,
+                                   QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+                                   QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget,
+                                   QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
 
     ROLE_GAME = Qt.UserRole + 1
     ROLE_STATUS = Qt.UserRole + 2  # compatibility status, for the catalog filter
 
-    def badge_icon(pm, status, show):
-        """Poster cropped to the grid cell, with the compatibility status painted on it."""
+    def badge_icon(pm, status, show, tag=""):
+        """Poster cropped to the grid cell, with the compatibility status painted on it and, for
+        titles delivered through a third-party launcher, a "via <Launcher>" tag at the top."""
         pm = pm.scaled(150, 225, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         pm = pm.copy((pm.width() - 150) // 2, (pm.height() - 225) // 2, 150, 225)
+        if not show and not tag:
+            return QIcon(pm)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        font = QFont()
+        font.setPointSize(8)
+        font.setBold(True)
+        p.setFont(font)
         if show:
             label = STATUS_LABELS.get(status, status)
-            p = QPainter(pm)
-            p.setRenderHint(QPainter.Antialiasing)
-            font = QFont()
-            font.setPointSize(8)
-            font.setBold(True)
-            p.setFont(font)
             rect = QRect(6, 225 - 22 - 6, p.fontMetrics().horizontalAdvance(label) + 14, 22)
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(STATUS_COLORS.get(status, STATUS_COLORS["untested"])))
             p.drawRoundedRect(rect, 5, 5)
             p.setPen(QColor("white"))
             p.drawText(rect, Qt.AlignCenter, label)
-            p.end()
+        if tag:
+            label = p.fontMetrics().elidedText(tag, Qt.ElideRight, 150 - 12 - 14)
+            rect = QRect(6, 6, p.fontMetrics().horizontalAdvance(label) + 14, 22)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(20, 20, 20, 200))
+            p.drawRoundedRect(rect, 5, 5)
+            p.setPen(QColor("white"))
+            p.drawText(rect, Qt.AlignCenter, label)
+        p.end()
         return QIcon(pm)
 
     class Images(QObject):
@@ -1458,13 +1704,40 @@ def run_gui(install_id=None):
                     os.killpg(os.getpgid(p.pid), signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
                     pass
-            # bring down any detached wine processes in the game's prefix
-            stop_wine(self.cfg, game_prefix(self.cfg, self.game_dir))
+            # bring down any detached wine processes in the game's prefix (or in its
+            # third-party launcher's prefix)
+            stop_game(self.cfg, self.game_dir)
             if p and p.poll() is None:
                 try:
                     os.killpg(os.getpgid(p.pid), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
+
+    class LauncherInstallJob(QThread):
+        """ThirdPartyLauncher.install() off the GUI thread: stage/progress/log signals, a cancel
+        event, and any failure as a readable message."""
+        progress = Signal(str, object, str)  # stage, percent (None = busy), text
+        log = Signal(str)
+        finished_job = Signal(bool, str)
+
+        def __init__(self, cfg, lid):
+            super().__init__()
+            self.cfg, self.lid = cfg, lid
+            self.cancel = threading.Event()
+
+        def run(self):
+            try:
+                tpl = thirdparty_module().ThirdPartyLauncher(
+                    self.lid, self.cfg, log=lambda s, *a, **k: self.log.emit(str(s)))
+                tpl.install(progress=lambda stage, pct=None, text="": self.progress.emit(
+                    str(stage), pct, str(text)), cancel_event=self.cancel)
+                if not tpl.is_installed():
+                    raise RuntimeError(f"{tpl.name} did not install: its executable is missing "
+                                       f"from {tpl.prefix}")
+            except Exception as e:  # noqa: BLE001 - shown in the dialog
+                self.finished_job.emit(False, "Cancelled" if self.cancel.is_set() else str(e))
+                return
+            self.finished_job.emit(True, "")
 
     class FilterModel(QSortFilterProxyModel):
         def __init__(self):
@@ -1544,6 +1817,7 @@ def run_gui(install_id=None):
             form.addRow("Wine binary", self.wine)
             self.prefix = QLineEdit(cfg["prefix"])
             form.addRow("Wine prefix", self.prefix)
+            form.addRow(self.build_launchers())
             bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
             bb.accepted.connect(self.accept)
             bb.rejected.connect(self.reject)
@@ -1553,6 +1827,193 @@ def run_gui(install_id=None):
             d = QFileDialog.getExistingDirectory(self, "Games folder", self.games_dir.text())
             if d:
                 self.games_dir.setText(d)
+
+        # ---------- third-party launchers ----------
+        def build_launchers(self):
+            """The "Third-party launchers" group: every recipe with its state and Set up / Open /
+            Remove prefix, the GE-Proton build they run with, and Steam's anti-cheat runtimes."""
+            self.workers = []
+            self.procs = []
+            self.launcher_rows = {}
+            self.launchers = launchers_db()
+            self.tp = None
+            box = QGroupBox("Third-party launchers")
+            grid = QGridLayout(box)
+            try:
+                self.tp = thirdparty_module()
+            except RuntimeError as e:
+                lbl = QLabel(str(e))
+                lbl.setWordWrap(True)
+                grid.addWidget(lbl, 0, 0, 1, 5)
+                return box
+            order = sorted(self.launchers, key=lambda l: launcher_name(l, self.launchers).lower())
+            for row, lid in enumerate(order):
+                state = QLabel()
+                setup = QPushButton("Set up")
+                setup.clicked.connect(lambda _=False, l=lid: self.setup_launcher(l))
+                open_btn = QPushButton("Open")
+                open_btn.clicked.connect(lambda _=False, l=lid: self.open_launcher(l))
+                remove = QPushButton("Remove prefix")
+                remove.clicked.connect(lambda _=False, l=lid: self.remove_prefix(l))
+                grid.addWidget(QLabel(f"<b>{html.escape(launcher_name(lid, self.launchers))}</b>"),
+                               row, 0)
+                grid.addWidget(state, row, 1)
+                for col, b in enumerate((setup, open_btn, remove), 2):
+                    grid.addWidget(b, row, col)
+                self.launcher_rows[lid] = (state, setup, open_btn, remove)
+            row = len(order)
+            self.ge_label = QLabel()
+            self.ge_btn = QPushButton("Update")
+            self.ge_btn.clicked.connect(self.update_ge_proton)
+            grid.addWidget(QLabel("GE-Proton"), row, 0)
+            grid.addWidget(self.ge_label, row, 1, 1, 2)
+            grid.addWidget(self.ge_btn, row, 3)
+            self.ac_label = QLabel()
+            self.ac_label.setWordWrap(True)
+            self.ac_btn = QPushButton("Install via Steam")
+            self.ac_btn.clicked.connect(self.install_anticheat)
+            grid.addWidget(QLabel("Anti-cheat runtimes"), row + 1, 0)
+            grid.addWidget(self.ac_label, row + 1, 1, 1, 2)
+            grid.addWidget(self.ac_btn, row + 1, 3)
+            self.refresh_launchers()
+            return box
+
+        def launcher(self, lid):
+            return self.tp.ThirdPartyLauncher(lid, self.cfg)
+
+        def refresh_launchers(self):
+            for lid, (state, setup, open_btn, remove) in self.launcher_rows.items():
+                try:
+                    tpl = self.launcher(lid)
+                    installed = tpl.is_installed()
+                    has_prefix = Path(tpl.prefix).exists()
+                except Exception as e:  # noqa: BLE001 - a broken recipe must not break Settings
+                    state.setText(f"error: {e}")
+                    installed = has_prefix = False
+                else:
+                    state.setText("Installed" if installed else "Not installed")
+                setup.setText("Sign-in guide" if installed else "Set up")
+                open_btn.setEnabled(installed)
+                remove.setEnabled(has_prefix)
+            try:
+                tag = self.tp.ge_proton_installed() or ""
+            except Exception as e:  # noqa: BLE001
+                tag = f"error: {e}"
+            self.ge_label.setText(tag or "not installed")
+            self.ge_btn.setText("Update" if tag else "Install")
+            rt = {}
+            try:
+                rt = dict(self.tp.anticheat_runtimes() or {})
+            except Exception as e:  # noqa: BLE001
+                self.ac_label.setText(f"error: {e}")
+            else:
+                self.ac_label.setText(" · ".join(
+                    f"{ANTICHEAT_LABELS[k]}: " + (f"✔ {rt[k]}" if rt.get(k) else "not installed")
+                    for k in ("eac", "battleye")))
+            self.ac_btn.setEnabled(not all(rt.get(k) for k in ("eac", "battleye")))
+
+        def setup_launcher(self, lid):
+            try:
+                installed = self.launcher(lid).is_installed()
+                dlg = LauncherSetupDialog(self, self.cfg, lid, install=not installed)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.warning(self, APP_NAME,
+                                    f"Cannot set up {launcher_name(lid, self.launchers)}:\n{e}")
+                return
+            dlg.exec()
+            self.refresh_launchers()
+
+        def open_launcher(self, lid):
+            try:
+                tpl = self.launcher(lid)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.warning(self, APP_NAME, f"Cannot open {lid}:\n{e}")
+                return
+            w = Worker(lambda _w: tpl.open())  # .wine() may fetch GE-Proton: off the GUI thread
+
+            def done(ok, err, proc):
+                if ok:
+                    self.procs.append(proc)
+                else:
+                    QMessageBox.warning(self, APP_NAME, f"Could not open {tpl.name}:\n{err}")
+
+            w.done.connect(done)
+            self.workers.append(w)
+            w.start()
+
+        def remove_prefix(self, lid):
+            try:
+                tpl = self.launcher(lid)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.warning(self, APP_NAME, f"Cannot remove {lid}:\n{e}")
+                return
+            if QMessageBox.question(
+                    self, APP_NAME, f"Delete the {tpl.name} prefix?\n\n{tpl.prefix}\n\n"
+                    "This removes the launcher and every game installed in it.") != QMessageBox.Yes:
+                return
+            state, *buttons = self.launcher_rows[lid]
+            state.setText("Removing…")
+            for b in buttons:
+                b.setEnabled(False)
+            w = Worker(lambda _w: tpl.remove_prefix())
+
+            def done(ok, err, _):
+                if not ok:
+                    QMessageBox.warning(self, APP_NAME, f"Could not remove the prefix:\n{err}")
+                self.refresh_launchers()
+
+            w.done.connect(done)
+            self.workers.append(w)
+            w.start()
+
+        def update_ge_proton(self):
+            dlg = LogDialog(self, "GE-Proton")
+            dlg.add("Fetching the latest GE-Proton release (GloriousEggroll/proton-ge-custom on "
+                    "GitHub, checksum-verified); third-party launchers and their games run with "
+                    "it.\n")
+            try:  # "Update" with a build installed: ask GitHub for a newer tag ("Install": any)
+                latest = bool(self.tp.ge_proton_installed())
+            except Exception:  # noqa: BLE001
+                latest = False
+
+            def job(w):
+                return self.tp.ensure_ge_proton(
+                    self.cfg, log=lambda s, *a, **k: w.log.emit(str(s), False),
+                    progress=lambda stage, pct=None, text="": w.log.emit(
+                        f"{stage}: {text}" + (f" {int(pct)}%" if pct is not None else ""),
+                        pct is not None),
+                    latest=latest)
+
+            w = Worker(job)
+            w.log.connect(dlg.add)
+
+            def done(ok, err, wine):
+                dlg.close_btn.setEnabled(True)
+                dlg.add(f"\nGE-Proton ready: {wine}" if ok else "\nERROR: " + err)
+                self.refresh_launchers()
+
+            w.done.connect(done)
+            self.workers.append(w)
+            w.start()
+            dlg.exec()
+
+        def install_anticheat(self):
+            """Open Steam on the Proton anti-cheat runtimes that are missing (steam:// URLs)."""
+            try:
+                rt = dict(self.tp.anticheat_runtimes() or {})
+            except Exception:  # noqa: BLE001
+                rt = {}
+            opened = []
+            for key, url in self.tp.STEAM_INSTALL_URLS.items():
+                if not rt.get(key):
+                    QDesktopServices.openUrl(QUrl(url))
+                    opened.append(ANTICHEAT_LABELS.get(key, key))
+            if opened:
+                QMessageBox.information(
+                    self, APP_NAME, "Steam opens the install page of: " + ", ".join(opened) +
+                    ".\n\nThese are Valve's free Proton anti-cheat runtimes. Once Steam has "
+                    "installed them the launcher finds them by itself.")
+            self.refresh_launchers()
 
         def apply(self):
             self.cfg.update({
@@ -1608,17 +2069,248 @@ def run_gui(install_id=None):
         def add(self, line, replace=False):
             if replace:
                 cur = self.text.textCursor()
-                cur.movePosition(cur.End)
-                cur.select(cur.BlockUnderCursor)
-                if cur.selectedText().strip().endswith(("B", "?")):
+                cur.movePosition(QTextCursor.MoveOperation.End)
+                cur.select(QTextCursor.SelectionType.BlockUnderCursor)
+                if cur.selectedText().strip().endswith(("B", "?", "%")):
                     cur.removeSelectedText()
             self.text.appendPlainText(line)
+
+    class LauncherSetupDialog(QDialog):
+        """Installs a third-party launcher (its publisher's official installer, downloaded on this
+        machine, into the launcher's own GE-Proton prefix) with stage, progress and log, then
+        shows the sign-in guide. install=False goes straight to the guide for a launcher that
+        is already installed. .ok says whether the launcher is installed when the dialog closes."""
+
+        def __init__(self, parent, cfg, lid, install=True):
+            super().__init__(parent)
+            self.cfg, self.lid = cfg, lid
+            self.launcher = thirdparty_module().ThirdPartyLauncher(lid, cfg)
+            self.name = self.launcher.name
+            self.job = None
+            self.ok = False
+            self.last_stage = None
+            self.procs = []
+            self.workers = []
+            self.setWindowTitle(f"Set up {self.name}")
+            self.resize(680, 480)
+            lay = QVBoxLayout(self)
+            self.pages = QStackedWidget()
+            lay.addWidget(self.pages)
+            # page 0: install
+            page = QWidget()
+            pl = QVBoxLayout(page)
+            intro = QLabel(f"<b>{html.escape(self.name)}</b> is downloaded from its publisher's "
+                           "official installer and installed into its own Wine prefix (GE-Proton), "
+                           "shared by all of its games.<br>Prefix: "
+                           f"{html.escape(str(self.launcher.prefix))}")
+            intro.setWordWrap(True)
+            pl.addWidget(intro)
+            self.stage = QLabel("Starting…")
+            self.stage.setWordWrap(True)
+            pl.addWidget(self.stage)
+            self.bar = QProgressBar()
+            self.bar.setRange(0, 0)
+            pl.addWidget(self.bar)
+            self.log = QPlainTextEdit()
+            self.log.setReadOnly(True)
+            self.log.setMaximumBlockCount(2000)
+            pl.addWidget(self.log, 1)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            self.cancel_btn = QPushButton("Cancel")
+            self.cancel_btn.clicked.connect(self.cancel)
+            self.close_btn = QPushButton("Close")
+            self.close_btn.setEnabled(False)
+            self.close_btn.clicked.connect(self.reject)
+            row.addWidget(self.cancel_btn)
+            row.addWidget(self.close_btn)
+            pl.addLayout(row)
+            self.pages.addWidget(page)
+            # page 1: sign-in guide
+            page = QWidget()
+            pl = QVBoxLayout(page)
+            pl.addWidget(QLabel(f"<h3>{html.escape(self.name)} is ready - sign in</h3>"))
+            # the numbered steps scroll and wrap, URLs open in the browser
+            self.steps = QTextBrowser()
+            self.steps.setOpenExternalLinks(True)
+            self.steps.setHtml(self.guide_html())
+            pl.addWidget(self.steps, 1)
+            self.note = QLabel(self.guide_note())
+            self.note.setWordWrap(True)
+            self.note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            pl.addWidget(self.note)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            self.open_btn = QPushButton(f"Open {self.name}")
+            self.open_btn.clicked.connect(self.open_launcher)
+            self.done_btn = QPushButton("Done")
+            self.done_btn.setDefault(True)
+            self.done_btn.clicked.connect(self.accept)
+            row.addWidget(self.open_btn)
+            row.addWidget(self.done_btn)
+            pl.addLayout(row)
+            self.pages.addWidget(page)
+            if install:
+                self.start_install()
+            else:
+                self.ok = True
+                self.pages.setCurrentIndex(1)
+
+        @staticmethod
+        def linkify(text):
+            """html-escaped text with its http(s) URLs as links."""
+            out, pos = [], 0
+            for m in re.finditer(r"https?://[^\s<>\"']+", text):
+                url = m.group(0).rstrip(".,;:)")
+                out.append(html.escape(text[pos:m.start()]))
+                out.append(f'<a href="{html.escape(url)}">{html.escape(url)}</a>')
+                pos = m.start() + len(url)
+            out.append(html.escape(text[pos:]))
+            return "".join(out)
+
+        def guide_html(self):
+            """The recipe's sign-in steps as a numbered list."""
+            steps = [str(s) for s in self.launcher.signin_steps()]
+            return ("<ol>" + "".join(f"<li style='margin-bottom: 8px'>{self.linkify(s)}</li>"
+                                     for s in steps) + "</ol>")
+
+        def guide_note(self):
+            """How the entitlement reaches this launcher (the recipe's own words), and the Link
+            step for launchers that list the Game Pass titles in their library."""
+            try:
+                summary = str(self.launcher.signin_summary() or "")
+            except Exception:  # noqa: BLE001 - an older recipe / module
+                summary = ""
+            try:
+                library = bool(self.launcher.game_pass_library())
+            except Exception:  # noqa: BLE001
+                library = False
+            text = html.escape(summary)
+            if library:
+                text += ((" " if text else "") + "After installing the game there, select the title in "
+                         f"{APP_NAME} and use <b>Link installed game…</b> so that Play starts it.")
+            return text
+
+        def start_install(self):
+            self.pages.setCurrentIndex(0)
+            self.job = LauncherInstallJob(self.cfg, self.lid)
+            self.job.progress.connect(self.on_progress)
+            self.job.log.connect(self.log.appendPlainText)
+            self.job.finished_job.connect(self.install_done)
+            self.job.start()
+
+        def on_progress(self, stage, pct, text):
+            self.stage.setText(text or stage)
+            if pct is None:
+                self.bar.setRange(0, 0)
+                self.bar.setFormat(stage)
+            else:
+                self.bar.setRange(0, 100)
+                self.bar.setValue(max(0, min(int(pct), 100)))
+                self.bar.setFormat(f"{stage}  %p%")
+            if stage != self.last_stage:
+                self.last_stage = stage
+                self.log.appendPlainText(f"== {stage}" + (f": {text}" if text else ""))
+
+        def install_done(self, ok, err):
+            self.bar.setRange(0, 100)
+            self.cancel_btn.setEnabled(False)
+            self.close_btn.setEnabled(True)
+            if ok:
+                self.ok = True
+                self.bar.setValue(100)
+                self.stage.setText(f"{self.name} is installed.")
+                self.pages.setCurrentIndex(1)
+                return
+            self.stage.setText(f"<span style='color:{STATUS_COLORS['broken']}'><b>Failed:</b> "
+                               f"{html.escape(err)}</span>")
+            self.log.appendPlainText("ERROR: " + err)
+
+        def cancel(self):
+            if self.job and self.job.isRunning():
+                self.job.cancel.set()
+                self.cancel_btn.setEnabled(False)
+                self.stage.setText("Cancelling…")
+            else:
+                self.reject()
+
+        def reject(self):
+            if self.job and self.job.isRunning():  # never destroy a running QThread: cancel first
+                self.cancel()
+                return
+            super().reject()
+
+        def open_launcher(self):
+            """Open <Launcher>: off the GUI thread, because open() -> wine() may download
+            GE-Proton first. The parent (Main / Settings) keeps the worker and the process."""
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "open_launcher"):
+                parent.open_launcher(self.lid)
+                return
+            w = Worker(lambda _w: self.launcher.open())
+
+            def done(ok, err, proc):
+                if ok:
+                    self.procs.append(proc)
+                else:
+                    QMessageBox.warning(self, APP_NAME, f"Could not open {self.name}:\n{err}")
+
+            w.done.connect(done)
+            self.workers.append(w)
+            w.start()
+
+    class LinkGameDialog(QDialog):
+        """Which game inside a third-party launcher a Game Pass title is (Link installed game…)."""
+
+        def __init__(self, parent, title, launcher, games):
+            super().__init__(parent)
+            self.setWindowTitle(f"Link installed game: {title}")
+            self.resize(520, 420)
+            lay = QVBoxLayout(self)
+            info = QLabel(f"Which game in <b>{html.escape(launcher)}</b> is "
+                          f"<b>{html.escape(title)}</b>? Pick it among the games installed there, "
+                          "or type its id when the launcher lists it differently.")
+            info.setWordWrap(True)
+            lay.addWidget(info)
+            self.list = QListWidget()
+            key = re.sub(r"[^a-z0-9]", "", title.lower())
+            for g in games:
+                it = QListWidgetItem(f"{g.get('name') or g.get('id')}   ({g.get('id')})")
+                it.setData(Qt.UserRole, dict(g))
+                self.list.addItem(it)
+                gkey = re.sub(r"[^a-z0-9]", "", str(g.get("name") or "").lower())
+                if key and gkey and (key in gkey or gkey in key) and not self.list.currentItem():
+                    self.list.setCurrentItem(it)
+            self.list.itemDoubleClicked.connect(lambda _it: self.accept())
+            lay.addWidget(self.list, 1)
+            if not games:
+                empty = QLabel(f"<i>{html.escape(launcher)} has no installed games yet: install "
+                               "the title there first, or enter its id below.</i>")
+                empty.setWordWrap(True)
+                lay.addWidget(empty)
+            self.game_id = QLineEdit()
+            self.game_id.setPlaceholderText("game id (only when the game is not listed above)")
+            lay.addWidget(self.game_id)
+            bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            bb.accepted.connect(self.accept)
+            bb.rejected.connect(self.reject)
+            lay.addWidget(bb)
+
+        def chosen(self):
+            """{id, name, dir} of the pick, or None."""
+            typed = self.game_id.text().strip()
+            if typed:
+                return {"id": typed, "name": "", "dir": ""}
+            it = self.list.currentItem()
+            return dict(it.data(Qt.UserRole)) if it else None
 
     class Main(QMainWindow):
         def __init__(self):
             super().__init__()
             self.cfg = load_config()
             self.compat = load_compat_db()
+            self.launchers = launchers_db()  # {id: recipe}: names for tags and buttons
+            self.launcher_procs = []
             self.images = Images()
             self.images.loaded.connect(self.on_image)
             self.catalog = []
@@ -1748,18 +2440,20 @@ def run_gui(install_id=None):
             btns = QVBoxLayout()
             self.b_install = QPushButton("Install")
             self.b_play = QPushButton("▶  Play")
+            self.b_link = QPushButton("Link installed game…")
             self.b_steam = QPushButton("Add to Steam")
             self.b_folder = QPushButton("Open folder")
             self.b_report = QPushButton("Compatibility report…")
             self.b_remove = QPushButton("Uninstall")
             self.b_install.clicked.connect(self.install_current)
             self.b_play.clicked.connect(self.play_current)
+            self.b_link.clicked.connect(self.link_current)
             self.b_steam.clicked.connect(self.steam_current)
             self.b_folder.clicked.connect(self.folder_current)
             self.b_report.clicked.connect(self.report_current)
             self.b_remove.clicked.connect(self.remove_current)
-            for b in (self.b_play, self.b_install, self.b_steam, self.b_folder, self.b_report,
-                      self.b_remove):
+            for b in (self.b_play, self.b_install, self.b_link, self.b_steam, self.b_folder,
+                      self.b_report, self.b_remove):
                 b.setMinimumHeight(34)
                 btns.addWidget(b)
                 b.hide()
@@ -1804,6 +2498,14 @@ def run_gui(install_id=None):
             busy = (self.active and self.active.game["id"] == g.get("id")) or \
                 any(j.game["id"] == g.get("id") for j in self.queue)
             status = inst.get("status") if inst else None
+            self.d_compat.setText(self.compat_text(g, inst))
+            entry = compat_entry(g.get("id") or (game_store_id(inst["dir"]) if inst else ""),
+                                 self.compat)
+            lid = title_launcher(entry, g, inst, self.launchers)
+            if lid:
+                self.update_launcher_buttons(g, inst, entry, lid, busy)
+                return
+            self.b_link.hide()
             self.b_install.setVisible(not busy and status != "installed" and bool(g.get("id")))
             self.b_install.setText("Resume / repair download" if status == "incomplete" else "Install")
             self.b_play.setVisible(status == "installed")
@@ -1811,7 +2513,7 @@ def run_gui(install_id=None):
             self.b_folder.setVisible(bool(inst))
             self.b_report.setVisible(status == "installed")
             self.b_remove.setVisible(bool(inst) and not busy)
-            self.d_compat.setText(self.compat_text(g, inst))
+            self.b_remove.setText("Uninstall")
             if busy:
                 self.d_status.setText("<i>Downloading – see the Downloads tab</i>")
             elif status == "installed":
@@ -1821,6 +2523,57 @@ def run_gui(install_id=None):
                 self.d_status.setText("<b>Download incomplete</b>")
             else:
                 self.d_status.setText("")
+
+        def update_launcher_buttons(self, g, inst, entry, lid, busy):
+            """Buttons for a title delivered through a third-party launcher: Set up / Open the
+            launcher, Link installed game…, and Play once the game's id there is known (from the
+            compatibility entry or the link)."""
+            name = launcher_name(lid, self.launchers)
+            have = self.launcher_installed(lid)
+            linked = bool(inst) and inst.get("status") == "launcher"
+            # the user's link beats the id the database pins
+            gid = (inst.get("launcher_game_id") if linked else None) or \
+                entry.get("launcher_game_id")
+            installs = bool(((self.launchers.get(lid) or {}).get("launch") or {}).get("install_args"))
+            self.b_install.setVisible(not busy)
+            self.b_install.setText(f"Open {name}" if have else f"Set up {name}")
+            self.b_play.setVisible(have and bool(gid) and not busy)
+            self.b_link.setVisible(have and not busy)
+            self.b_link.setText("Re-link installed game…" if linked else "Link installed game…")
+            self.b_steam.setVisible(linked and bool(g.get("id")))
+            if linked:
+                self.b_folder.setVisible(bool(inst.get("launcher_game_dir")) and
+                                         Path(inst["launcher_game_dir"]).is_dir())
+            else:  # a leftover folder of a failed download: Open folder / Uninstall still work
+                self.b_folder.setVisible(bool(inst))
+            self.b_report.setVisible(linked)
+            self.b_remove.setVisible(bool(inst) and not busy)
+            self.b_remove.setText("Remove from library" if linked else "Uninstall")
+            if busy:
+                self.d_status.setText("<i>Downloading – see the Downloads tab</i>")
+            elif linked:
+                self.d_status.setText(
+                    f"<b>Installed in {html.escape(name)}</b> as "
+                    f"{html.escape(inst.get('launcher_game_name') or str(gid or '?'))} "
+                    f"(id {html.escape(str(inst.get('launcher_game_id') or gid or '?'))})")
+            elif inst:
+                self.d_status.setText(
+                    f"<i>An earlier download left {html.escape(inst['dir'])} behind: this title has "
+                    f"no Store package and comes through {html.escape(name)}. Uninstall removes "
+                    "the folder.</i>")
+            elif have and gid and installs:
+                self.d_status.setText(f"<i>Delivered through {html.escape(name)}; Play starts it "
+                                      f"there, asking {html.escape(name)} to install it first "
+                                      "when needed.</i>")
+            elif have and gid:
+                self.d_status.setText(f"<i>Delivered through {html.escape(name)}: install it there "
+                                      "first, then Play starts it.</i>")
+            elif have:
+                self.d_status.setText(f"<i>Delivered through {html.escape(name)}: install it "
+                                      "there, then use Link installed game…</i>")
+            else:
+                self.d_status.setText(f"<i>Delivered through {html.escape(name)}, which is not "
+                                      "set up yet.</i>")
 
         def compat_text(self, game, inst):
             """The compatibility line of the details panel."""
@@ -1836,6 +2589,23 @@ def run_gui(install_id=None):
                 parts.append(f"<i>tested {html.escape(str(t['date']))} with WineGDK "
                              f"{html.escape(str(t.get('winegdk') or '?'))}, launcher "
                              f"{html.escape(str(t.get('launcher') or '?'))}</i>")
+            lid = title_launcher(entry, game, inst, self.launchers)
+            if lid:
+                name = launcher_name(lid, self.launchers)
+                state = "installed" if self.launcher_installed(lid) else "not set up yet"
+                parts.append(f"Delivered through <b>{html.escape(name)}</b> ({state}): it runs in "
+                             "that launcher's own GE-Proton prefix.")
+            ac = entry.get("anticheat") or {}
+            if ac.get("kind") and ac.get("kind") != "none":
+                online = {
+                    "supported": "Linux module present: online play works with the Steam Proton "
+                                 "runtime",
+                    "unsupported": "no Linux module: online modes are unavailable" +
+                                   (", single-player bypass applied" if ac.get("bypass") else ""),
+                }.get(ac.get("online"), "Linux support unknown")
+                parts.append("Anti-cheat: "
+                             f"{html.escape(ANTICHEAT_LABELS.get(ac['kind'], str(ac['kind'])))} "
+                             f"({online})")
             if status == "untested":
                 parts.append("<i>Not tested yet - play it and send a compatibility report.</i>")
             if entry.get("_user"):
@@ -1844,8 +2614,17 @@ def run_gui(install_id=None):
 
         # ---------- compatibility database ----------
         def refresh_compat(self):
-            """Fetch a newer titles.json in the background (at most once a day)."""
-            w = Worker(lambda _w: refresh_compat_db())
+            """Fetch a newer titles.json and launchers.json in the background (at most once a
+            day each)."""
+            def job(_w):
+                fetched = refresh_compat_db()
+                try:
+                    fetched = thirdparty_module().refresh_launchers_db() or fetched
+                except Exception as e:  # noqa: BLE001 - module missing, offline, invalid copy
+                    print(f"launchers.json refresh skipped: {e}", file=sys.stderr)
+                return fetched
+
+            w = Worker(job)
             w.done.connect(self.compat_refreshed)
             self.workers.append(w)
             w.start()
@@ -1853,6 +2632,7 @@ def run_gui(install_id=None):
         def compat_refreshed(self, ok, err, fetched):
             if ok and fetched:
                 self.compat = load_compat_db()
+                self.launchers = launchers_db()
                 self.restyle_items()
                 self.update_buttons()
 
@@ -1861,6 +2641,183 @@ def run_gui(install_id=None):
                 for row in range(model.rowCount()):
                     self.style_item(model.item(row))
             self.cat_proxy.invalidateFilter()
+
+        # ---------- third-party launchers / anti-cheat ----------
+        def launcher_for(self, lid):
+            """ThirdPartyLauncher for a recipe id, or None when the thirdparty module is missing
+            or the recipe unknown (setup_launcher() shows the reason)."""
+            try:
+                return thirdparty_module().ThirdPartyLauncher(lid, self.cfg)
+            except Exception:  # noqa: BLE001
+                return None
+
+        def launcher_installed(self, lid):
+            tpl = self.launcher_for(lid)
+            try:
+                return bool(tpl and tpl.is_installed())
+            except Exception:  # noqa: BLE001
+                return False
+
+        def launcher_action(self, lid):
+            """The Set up <Launcher> / Open <Launcher> button."""
+            if self.launcher_installed(lid):
+                self.open_launcher(lid)
+            else:
+                self.setup_launcher(lid)
+
+        def setup_launcher(self, lid, then=None):
+            """Install a third-party launcher (or only show its sign-in guide when it is already
+            installed); then() runs when the launcher is installed afterwards."""
+            try:
+                dlg = LauncherSetupDialog(self, self.cfg, lid,
+                                          install=not self.launcher_installed(lid))
+            except Exception as e:  # noqa: BLE001 - module missing, unknown recipe
+                QMessageBox.warning(self, APP_NAME,
+                                    f"Cannot set up {launcher_name(lid, self.launchers)}:\n{e}")
+                return False
+            dlg.exec()
+            self.update_buttons()
+            if dlg.ok and then:
+                then()
+            return dlg.ok
+
+        def open_launcher(self, lid):
+            tpl = self.launcher_for(lid)
+            if not tpl:
+                self.setup_launcher(lid)  # reports why the launcher is unavailable
+                return
+            w = Worker(lambda _w: tpl.open())  # .wine() may fetch GE-Proton: off the GUI thread
+
+            def done(ok, err, proc):
+                if ok:
+                    self.launcher_procs = [p for p in self.launcher_procs
+                                           if p.poll() is None] + [proc]
+                else:
+                    QMessageBox.warning(self, APP_NAME, f"Could not open {tpl.name}:\n{err}")
+
+            w.done.connect(done)
+            self.workers.append(w)
+            w.start()
+
+        def link_current(self):
+            """Link installed game…: which game inside the launcher this title is. The pick is
+            stored in the title's meta under games_dir (status "launcher") so Play and
+            --play can start it."""
+            g = self.current
+            if not g:
+                return
+            inst = self.current_installed()
+            store_id = g.get("id") or (game_store_id(inst["dir"]) if inst else "")
+            entry = compat_entry(store_id, self.compat)
+            lid = title_launcher(entry, g, inst, self.launchers)
+            tpl = self.launcher_for(lid) if lid else None
+            if not tpl:
+                return
+            if not self.launcher_installed(lid):
+                self.setup_launcher(lid)
+                return
+            self.b_link.setEnabled(False)
+            w = Worker(lambda _w: list(tpl.installed_games()))
+
+            def done(ok, err, games):
+                self.b_link.setEnabled(True)
+                if not ok:
+                    QMessageBox.warning(self, APP_NAME, "Could not list the games installed in "
+                                        f"{tpl.name}:\n{err}")
+                    return
+                dlg = LinkGameDialog(self, g.get("title") or store_id, tpl.name, games)
+                if not dlg.exec():
+                    return
+                pick = dlg.chosen()
+                if not pick or not pick.get("id"):
+                    QMessageBox.information(self, APP_NAME,
+                                            "Pick a game from the list or enter its id.")
+                    return
+                full = next((c for c in self.catalog if c["id"] == store_id), g)
+                if not full.get("id"):
+                    full = dict(full, id=store_id)
+                link_launcher_game(self.cfg, full, lid, pick["id"], pick.get("name") or "",
+                                   pick.get("dir") or "")
+                self.refresh_library()
+
+            w.done.connect(done)
+            self.workers.append(w)
+            w.start()
+
+        def play_launcher_title(self, g, inst, entry, lid):
+            """Play for a title delivered through a third-party launcher: set the launcher up or
+            link the game when needed, then start it there (Play becomes Stop as usual; Stop
+            brings down the launcher's prefix)."""
+            if not self.launcher_installed(lid):
+                self.setup_launcher(lid, then=self.play_current)
+                return
+            if not (inst and inst.get("status") == "launcher"):
+                gid = entry.get("launcher_game_id")
+                if not gid:
+                    self.link_current()
+                    return
+                full = next((c for c in self.catalog if c["id"] == g.get("id")), g)
+                link_launcher_game(self.cfg, full, lid, gid)
+                self.refresh_library()
+                inst = find_installed(self.cfg, g.get("id"))
+                if not inst:
+                    return
+            self.start_play_job(inst)
+
+        def offer_launcher(self, game, dest):
+            """A download failed because the title has no Store package: when its entry names a
+            third-party launcher, or its publisher matches a recipe (launchers.json
+            publisher_match), offer to set it up / open it instead of a bare error."""
+            lid = title_launcher(compat_entry(game.get("id"), self.compat), game, None, self.launchers)
+            if not lid:
+                return
+            try:  # the folder the download created holds only our meta: drop the "incomplete" ghost
+                if dest and {p.name for p in Path(dest).iterdir()} == {META_NAME}:
+                    shutil.rmtree(dest)
+                    self.refresh_library()
+            except OSError:
+                pass
+            name = launcher_name(lid, self.launchers)
+            have = self.launcher_installed(lid)
+            q = (f"{game.get('title')} is not delivered as a Store package but through {name}.\n\n"
+                 + (f"Open {name} to install it there?" if have else f"Set up {name} now?"))
+            if QMessageBox.question(self, APP_NAME, q) != QMessageBox.Yes:
+                return
+            self.show_game(next((c for c in self.catalog if c["id"] == game.get("id")), game))
+            self.launcher_action(lid)
+
+        def anticheat_warning(self, inst, entry):
+            """Before the first Play of a title whose anti-cheat has no Linux module: say that
+            online modes are unavailable (once per title, remembered in the config). False when
+            the user cancels."""
+            store_id = inst.get("id") or entry.get("id") or ""
+            if store_id and store_id in (self.cfg.get("anticheat_warned") or []):
+                return True
+            info, _ = anticheat_status(inst["dir"], entry, resolve_wine(self.cfg, entry))
+            if info.get("online") != "unsupported" or info.get("kind") in ("none", "unknown"):
+                return True
+            launch = entry.get("launch") or {}
+            bypassed = bool(launch.get("executable") or info.get("bypass") or
+                            (launch.get("eac_bypass") is not False and
+                             eac_real_executable(inst["dir"])))
+            text = (f"{inst.get('title') or store_id} uses "
+                    f"{ANTICHEAT_LABELS.get(info['kind'], str(info['kind']))}, and this build "
+                    "ships no Linux module for it.\n\n" +
+                    ("The launcher starts the game past the anti-cheat, so only offline / "
+                     "single-player modes work: online modes are unavailable." if bypassed else
+                     "No single-player bypass is known for it, so the game may not start."))
+            if info.get("message"):
+                text += "\n\n" + str(info["message"])
+            box = QMessageBox(QMessageBox.Warning, APP_NAME, text,
+                              QMessageBox.Ok | QMessageBox.Cancel, self)
+            box.setInformativeText("Shown once per title.")
+            if box.exec() != QMessageBox.Ok:
+                return False
+            if store_id:
+                self.cfg["anticheat_warned"] = sorted(
+                    set(self.cfg.get("anticheat_warned") or []) | {store_id})
+                save_config(self.cfg)
+            return True
 
         def report_current(self):
             inst = self.current_installed()
@@ -1909,7 +2866,11 @@ def run_gui(install_id=None):
             entry = compat_entry(game.get("id"), self.compat)
             item.setData(entry["status"], ROLE_STATUS)
             known = entry["status"] != "untested" or bool(game.get("dir"))
+            lid = title_launcher(entry, game, game, self.launchers)
+            tag = f"via {launcher_name(lid, self.launchers)}" if lid else ""
             tip = game["title"]
+            if tag:
+                tip += "\n" + tag
             if known:
                 tip += f"\nCompatibility: {STATUS_LABELS[entry['status']]}"
                 if entry.get("notes"):
@@ -1919,7 +2880,7 @@ def run_gui(install_id=None):
             if not pm:
                 pm = QPixmap(150, 225)
                 pm.fill(Qt.darkGray)
-            item.setIcon(badge_icon(pm, entry["status"], known))
+            item.setIcon(badge_icon(pm, entry["status"], known, tag))
 
         # ---------- catalog ----------
         def load_catalog(self, force=False):
@@ -1972,7 +2933,8 @@ def run_gui(install_id=None):
             self.lib_model.clear()
             games = installed_games(self.cfg)
             for g in games:
-                suffix = "" if g.get("status") == "installed" else f"\n({g.get('status')})"
+                suffix = "" if g.get("status") in ("installed", "launcher") else \
+                    f"\n({g.get('status')})"
                 self.lib_model.appendRow(self.make_item(g, suffix))
             self.lib_empty.setVisible(not games)
             self.update_buttons()
@@ -2048,6 +3010,10 @@ def run_gui(install_id=None):
             g = self.current
             if not g or not g.get("id"):
                 return
+            lid = title_launcher(compat_entry(g["id"], self.compat), g, None, self.launchers)
+            if lid:  # no Store package: the title comes through a third-party launcher
+                self.launcher_action(lid)
+                return
             if not is_logged_in():
                 QMessageBox.information(self, APP_NAME, "Sign in first (top right).")
                 return
@@ -2119,6 +3085,8 @@ def run_gui(install_id=None):
             self.active = None
             self.refresh_library()
             self.pump_queue()
+            if not ok and "no PC package" in msg:
+                self.offer_launcher(job.game, job.dest)
 
         def current_installed(self):
             g = self.current
@@ -2129,7 +3097,16 @@ def run_gui(install_id=None):
             return g if g.get("dir") else None
 
         def play_current(self):
+            g = self.current
             inst = self.current_installed()
+            if not g:
+                return
+            entry = compat_entry(g.get("id") or (game_store_id(inst["dir"]) if inst else ""),
+                                 self.compat)
+            lid = title_launcher(entry, g, inst, self.launchers)
+            if lid:
+                self.play_launcher_title(g, inst, entry, lid)
+                return
             if not inst:
                 return
             wine = self.cfg.get("wine") or find_wine()
@@ -2139,6 +3116,11 @@ def run_gui(install_id=None):
                                         "Set it up now?") == QMessageBox.Yes:
                     self.setup_wine(then=self.play_current)
                 return
+            if not self.anticheat_warning(inst, entry):
+                return
+            self.start_play_job(inst)
+
+        def start_play_job(self, inst):
             job = LaunchJob(self.cfg, inst["dir"])
             self.play_job = job
             # the Play button becomes Stop while the game runs (Alt+F4 may not reach
@@ -2210,11 +3192,23 @@ def run_gui(install_id=None):
         def folder_current(self):
             inst = self.current_installed()
             if inst:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(inst["dir"]))
+                d = inst.get("launcher_game_dir") if inst.get("status") == "launcher" else ""
+                QDesktopServices.openUrl(QUrl.fromLocalFile(d or inst["dir"]))
 
         def remove_current(self):
             inst = self.current_installed()
             if not inst:
+                return
+            if inst.get("status") == "launcher":
+                name = launcher_name(inst.get("launcher") or "", self.launchers)
+                if QMessageBox.question(
+                        self, APP_NAME,
+                        f"Remove {inst.get('title')} from the library?\n\nThe game stays "
+                        f"installed in {name}; only the link\n{inst['dir']}\nis removed.") \
+                        != QMessageBox.Yes:
+                    return
+                unlink_launcher_game(inst["dir"])
+                self.refresh_library()
                 return
             if QMessageBox.question(
                     self, APP_NAME,
@@ -2226,13 +3220,16 @@ def run_gui(install_id=None):
 
         def open_settings(self):
             dlg = SettingsDialog(self, self.cfg)
-            if dlg.exec():
-                old = (self.cfg["market"], self.cfg["language"])
+            old = (self.cfg["market"], self.cfg["language"])
+            accepted = dlg.exec()
+            if accepted:
                 dlg.apply()
-                self.refresh_library()
                 self.refresh_wine_btn()
-                if old != (self.cfg["market"], self.cfg["language"]):
-                    self.load_catalog(force=True)
+            # launchers may have been set up or removed from the dialog, even when cancelled
+            self.launchers = launchers_db()
+            self.refresh_library()
+            if accepted and old != (self.cfg["market"], self.cfg["language"]):
+                self.load_catalog(force=True)
 
         def closeEvent(self, ev):
             if self.active:
