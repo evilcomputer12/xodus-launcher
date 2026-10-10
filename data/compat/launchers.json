@@ -199,14 +199,11 @@
         "kind": "ge-proton",
         "min_version": "GE-Proton11-1",
         "prefer_tools": [
-          "UMU-Proton-10",
-          "GE-Proton10",
-          "Proton 10"
+          "GE-Proton11",
+          "Proton - Experimental",
+          "GE-Proton"
         ],
-        "release": {
-          "repo": "Open-Wine-Components/umu-proton",
-          "tag": "UMU-Proton-10.0-4"
-        }
+        "release": null
       },
       "prefix": {
         "winetricks": [
@@ -214,7 +211,15 @@
           "win10"
         ],
         "dll_overrides": {},
-        "registry": [],
+        "registry": [
+          {
+            "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{ee3c1574-6473-4f36-a1f0-31c4cb81968e}",
+            "name": "DisplayName",
+            "type": "REG_SZ",
+            "value": "EA app",
+            "notes": "The bootstrapper (32-bit) registers its bundle under WOW6432Node, but the MSI's .NET custom action FillMissingBundleValues opens the key through RegistryView.Registry32 in wine-mono and finds nothing (status 25001). Pre-creating the key in the 64-bit view lets it succeed; the GUID is the bundle provider key of EA app 13.805.x."
+          }
+        ],
         "env": {},
         "arch": "win64"
       },
@@ -260,6 +265,7 @@
         "notes": "The EA app client itself has no anti-cheat; only games do. (1) EA anticheat / 'EA Javelin' (kernel driver, Windows only): Battlefield 6/REDSEC/2042, Battlefield 1 and V (FairFight + EA anticheat), EA SPORTS FC 24-26, Madden 24-26, WRC 24, skate., PvZ Battle for Neighborville / Garden Warfare 2, FIFA 23 -> AreWeAntiCheatYet 'Denied': no Linux module exists, there is no single-player bypass, so label online modes unavailable and expect these not to start at all. EA has only posted a job listing (March 2026) about future Linux/Proton support for Javelin. (2) Easy Anti-Cheat with a Linux module: STAR WARS: Squadrons and Madden NFL 23 are 'Supported' with Steam's 'Proton EasyAntiCheat Runtime' (Steam app 1826330; BattlEye runtime is app 1161040). Mechanism: Proton's Wine (ValveSoftware/wine dlls/ntdll/unix/loader.c set_dll_path) reads the PROTON_EAC_RUNTIME env var and adds <dir>/v2/lib32 and <dir>/v2/lib64 to the DLL search path (PROTON_BATTLEYE_RUNTIME likewise), so when Xodus runs GE-Proton's files/bin/wine directly it only has to export PROTON_EAC_RUNTIME=<path of app 1826330> in wine_env (under Steam the lsteamclient shim sets it from the installed app; Lutris points it at its own runtime/eac_runtime copy). Whether the EA-app builds of those titles ship the easyanticheat_x64.so Linux module like the Steam builds is unverified. Apex Legends dropped Linux support (EAC + Hyperion, Denied). (3) FairFight/PunkBuster only (server-side or user-mode): Titanfall, Titanfall 2, STAR WARS Battlefront (2015) / II (2017), Battlefield 4, Battlefield: Hardline run (Supported/Running). Mark EA Play/Game Pass titles with an EA anticheat entry as 'online unavailable / not launchable' in the compat DB; leave the rest as normal."
       },
       "known_issues": [
+        "2026-10-10: the installer's last step moves the client into <version>\\EA Desktop and creates a directory symlink 'EA Desktop' -> '<version>\\EA Desktop' (CreateSymbolicLinkW); builds without reparse-point support (UMU-Proton-10.0-4 returns success without creating the link) make the install roll back with 0x8007065b. Wine 11 based builds (GE-Proton 11, Proton Experimental) create the link, so the recipe prefers them.",
         "Self-update layout: the installer/updater may place the client in a versioned folder, drive_c/Program Files/Electronic Arts/EA Desktop/<version>/EA Desktop/EALauncher.exe (unifideck saw 13.735.2.6250/ in July 2026), instead of EA Desktop/EA Desktop/. Lutris' ea-app script runs a verifyea.sh after install and after every exit that moves <version>/EA Desktop up to EA Desktop/EA Desktop; alternatively resolve EALauncher.exe with a glob (NonSteamLaunchers does find -iname EALauncher.exe). Symptom when the path goes stale: 'Connecting to the EA app' splash then exit code 0 (lutris/lutris#6843, Aug-Oct 2026).",
         "EA app updates regularly break the Wine install: Jan 2026 an EA Desktop update left the launcher half-updated (RPC_S_SERVER_UNAVAILABLE 0x6ba, CreateSymbolicLinkW stubs) and games stopped launching until Proton Experimental (2026-01-29) / Proton 11.0-1-beta1 (2026-04-16) 'Fixed many EA games being unplayable after a recent EA Desktop update'; GE-Proton10-30 (2026-02-10) imported those upstream changes. Proton 11.0-1-beta2 (Xalia 0.4.9) fixed lockups when interacting with the EA App. Keep GE-Proton >= 11-1 (unifideck: unattended install + rendered login window on GE-Proton11-1, 2026-07-03); Lutris itself runs the client on dwproton-11.0-14 (Proton Experimental bleeding-edge 11.0, 2026-09-29). NonSteamLaunchers keeps a 'repaireaapp' path (re-run the installer /quiet into the same prefix) for when the client breaks itself.",
         "Login/UI window: the EA app UI is Qt + QtWebEngine (Chromium). Blank login window after an EA update was fixed in Proton 8.0-4 (2023); text/fonts rendered as placeholder boxes (WineHQ bug 54899, Cyrillic locale) was fixed in Wine 10.9 - corefonts from the Lutris recipe is still installed for the web views. Older community advice ('use a Wine runner, not Proton, keep D3D Extras') predates these fixes.",
