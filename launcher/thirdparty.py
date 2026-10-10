@@ -311,6 +311,29 @@ def _log_tail(logfile, lines=15):
         return ""
 
 
+def prefix_activity(prefix, window=90):
+    """Bytes written in the last `window` seconds under the prefix's drive_c (temp downloads,
+    program files): lets a silent installer show that it is still doing something."""
+    now = time.time(); total = 0; newest = 0
+    for base in ("drive_c/users", "drive_c/Program Files", "drive_c/Program Files (x86)", "drive_c/ProgramData"):
+        root = Path(prefix) / base
+        if not root.is_dir():
+            continue
+        for dirpath, dirs, files in os.walk(root):
+            if "/cache/" in dirpath.replace("\\", "/") + "/":
+                dirs[:] = []
+                continue
+            for f in files:
+                try:
+                    st = os.stat(os.path.join(dirpath, f))
+                except OSError:
+                    continue
+                if now - st.st_mtime <= window:
+                    total += st.st_size
+                    newest = max(newest, st.st_mtime)
+    return total, newest
+
+
 class _Fmt(dict):
     """str.format_map helper that leaves unknown {placeholders} alone."""
 
@@ -1746,8 +1769,21 @@ class ThirdPartyLauncher:
         settle = int(inst.get("settle_seconds", 10))
         deadline = time.monotonic() + timeout
         appeared = False
+        last_report, started = 0.0, time.monotonic()
         while True:
             rc = p.poll()
+            if time.monotonic() - last_report >= 10:
+                last_report = time.monotonic()
+                written, newest = prefix_activity(self.prefix)
+                mins = int((time.monotonic() - started) // 60)
+                if written:
+                    progress("install", None, f"{self.name} installer running for {mins} min: "
+                                              f"{human_size(written)} written in the last 90 s")
+                elif newest and time.time() - newest > 300:
+                    progress("install", None, f"{self.name} installer running for {mins} min: no file activity "
+                                              f"for {int((time.time() - newest) // 60)} min (it may be waiting for a window)")
+                else:
+                    progress("install", None, f"{self.name} installer running for {mins} min")
             if cancel_event is not None and cancel_event.is_set():
                 self._kill(p)
                 self.stop()
