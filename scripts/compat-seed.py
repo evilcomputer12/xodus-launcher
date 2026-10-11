@@ -23,7 +23,7 @@ STORE_ID = re.compile(r"^9[A-Z0-9]{11}$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ENTRY_KEYS = {"title", "status", "notes", "tested", "runtime", "prefix", "dxvk", "vkd3d", "env",
               "dll_overrides", "launch", "winetricks", "registry", "launcher", "launcher_game_id",
-              "anticheat"}
+              "anticheat", "seed_files"}
 TESTED_KEYS = {"date", "launcher", "winegdk", "gpu", "distro"}
 LAUNCH_KEYS = {"executable", "args", "eac_bypass", "working_dir"}
 ANTICHEAT_KEYS = {"kind", "linux_module", "bypass", "online"}
@@ -67,6 +67,10 @@ def check_entry(sid, e, errors, launcher_ids, tp):
         errors.append(f"{where}: not a Store ID")
     for k in set(e) - ENTRY_KEYS:
         errors.append(f"{where}: unknown field {k!r}")
+    for f in e.get("seed_files") or []:
+        if not (isinstance(f, dict) and isinstance(f.get("from"), str) and isinstance(f.get("to"), str)
+                and ".." not in f["from"] and ".." not in f["to"] and not f["to"].startswith(("/", "\\"))):
+            errors.append(f"{where}.seed_files: entries {{from: game-relative file, to: user-profile-relative path}}")
     if not e.get("title"):
         errors.append(f"{where}: missing title")
     statuses = launcher().COMPAT_STATUSES

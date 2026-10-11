@@ -12,6 +12,7 @@ Usage:
 
 import concurrent.futures
 import fcntl
+import getpass
 import glob
 import hashlib
 import html
@@ -581,6 +582,26 @@ def wine_version(wine):
 def _release_date(tag):
     m = re.match(r"winegdk-(\d{8})", tag or "")
     return m.group(1) if m else ""
+
+
+def seed_user_files(prefix, game_dir, entry, log=print):
+    """compat seed_files: copy files from the game folder into the Wine user profile when they are
+    missing (e.g. the INIs a game's own launcher would write before the game can start)."""
+    users = Path(prefix) / "drive_c/users"
+    for f in entry.get("seed_files") or []:
+        src = Path(game_dir) / str(f.get("from", "")).replace("\\", "/")
+        rel = str(f.get("to", "")).replace("\\", "/")
+        if ".." in rel.split("/") or not src.is_file():
+            continue
+        for user in (users / getpass.getuser(), users / "steamuser"):
+            if not user.is_dir():
+                continue
+            dst = user / rel
+            if dst.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            log(f"compat: seeded {dst} from {src.name}")
 
 
 def apply_prefix_tweaks(cfg, wine, prefix, entry, log=print):
@@ -1423,6 +1444,7 @@ def launch_game(cfg, game_dir, log=print, on_start=None):
         prepare_prefix(cfg, wine, prefix, log)
     if entry.get("registry") or entry.get("winetricks"):
         apply_prefix_tweaks(cfg, wine, prefix, entry, log)
+    seed_user_files(prefix, game_dir, entry, log)
     cwd = game_dir
     if launch.get("working_dir") and (Path(game_dir) / launch["working_dir"]).is_dir():
         cwd = str(Path(game_dir) / launch["working_dir"])
