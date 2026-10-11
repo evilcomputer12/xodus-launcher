@@ -141,6 +141,18 @@
         "bypass": null,
         "online": "unsupported"
       }
+    },
+    "9P03JGQ4S1GC": {
+      "title": "The Elder Scrolls V: Skyrim Special Edition",
+      "status": "launches",
+      "notes": "The Game Pass build reads Documents\\My Games\\Skyrim Special Edition MS\\Skyrim.ini and SkyrimPrefs.ini; SkyrimSELauncher.exe creates them on its first start (Skyrim.ini from Skyrim_Default_<lang>.ini, SkyrimPrefs.ini after its hardware detection). Pressing Play before both exist gives 'Unable to find an INI file'; start the launcher once, let it finish, then Play. SkyrimSE.exe then loads its INIs and starts rendering (DXVK).",
+      "tested": {
+        "date": "2026-10-11",
+        "launcher": "84f6467",
+        "winegdk": "winegdk-20261010-113e74b",
+        "gpu": "AMD Radeon RX 7600 XT (RADV, Mesa 26.2)",
+        "distro": "CachyOS"
+      }
     }
   }
 }
